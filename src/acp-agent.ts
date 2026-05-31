@@ -84,6 +84,12 @@ import {
   toolUpdateFromDiffToolResponse,
   toolUpdateFromToolResult,
 } from "./tools.js";
+import {
+  ASK_USER_QUESTION_METHOD,
+  normalizeAskUserQuestionResult,
+  parseAskUserQuestionInput,
+  type AskUserQuestionResult,
+} from "./interactive.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 
 export const CLAUDE_CONFIG_DIR =
@@ -1939,6 +1945,41 @@ export class ClaudeAcpAgent implements Agent {
         }
       }
 
+      if (toolName === "AskUserQuestion") {
+        const ask = parseAskUserQuestionInput(toolInput);
+        if (!ask) {
+          return { behavior: "deny", message: "AskUserQuestion called without questions" };
+        }
+        let result: AskUserQuestionResult | undefined;
+        try {
+          result = (await this.client.extMethod(ASK_USER_QUESTION_METHOD, {
+            sessionId,
+            toolCallId: toolUseID,
+            questions: ask.questions,
+          })) as AskUserQuestionResult;
+        } catch (err) {
+          // Client doesn't implement the extension method (older client) — fail
+          // closed with a model-readable message instead of hanging.
+          this.logger.error(`AskUserQuestion extMethod failed: ${(err as Error).message}`);
+          return { behavior: "deny", message: "Client does not support AskUserQuestion" };
+        }
+        if (signal.aborted) {
+          throw new Error("Tool use aborted");
+        }
+        const normalized = normalizeAskUserQuestionResult(result);
+        if (!normalized) {
+          return { behavior: "deny", message: "The user cancelled the question" };
+        }
+        return {
+          behavior: "allow",
+          updatedInput: {
+            ...toolInput,
+            answers: normalized.answers,
+            ...(normalized.annotations ? { annotations: normalized.annotations } : {}),
+          },
+        };
+      }
+
       if (session.modes.currentModeId === "bypassPermissions") {
         return {
           behavior: "allow",
@@ -2263,8 +2304,9 @@ export class ClaudeAcpAgent implements Agent {
     // Parse model configuration from environment (e.g. Bedrock model overrides)
     const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
 
-    // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
-    const disallowedTools = ["AskUserQuestion"];
+    // `AskUserQuestion` is now supported over ACP via the `extMethod` channel
+    // (see `canUseTool` + `interactive.ts`), so it is no longer force-disabled.
+    // Callers can still disable it via `userProvidedOptions.disallowedTools`.
 
     // Resolve which built-in tools to expose.
     // Explicit tools array from _meta.claudeCode.options takes precedence.
@@ -2318,7 +2360,7 @@ export class ClaudeAcpAgent implements Agent {
         ...userProvidedOptions?.extraArgs,
         "replay-user-messages": "",
       },
-      disallowedTools: [...(userProvidedOptions?.disallowedTools || []), ...disallowedTools],
+      disallowedTools: [...(userProvidedOptions?.disallowedTools || [])],
       tools,
       hooks: {
         ...userProvidedOptions?.hooks,

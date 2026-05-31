@@ -415,6 +415,25 @@ export function toolInfoFromToolUse(
       };
     }
 
+    case "AskUserQuestion": {
+      const input = toolUse.input as
+        | { questions?: { question?: string; header?: string }[] }
+        | undefined;
+      const questions = input?.questions ?? [];
+      const title =
+        questions.length > 0 && questions[0]?.header ? questions[0].header : "Ask a question";
+      return {
+        title,
+        kind: "think",
+        content: questions
+          .filter((q): q is { question: string } => typeof q?.question === "string")
+          .map((q) => ({
+            type: "content" as const,
+            content: { type: "text" as const, text: q.question },
+          })),
+      };
+    }
+
     case "Other": {
       const input = toolUse.input;
       let output;
