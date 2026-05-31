@@ -323,52 +323,18 @@ export type ToolUseCache = {
 };
 
 export async function claudeCliPath(): Promise<string> {
-  if (process.env.CLAUDE_CODE_EXECUTABLE) {
-    return process.env.CLAUDE_CODE_EXECUTABLE;
-  }
-  // The SDK's CLI is a native binary shipped as a platform-specific optional
-  // dependency of @anthropic-ai/claude-agent-sdk. Resolve via a require bound
-  // to the SDK so nested installs are found even when npm doesn't hoist.
-  const { createRequire } = await import("node:module");
-  const req = createRequire(import.meta.resolve("@anthropic-ai/claude-agent-sdk"));
-  const ext = process.platform === "win32" ? ".exe" : "";
-  // On linux, both glibc and musl variants may be installed side-by-side
-  // (e.g. bunx hydrates every optional dep), so picking one by trial is
-  // unreliable: the wrong binary segfaults at runtime instead of failing to
-  // spawn. Detect the runtime libc and prefer the matching variant, falling
-  // back to the other only if the preferred one isn't installed.
-  const candidates =
-    process.platform === "linux"
-      ? isMuslLibc()
-        ? [
-            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
-            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
-          ]
-        : [
-            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
-            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
-          ]
-      : [`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/claude${ext}`];
-  for (const candidate of candidates) {
-    try {
-      return req.resolve(candidate);
-    } catch {
-      // try next candidate
-    }
+  // The embedding host (Universe Editor) bundles this agent as a single esbuild
+  // file with no node_modules, so the native binary can't be resolved via
+  // require. The host always provides its absolute path through this env var
+  // (downloaded on demand or pointed at a system install).
+  const fromEnv = process.env.CLAUDE_CODE_EXECUTABLE;
+  if (fromEnv) {
+    return fromEnv;
   }
   throw new Error(
-    `Claude native binary not found for ${process.platform}-${process.arch}. ` +
-      `Reinstall @anthropic-ai/claude-agent-sdk without --omit=optional, or set CLAUDE_CODE_EXECUTABLE.`,
+    "CLAUDE_CODE_EXECUTABLE is not set. The embedding host must provide the path " +
+      "to the Claude native binary via the CLAUDE_CODE_EXECUTABLE environment variable.",
   );
-}
-
-function isMuslLibc(): boolean {
-  // process.report.getReport().header.glibcVersionRuntime is populated when
-  // Node is dynamically linked against glibc, and absent on musl.
-  const report = process.report?.getReport() as
-    | { header?: { glibcVersionRuntime?: string } }
-    | undefined;
-  return !report?.header?.glibcVersionRuntime;
 }
 
 function shouldHideClaudeAuth(): boolean {
