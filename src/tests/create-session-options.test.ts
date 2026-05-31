@@ -66,7 +66,7 @@ describe("createSession options merging", () => {
     agent = new ClaudeAcpAgent(createMockClient());
   });
 
-  it("merges user-provided disallowedTools with ACP internal list", async () => {
+  it("forwards user-provided disallowedTools without re-adding AskUserQuestion", async () => {
     await agent.newSession({
       cwd: process.cwd(),
       mcpServers: [],
@@ -82,17 +82,18 @@ describe("createSession options merging", () => {
     // User-provided tools should be present
     expect(capturedOptions!.disallowedTools).toContain("WebSearch");
     expect(capturedOptions!.disallowedTools).toContain("WebFetch");
-    // ACP's internal disallowed tool should also be present
-    expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
+    // AskUserQuestion is now supported over ACP — no longer force-disabled
+    expect(capturedOptions!.disallowedTools).not.toContain("AskUserQuestion");
   });
 
-  it("works when user provides no disallowedTools", async () => {
+  it("leaves disallowedTools empty when user provides none", async () => {
     await agent.newSession({
       cwd: process.cwd(),
       mcpServers: [],
     });
 
-    expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
+    expect(capturedOptions!.disallowedTools).not.toContain("AskUserQuestion");
+    expect(capturedOptions!.disallowedTools).toEqual([]);
   });
 
   it("works when user provides empty disallowedTools", async () => {
@@ -103,6 +104,22 @@ describe("createSession options merging", () => {
         claudeCode: {
           options: {
             disallowedTools: [],
+          },
+        },
+      },
+    });
+
+    expect(capturedOptions!.disallowedTools).not.toContain("AskUserQuestion");
+  });
+
+  it("still honors a user request to disable AskUserQuestion", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            disallowedTools: ["AskUserQuestion"],
           },
         },
       },
@@ -127,9 +144,9 @@ describe("createSession options merging", () => {
 
     // disableBuiltInTools removes all built-in tools from context
     expect(capturedOptions!.tools).toEqual([]);
-    // User-provided and ACP disallowedTools still apply
+    // User-provided disallowedTools still apply
     expect(capturedOptions!.disallowedTools).toContain("CustomTool");
-    expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
+    expect(capturedOptions!.disallowedTools).not.toContain("AskUserQuestion");
   });
 
   it("merges user-provided hooks with ACP hooks", async () => {
@@ -568,11 +585,11 @@ describe("createSession options merging", () => {
   });
 
   describe("elicitation", () => {
-    it("keeps AskUserQuestion disabled and omits callbacks without elicitation capability", async () => {
+    it("keeps AskUserQuestion enabled (extMethod fallback) and omits elicitation callbacks without elicitation capability", async () => {
       await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
       await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
-      expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
+      expect(capturedOptions!.disallowedTools).not.toContain("AskUserQuestion");
       expect(capturedOptions!.onElicitation).toBeUndefined();
     });
 
@@ -587,14 +604,14 @@ describe("createSession options merging", () => {
       expect(typeof capturedOptions!.onElicitation).toBe("function");
     });
 
-    it("wires callbacks for url-only elicitation but keeps AskUserQuestion disabled", async () => {
+    it("wires callbacks for url-only elicitation and keeps AskUserQuestion enabled", async () => {
       await agent.initialize({
         protocolVersion: 1,
         clientCapabilities: { elicitation: { url: {} } },
       });
       await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
-      expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
+      expect(capturedOptions!.disallowedTools).not.toContain("AskUserQuestion");
       expect(typeof capturedOptions!.onElicitation).toBe("function");
     });
 
