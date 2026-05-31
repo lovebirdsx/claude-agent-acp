@@ -1481,9 +1481,15 @@ describe("prompt conversion", () => {
 });
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
-  it("finds vendored cli path", async () => {
-    const path = await claudeCliPath();
-    expect(path).toMatch(/@anthropic-ai\/claude-agent-sdk-[^/]+\/claude(\.exe)?$/);
+  it("reads cli path from CLAUDE_CODE_EXECUTABLE", async () => {
+    const prev = process.env.CLAUDE_CODE_EXECUTABLE;
+    process.env.CLAUDE_CODE_EXECUTABLE = "/tmp/claude";
+    try {
+      expect(await claudeCliPath()).toBe("/tmp/claude");
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CODE_EXECUTABLE;
+      else process.env.CLAUDE_CODE_EXECUTABLE = prev;
+    }
   });
 
   it("query has a 'default' model", async () => {
