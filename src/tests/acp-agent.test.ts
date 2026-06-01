@@ -2748,6 +2748,102 @@ describe("stop reason propagation", () => {
     expect(err).not.toBeNull();
     expect((err as { data: unknown }).data).toBeUndefined();
   });
+
+  it("appends tool name/id and raw input to unparseable tool-call errors", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, [
+      {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        event: {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "tool_use", id: "toolu_abc", name: "Edit", input: {} },
+        },
+      },
+      {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "input_json_delta", partial_json: '{"file":"a.ts",' },
+        },
+      },
+      {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "input_json_delta", partial_json: ' "bad":' },
+        },
+      },
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "The model's tool call could not be parsed (retry also failed).",
+      }),
+    ]);
+
+    const err = await agent
+      .prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "test" }],
+      })
+      .then(
+        () => null,
+        (e) => e,
+      );
+
+    expect(err).not.toBeNull();
+    expect((err as Error).message).toContain(
+      '(tool: Edit, id: toolu_abc, input: {"file":"a.ts", "bad":)',
+    );
+  });
+
+  it("does not annotate non-parse errors with tool context", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, [
+      {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        event: {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "tool_use", id: "toolu_abc", name: "Edit", input: {} },
+        },
+      },
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "You've hit your limit · resets 8pm",
+      }),
+    ]);
+
+    const err = await agent
+      .prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "test" }],
+      })
+      .then(
+        () => null,
+        (e) => e,
+      );
+
+    expect(err).not.toBeNull();
+    expect((err as Error).message).not.toContain("tool:");
+  });
 });
 
 describe("model refusal fallback handling", () => {
