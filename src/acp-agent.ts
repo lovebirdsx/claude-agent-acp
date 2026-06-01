@@ -953,17 +953,16 @@ export class ClaudeAcpAgent {
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
     const sdk_sessions = await listSessions({ dir: params.cwd ?? undefined });
-    const sessions = [];
-
-    for (const session of sdk_sessions) {
-      if (!session.cwd) continue;
-      sessions.push({
-        sessionId: session.sessionId,
-        cwd: session.cwd,
-        title: sanitizeTitle(session.summary),
-        updatedAt: new Date(session.lastModified).toISOString(),
-      });
-    }
+    const sessions = await Promise.all(
+      sdk_sessions
+        .filter((session) => !!session.cwd)
+        .map(async (session) => ({
+          sessionId: session.sessionId,
+          cwd: session.cwd as string,
+          title: sanitizeTitle(session.summary),
+          updatedAt: await this.lastActivityIso(session),
+        })),
+    );
     return {
       sessions,
     };
@@ -1001,6 +1000,37 @@ export class ClaudeAcpAgent {
         updatedAt: new Date(info!.lastModified).toISOString(),
       },
     });
+  }
+
+  /** Last real-message timestamp for a session.
+   *
+   *  `listSessions().lastModified` is the JSONL file mtime, which `session/load`
+   *  bumps even for a read-only resume — so using it makes merely viewing a
+   *  session reorder/restamp it. Instead we read the conversation content and
+   *  take the latest message timestamp; `getSessionMessages` already strips
+   *  isMeta + non-message lines, so viewing (which appends no real message)
+   *  leaves this value stable. Falls back to createdAt/mtime on empty/error. */
+  private async lastActivityIso(session: {
+    sessionId: string;
+    cwd?: string;
+    createdAt?: number;
+    lastModified: number;
+  }): Promise<string> {
+    const fallback = new Date(session.createdAt ?? session.lastModified).toISOString();
+    try {
+      const msgs = await getSessionMessages(session.sessionId, {
+        dir: session.cwd ?? undefined,
+      });
+      let maxTs = 0;
+      for (const m of msgs) {
+        const ts = (m as { timestamp?: string }).timestamp;
+        const parsed = ts ? Date.parse(ts) : NaN;
+        if (Number.isFinite(parsed) && parsed > maxTs) maxTs = parsed;
+      }
+      return maxTs > 0 ? new Date(maxTs).toISOString() : fallback;
+    } catch {
+      return fallback;
+    }
   }
 
   async authenticate(_params: AuthenticateRequest): Promise<void> {
