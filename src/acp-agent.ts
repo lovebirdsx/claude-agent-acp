@@ -834,6 +834,10 @@ export class ClaudeAcpAgent implements Agent {
     // to the user (the refused assistant message itself usually has no content)
     // and report ACP's dedicated `refusal` stop reason.
     let lastRefusalExplanation: string | null = null;
+    // Records the most recent tool_use started this turn. When the SDK reports
+    // an unparseable tool call, we append this to the error detail so clients
+    // can see which tool failed — the SDK's message text alone is generic.
+    let lastToolUse: { id: string; name: string; rawInput: string } | undefined;
     // Tracks whether we're inside a compaction. The SDK emits the terminal
     // `status` (compact_result success/failed) twice for a single failed
     // compaction, and the two messages are indistinguishable — so we report the
@@ -1219,7 +1223,7 @@ export class ClaudeAcpAgent implements Agent {
                 if (message.is_error) {
                   throw RequestError.internalError(
                     errorKindData(lastAssistantError),
-                    message.result,
+                    withToolUseContext(message.result, lastToolUse),
                   );
                 }
                 // For local-only commands (no model invocation), the result
@@ -1250,7 +1254,10 @@ export class ClaudeAcpAgent implements Agent {
                 if (message.is_error) {
                   throw RequestError.internalError(
                     errorKindData(lastAssistantError),
-                    message.errors.join(", ") || message.subtype,
+                    withToolUseContext(
+                      message.errors.join(", ") || message.subtype,
+                      lastToolUse,
+                    ),
                   );
                 }
                 if (!isTaskNotification) {
@@ -1264,7 +1271,10 @@ export class ClaudeAcpAgent implements Agent {
                 if (message.is_error) {
                   throw RequestError.internalError(
                     errorKindData(lastAssistantError),
-                    message.errors.join(", ") || message.subtype,
+                    withToolUseContext(
+                      message.errors.join(", ") || message.subtype,
+                      lastToolUse,
+                    ),
                   );
                 }
                 if (!isTaskNotification) {
@@ -1283,6 +1293,28 @@ export class ClaudeAcpAgent implements Agent {
             // it) can all be tagged with the same, replay-stable id.
             if (message.event.type === "message_start") {
               currentStreamMessageId = message.event.message.id || undefined;
+            }
+            if (
+              message.event.type === "content_block_start" &&
+              (message.event.content_block.type === "tool_use" ||
+                message.event.content_block.type === "server_tool_use" ||
+                message.event.content_block.type === "mcp_tool_use")
+            ) {
+              lastToolUse = {
+                id: message.event.content_block.id,
+                name: message.event.content_block.name,
+                rawInput: "",
+              };
+            }
+            // The model's tool input streams in as `input_json_delta` text
+            // fragments; accumulate them so an unparseable tool call can report
+            // the exact (often malformed) JSON that failed to parse.
+            if (
+              message.event.type === "content_block_delta" &&
+              message.event.delta.type === "input_json_delta" &&
+              lastToolUse
+            ) {
+              lastToolUse.rawInput += message.event.delta.partial_json;
             }
             if (
               message.parent_tool_use_id === null &&
@@ -2676,6 +2708,33 @@ function errorKindData(
   errorKind: SDKAssistantMessageError | undefined,
 ): { errorKind: SDKAssistantMessageError } | undefined {
   return errorKind ? { errorKind } : undefined;
+}
+
+/** Matches the Claude SDK's generic "couldn't parse the tool call" failure.
+ *  Only that error gets tool context appended; rate-limit / auth / billing
+ *  results are left untouched to avoid misleading annotations. */
+const TOOL_CALL_PARSE_ERROR = /tool call could not be parsed/i;
+
+/** Cap the embedded tool input so a huge argument blob can't bloat the error
+ *  message; the truncated head is enough to identify the offending call. */
+const MAX_TOOL_INPUT_IN_ERROR = 500;
+
+/** When `detail` is the SDK's unparseable-tool-call message and we observed a
+ *  tool_use this turn, append the tool name/id and the raw (often malformed)
+ *  input so clients can see which tool failed and why. Otherwise returns
+ *  `detail` unchanged. */
+function withToolUseContext(
+  detail: string,
+  toolUse: { id: string; name: string; rawInput: string } | undefined,
+): string {
+  if (toolUse && TOOL_CALL_PARSE_ERROR.test(detail)) {
+    const input = toolUse.rawInput.trim();
+    const inputPart = input
+      ? `, input: ${input.length > MAX_TOOL_INPUT_IN_ERROR ? `${input.slice(0, MAX_TOOL_INPUT_IN_ERROR)}…` : input}`
+      : "";
+    return `${detail} (tool: ${toolUse.name}, id: ${toolUse.id}${inputPart})`;
+  }
+  return detail;
 }
 
 /** Project a nullable API usage object into our non-null snapshot shape.
