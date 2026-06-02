@@ -37,4 +37,11 @@ await writeFile(
   JSON.stringify({ sdkVersion: sdkPkg.version }, null, 2) + '\n',
 )
 
+// Mark the bundle as ESM so Node loads it correctly when `dist/` is shipped on
+// its own. electron-builder's extraResources copies only `dist/`, without the
+// package root's package.json; Node then resolves the module type from the
+// nearest package.json and falls back to CJS, making the bundle's `import`
+// statements throw "Cannot use import statement outside a module".
+await writeFile(resolve(root, 'dist/package.json'), JSON.stringify({ type: 'module' }, null, 2) + '\n')
+
 console.log(`agent bundled → dist/index.js (claude SDK ${sdkPkg.version})`)
