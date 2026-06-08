@@ -190,11 +190,12 @@ type Session = {
    *  cancel. */
   forceCancelTimer?: ReturnType<typeof setTimeout>;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
-  /** Context window size of the last top-level assistant model, carried across
-   *  prompts so mid-stream usage_update notifications report a correct `size`
-   *  before the turn's first result message arrives. Defaults to
-   *  DEFAULT_CONTEXT_WINDOW, refreshed from each result's modelUsage, and
-   *  invalidated when the user switches the session's model. */
+  /** Effective context window (after any `autoCompactWindow` clamp) used as the
+   *  `size` denominator in usage_update notifications, carried across prompts so
+   *  mid-stream updates report a correct `size` before the turn's first result.
+   *  Defaults to DEFAULT_CONTEXT_WINDOW, then prefers getContextUsage's
+   *  `maxTokens` (refreshed each result / at compact boundaries), falling back
+   *  to modelUsage / the model heuristic. Invalidated on model switch. */
   contextWindowSize: number;
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
@@ -981,16 +982,20 @@ export class ClaudeAcpAgent implements Agent {
                 // dropped dramatically) and replaced within seconds by the next
                 // result message.
                 //
-                // `size` keeps coming from session.contextWindowSize (learned
-                // from modelUsage / the model heuristic) — getContextUsage's
-                // window field under-reports extended 1M windows.
+                // `size` comes from getContextUsage's `maxTokens` (the effective
+                // window after the autoCompactWindow clamp) when available, kept
+                // in session.contextWindowSize; otherwise the previously learned
+                // window (modelUsage / the model heuristic) stands.
                 //
                 // The "Compacting completed." text is emitted from the `status`
                 // handler (keyed on `compact_result`), not here, so the failure
                 // path gets a message too.
-                const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
+                const usage = await fetchContextUsage(session.query, this.logger);
                 lastAssistantUsage = null;
-                lastAssistantTotalUsage = usedTokens ?? 0;
+                lastAssistantTotalUsage = usage?.used ?? 0;
+                if (usage?.maxTokens != null) {
+                  session.contextWindowSize = usage.maxTokens;
+                }
                 await this.client.sessionUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -1155,6 +1160,15 @@ export class ClaudeAcpAgent implements Agent {
             // leave the next prompt's mid-stream updates reporting 200k.
             if (matchingModelUsage) {
               session.contextWindowSize = matchingModelUsage.contextWindow;
+            }
+            // Prefer the SDK's effective window (autoCompactWindow clamp applied)
+            // over the model's physical window from modelUsage — it's what
+            // actually governs auto-compaction, so `used / size` matches what
+            // the user sees compaction fire at. One local control request per
+            // turn; mid-stream deltas reuse this cached value.
+            const refreshed = await fetchContextUsage(session.query, this.logger);
+            if (refreshed?.maxTokens != null) {
+              session.contextWindowSize = refreshed.maxTokens;
             }
 
             // Task-notification followups are autonomous work triggered by a
@@ -3736,22 +3750,36 @@ function inferContextWindowFromModel(model: string): number | null {
 
 /** Fetch the SDK's authoritative context-window occupancy via the
  *  `getContextUsage` control request. Unlike the per-message API usage numbers
- *  (which only count message tokens), this `totalTokens` includes the system
- *  prompt, tool schemas, MCP tools, and memory-file overhead — the real
- *  occupancy the user sees. Returns `null` on any control-request failure.
+ *  (which only count message tokens), `totalTokens` includes the system prompt,
+ *  tool schemas, MCP tools, and memory-file overhead — the real occupancy the
+ *  user sees. Returns `null` on any control-request failure.
  *
- *  Note: we deliberately do NOT use this response's window fields for `size`.
- *  They have been observed to under-report extended (1M) context windows, so
- *  the window keeps coming from `modelUsage` / `inferContextWindowFromModel`,
- *  which handle the 1M variants correctly. */
-async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<number | null> {
+ *  `maxTokens` is the *effective* window after the `autoCompactWindow` clamp
+ *  (e.g. `CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000` makes it 200k even on a 1M
+ *  model), which is what actually governs when auto-compaction fires — so it's
+ *  the correct `size` denominator. `rawMaxTokens` is the model's physical limit;
+ *  we only fall back to it (and ultimately to `modelUsage`/the heuristic, via a
+ *  null result) when `maxTokens` is missing or non-positive. We never take a max
+ *  of the two: when a user explicitly clamps the window, `maxTokens <
+ *  rawMaxTokens` is the desired behaviour. */
+async function fetchContextUsage(
+  query: Query,
+  logger: Logger,
+): Promise<{ used: number; maxTokens: number | null } | null> {
   try {
     const usage = await query.getContextUsage();
-    return usage.totalTokens;
+    const maxTokens = pickWindowSize(usage.maxTokens) ?? pickWindowSize(usage.rawMaxTokens);
+    return { used: usage.totalTokens, maxTokens };
   } catch (error) {
     logger.error("Failed to fetch context usage from SDK:", error);
     return null;
   }
+}
+
+/** A usable context-window size is a finite positive number; anything else
+ *  (0, NaN, negative, undefined) means the caller should fall back. */
+function pickWindowSize(value: number | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
 }
 
 /** Translate the legacy `MAX_THINKING_TOKENS` env var into the SDK's `thinking`
