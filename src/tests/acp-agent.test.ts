@@ -3374,6 +3374,135 @@ describe("usage_update computation", () => {
     expect(usageUpdates).toHaveLength(0);
   });
 
+  it("result prefers getContextUsage maxTokens over modelUsage contextWindow", async () => {
+    // The bug this fixes: a 1M physical model with an explicit autoCompactWindow
+    // clamp (e.g. CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000) must report size=200k,
+    // not the physical 1M, so the percentage matches where compaction fires.
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createStreamEvent("message_start", {
+        model: "claude-opus-4-6-1m",
+        usage: {
+          input_tokens: 2000,
+          output_tokens: 1000,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-opus-4-6-1m": {
+            inputTokens: 2000,
+            outputTokens: 1000,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.02,
+            contextWindow: 1000000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"];
+    session.contextWindowSize = 1000000;
+    (session.query as any).getContextUsage = vi
+      .fn()
+      .mockResolvedValue({ totalTokens: 3000, maxTokens: 200000, rawMaxTokens: 1000000 });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
+    // The result update (last) reflects the 200k effective window.
+    expect(usageUpdates[usageUpdates.length - 1].update.size).toBe(200000);
+    expect(session.contextWindowSize).toBe(200000);
+  });
+
+  it("result keeps the physical window when getContextUsage is unclamped (1M)", async () => {
+    // No autoCompactWindow clamp: maxTokens == rawMaxTokens == 1M, so a normal
+    // 1M user sees no regression.
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createStreamEvent("message_start", {
+        model: "claude-opus-4-6-1m",
+        usage: {
+          input_tokens: 2000,
+          output_tokens: 1000,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-opus-4-6-1m": {
+            inputTokens: 2000,
+            outputTokens: 1000,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.02,
+            contextWindow: 1000000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"];
+    session.contextWindowSize = 1000000;
+    (session.query as any).getContextUsage = vi
+      .fn()
+      .mockResolvedValue({ totalTokens: 3000, maxTokens: 1000000, rawMaxTokens: 1000000 });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdates[usageUpdates.length - 1].update.size).toBe(1000000);
+    expect(session.contextWindowSize).toBe(1000000);
+  });
+
+  it("result ignores a non-positive maxTokens and keeps the modelUsage window", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createStreamEvent("message_start", {
+        model: "claude-opus-4-6-1m",
+        usage: {
+          input_tokens: 2000,
+          output_tokens: 1000,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-opus-4-6-1m": {
+            inputTokens: 2000,
+            outputTokens: 1000,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.02,
+            contextWindow: 1000000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"];
+    (session.query as any).getContextUsage = vi
+      .fn()
+      .mockResolvedValue({ totalTokens: 3000, maxTokens: 0, rawMaxTokens: 0 });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
+    // maxTokens:0 and rawMaxTokens:0 are both invalid → fall back to modelUsage.
+    expect(usageUpdates[usageUpdates.length - 1].update.size).toBe(1000000);
+    expect(session.contextWindowSize).toBe(1000000);
+  });
+
   it("switching the session's model invalidates the learned context window", async () => {
     // When the user switches models mid-session, the window learned for the
     // previous model would otherwise persist into the next prompt's first
@@ -3820,26 +3949,48 @@ describe("usage_update computation", () => {
     expect(usageUpdate.update.size).toBe(1000000);
   });
 
-  it("compact_boundary uses authoritative getContextUsage for used, keeps session window for size", async () => {
+  it("compact_boundary uses getContextUsage maxTokens as the effective size", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       { type: "system", subtype: "compact_boundary", session_id: "test-session" },
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
     const session = agent.sessions["test-session"];
-    // A 1M window learned earlier (e.g. from modelUsage) must survive compaction
-    // — getContextUsage's window field under-reports it, so we don't use it.
+    // A 1M physical window was learned earlier, but the user clamped the
+    // effective window (autoCompactWindow) to 200k — getContextUsage reports
+    // that via maxTokens, which is the denominator auto-compaction fires at.
     session.contextWindowSize = 1000000;
     (session.query as any).getContextUsage = vi
       .fn()
-      .mockResolvedValue({ totalTokens: 12345, rawMaxTokens: 200000 });
+      .mockResolvedValue({ totalTokens: 12345, maxTokens: 200000, rawMaxTokens: 1000000 });
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdate).toBeDefined();
     expect(usageUpdate.update.used).toBe(12345);
-    // size stays at the session's learned window, NOT getContextUsage's value.
+    // size follows the effective window (maxTokens), not the physical 1M.
+    expect(usageUpdate.update.size).toBe(200000);
+    expect(session.contextWindowSize).toBe(200000);
+  });
+
+  it("compact_boundary falls back to rawMaxTokens when maxTokens is missing", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      { type: "system", subtype: "compact_boundary", session_id: "test-session" },
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"];
+    session.contextWindowSize = 500000;
+    (session.query as any).getContextUsage = vi
+      .fn()
+      .mockResolvedValue({ totalTokens: 12345, rawMaxTokens: 1000000 });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdate).toBeDefined();
+    expect(usageUpdate.update.used).toBe(12345);
     expect(usageUpdate.update.size).toBe(1000000);
     expect(session.contextWindowSize).toBe(1000000);
   });
