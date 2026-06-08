@@ -5075,9 +5075,10 @@ export class ClaudeAcpAgent {
                 // SDK frames without post_tokens fall back to used:0 and are
                 // corrected by the next result message.
                 //
-                // `size` keeps coming from session.contextWindowSize —
-                // compaction frees occupancy, it doesn't change the model's
-                // window.
+                // `size` comes from getContextUsage's `maxTokens` (the effective
+                // window after the autoCompactWindow clamp) when available, kept
+                // in session.contextWindowSize; otherwise the previously learned
+                // window (modelUsage / the model heuristic) stands.
                 //
                 const compactMetadata = message.compact_metadata;
                 await compaction.finish(
@@ -11626,6 +11627,12 @@ function immediateContextWindow(
       ) ?? DEFAULT_CONTEXT_WINDOW,
     authoritative: false,
   };
+}
+
+/** A usable context-window size is a finite positive number; anything else
+ *  (0, NaN, negative, undefined) means the caller should fall back. */
+function pickWindowSize(value: number | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
 }
 
 /** Translate the legacy `MAX_THINKING_TOKENS` env var into the SDK's `thinking`
