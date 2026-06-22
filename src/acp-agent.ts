@@ -240,7 +240,11 @@ import {
   clearHookCallbacks,
   completeHookCallback,
   createPostToolUseHook,
+<<<<<<< HEAD
   hasHookCallback,
+=======
+  createSubagentStopHook,
+>>>>>>> 045128d (feat: 支持Explore子代理结果持久化)
   createTaskHook,
   parseTaskCreateOutput,
   parseTaskListOutput,
@@ -9611,6 +9615,19 @@ export class ClaudeAcpAgent {
               createTaskHook({
                 taskState,
                 onChange: () => this.publishTaskPlan(sessionId, taskState),
+              }),
+            ],
+          },
+        ],
+        SubagentStop: [
+          ...(userProvidedOptions?.hooks?.SubagentStop || []),
+          {
+            hooks: [
+              createSubagentStopHook({
+                sessionId,
+                cwd: params.cwd,
+                sendUpdate: (notification) => this.client.sessionUpdate(notification),
+                logger: this.logger,
               }),
             ],
           },
