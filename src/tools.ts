@@ -1,6 +1,7 @@
 import {
   ContentBlock,
   PlanEntry,
+  SessionNotification,
   ToolCallContent,
   ToolCallLocation,
   ToolKind,
@@ -55,8 +56,9 @@ import {
   BetaWebFetchToolResultErrorBlock,
   BetaWebSearchToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
+import fs from "node:fs";
 import path from "node:path";
-import { Logger } from "./acp-agent.js";
+import { Logger, type ToolUpdateMeta } from "./acp-agent.js";
 
 /**
  * Union of all possible content types that can appear in tool results from the Anthropic SDK.
@@ -1012,6 +1014,133 @@ export const createTaskHook =
       if (!existing || existing.status === "completed") return { continue: true };
       options.taskState.set(taskId, { ...existing, status: "completed" });
       if (options.onChange) await options.onChange();
+    }
+    return { continue: true };
+  };
+
+function safePathPart(value: unknown): string {
+  return String(value || "unknown").replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function localTimestamp(): string {
+  const now = new Date();
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}${pad(now.getHours())}${pad(now.getMinutes())}`;
+}
+
+/** Render the saved Explore result markdown. Mirrors the legacy command-hook
+ *  script so the on-disk artifact looks identical regardless of which path
+ *  produced it. */
+function exploreResultMarkdown(input: {
+  session_id?: string;
+  agent_id?: string;
+  agent_type?: string;
+  agent_transcript_path?: string;
+  last_assistant_message?: string;
+}): string {
+  return [
+    "# Explore subagent result",
+    "",
+    `- session_id: ${input.session_id || ""}`,
+    `- agent_id: ${input.agent_id || ""}`,
+    `- agent_type: ${input.agent_type || ""}`,
+    `- agent_transcript_path: ${input.agent_transcript_path || ""}`,
+    "",
+    "## Final message",
+    "",
+    input.last_assistant_message || "",
+  ].join("\n");
+}
+
+/**
+ * Hook callback for `SubagentStop`. The headless Explore subagent never writes
+ * to disk, so its final answer is lost to the feed (the streaming handler drops
+ * subagent prose). To surface it the way Plan/Edit changes are surfaced, we
+ * persist the final message under `<cwd>/.claude/explore-results/*.md` and emit
+ * a `Write`-shaped `tool_call` carrying the structuredPatch — that is the only
+ * signal the renderer's SessionChangeTracker records, so the saved result then
+ * appears in the Session Changes view (and as a tool-call card in the timeline).
+ *
+ * Only `agent_type === "Explore"` is handled; other subagents pass through. A
+ * write failure is logged and swallowed so it never aborts the turn.
+ */
+export const createSubagentStopHook =
+  (options: {
+    sessionId: string;
+    cwd: string;
+    sendUpdate: (notification: SessionNotification) => Promise<void>;
+    logger?: Logger;
+  }): HookCallback =>
+  async (input): Promise<{ continue: boolean }> => {
+    if (input.hook_event_name !== "SubagentStop") return { continue: true };
+    if (!("agent_type" in input) || input.agent_type !== "Explore") return { continue: true };
+
+    const message =
+      "last_assistant_message" in input && typeof input.last_assistant_message === "string"
+        ? input.last_assistant_message
+        : "";
+    if (message.trim().length === 0) return { continue: true };
+
+    const agentId = "agent_id" in input && typeof input.agent_id === "string" ? input.agent_id : "";
+    const transcriptPath =
+      "agent_transcript_path" in input && typeof input.agent_transcript_path === "string"
+        ? input.agent_transcript_path
+        : "";
+
+    try {
+      const outDir = path.join(options.cwd, ".claude", "explore-results");
+      fs.mkdirSync(outDir, { recursive: true });
+      const baseName = `${localTimestamp()}-${safePathPart(options.sessionId)}-${safePathPart(agentId)}.md`;
+      const outPath = path.join(outDir, baseName);
+      const content = exploreResultMarkdown({
+        session_id: options.sessionId,
+        agent_id: agentId,
+        agent_type: "Explore",
+        agent_transcript_path: transcriptPath,
+        last_assistant_message: message,
+      });
+      fs.writeFileSync(outPath, content, "utf8");
+
+      // Build a creation diff: one hunk, every line added. This is the same
+      // shape Edit/Write report via PostToolUse, so readStructuredPatch on the
+      // client records it as an `added` Session Change.
+      const lines = content.split("\n");
+      const toolResponse = {
+        filePath: outPath,
+        type: "create",
+        structuredPatch: [
+          {
+            oldStart: 0,
+            oldLines: 0,
+            newStart: 1,
+            newLines: lines.length,
+            lines: lines.map((l) => `+${l}`),
+          },
+        ],
+      };
+      const { content: diffContent } = toolUpdateFromDiffToolResponse(toolResponse);
+
+      await options.sendUpdate({
+        sessionId: options.sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: `explore-result-${agentId || baseName}`,
+          title: `Saved Explore result: ${baseName}`,
+          kind: "edit",
+          status: "completed",
+          ...(diffContent && diffContent.length > 0 ? { content: diffContent } : {}),
+          _meta: {
+            claudeCode: {
+              toolName: "Write",
+              toolResponse,
+            },
+          } satisfies ToolUpdateMeta,
+        },
+      });
+    } catch (err) {
+      options.logger?.error(
+        `[claude-agent-acp] Failed to save Explore result: ${(err as Error).message}`,
+      );
     }
     return { continue: true };
   };

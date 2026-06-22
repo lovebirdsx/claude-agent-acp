@@ -14,6 +14,7 @@ import { AcpClient, toAcpNotifications, ToolUseCache, Logger } from "../acp-agen
 import {
   toolUpdateFromToolResult,
   createPostToolUseHook,
+  createSubagentStopHook,
   createTaskHook,
   toolInfoFromToolUse,
   planEntries,
@@ -23,6 +24,10 @@ import {
   taskStateToPlanEntries,
   TaskState,
 } from "../tools.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import type { SessionNotification } from "@agentclientprotocol/sdk";
 
 describe("rawOutput in tool call updates", () => {
   const mockClient = {} as AcpClient;
@@ -2203,5 +2208,106 @@ describe("empty message content is not emitted", () => {
       sessionUpdate: "agent_message_chunk",
       content: { type: "text", text: "real" },
     });
+  });
+});
+
+describe("createSubagentStopHook", () => {
+  let cwd: string;
+
+  beforeEach(() => {
+    cwd = fs.mkdtempSync(path.join(os.tmpdir(), "explore-result-"));
+  });
+
+  it("persists the Explore result and emits a Write-shaped tool_call", async () => {
+    const sent: SessionNotification[] = [];
+    const hook = createSubagentStopHook({
+      sessionId: "sess-1",
+      cwd,
+      sendUpdate: async (n) => {
+        sent.push(n);
+      },
+    });
+
+    await hook(
+      {
+        hook_event_name: "SubagentStop",
+        agent_type: "Explore",
+        agent_id: "agent-9",
+        agent_transcript_path: "/tmp/transcript.jsonl",
+        last_assistant_message: "Found the bug in foo.ts line 42.",
+        stop_hook_active: false,
+      } as any,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+
+    // A markdown file was written under <cwd>/.claude/explore-results.
+    const outDir = path.join(cwd, ".claude", "explore-results");
+    const files = fs.readdirSync(outDir);
+    expect(files).toHaveLength(1);
+    const written = fs.readFileSync(path.join(outDir, files[0]), "utf8");
+    expect(written).toContain("Found the bug in foo.ts line 42.");
+
+    // One tool_call carrying a Write toolResponse with a structuredPatch.
+    expect(sent).toHaveLength(1);
+    const update = sent[0].update as any;
+    expect(update.sessionUpdate).toBe("tool_call");
+    expect(update.kind).toBe("edit");
+    expect(update.status).toBe("completed");
+    expect(update._meta.claudeCode.toolName).toBe("Write");
+    expect(update._meta.claudeCode.toolResponse.type).toBe("create");
+    expect(Array.isArray(update._meta.claudeCode.toolResponse.structuredPatch)).toBe(true);
+    expect(update.content?.[0]?.type).toBe("diff");
+  });
+
+  it("ignores non-Explore subagents", async () => {
+    const sent: SessionNotification[] = [];
+    const hook = createSubagentStopHook({
+      sessionId: "sess-1",
+      cwd,
+      sendUpdate: async (n) => {
+        sent.push(n);
+      },
+    });
+
+    await hook(
+      {
+        hook_event_name: "SubagentStop",
+        agent_type: "general-purpose",
+        agent_id: "agent-9",
+        last_assistant_message: "done",
+        stop_hook_active: false,
+      } as any,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+
+    expect(sent).toHaveLength(0);
+    expect(fs.existsSync(path.join(cwd, ".claude", "explore-results"))).toBe(false);
+  });
+
+  it("skips when the final message is empty", async () => {
+    const sent: SessionNotification[] = [];
+    const hook = createSubagentStopHook({
+      sessionId: "sess-1",
+      cwd,
+      sendUpdate: async (n) => {
+        sent.push(n);
+      },
+    });
+
+    await hook(
+      {
+        hook_event_name: "SubagentStop",
+        agent_type: "Explore",
+        agent_id: "agent-9",
+        last_assistant_message: "   ",
+        stop_hook_active: false,
+      } as any,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+
+    expect(sent).toHaveLength(0);
   });
 });
