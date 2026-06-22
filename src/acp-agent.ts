@@ -112,6 +112,7 @@ import {
   applyTaskUpdate,
   ClaudePlanEntry,
   createPostToolUseHook,
+  createSubagentStopHook,
   createTaskHook,
   parseTaskCreateOutput,
   planEntries,
@@ -5691,6 +5692,19 @@ export class ClaudeAcpAgent {
                     },
                   });
                 },
+              }),
+            ],
+          },
+        ],
+        SubagentStop: [
+          ...(userProvidedOptions?.hooks?.SubagentStop || []),
+          {
+            hooks: [
+              createSubagentStopHook({
+                sessionId,
+                cwd: params.cwd,
+                sendUpdate: (notification) => this.client.sessionUpdate(notification),
+                logger: this.logger,
               }),
             ],
           },
