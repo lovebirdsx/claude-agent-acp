@@ -240,11 +240,9 @@ import {
   clearHookCallbacks,
   completeHookCallback,
   createPostToolUseHook,
-<<<<<<< HEAD
-  hasHookCallback,
-=======
+  createPostToolUseHook,
   createSubagentStopHook,
->>>>>>> 045128d (feat: 支持Explore子代理结果持久化)
+  hasHookCallback,
   createTaskHook,
   parseTaskCreateOutput,
   parseTaskListOutput,
@@ -5966,6 +5964,16 @@ export class ClaudeAcpAgent {
 
               // Send usage_update notification
               if (lastAssistantTotalUsage !== null) {
+                // Per-model breakdown (session-cumulative, including sub-agent /
+                // Task work — `message.modelUsage` already folds those in). The
+                // ACP `usage_update` schema is fixed to {used,size,cost}, so the
+                // breakdown rides along in `_meta` like `_claude/origin` does.
+                const modelBreakdown = toModelBreakdown(message.modelUsage);
+                const meta: Record<string, unknown> = {};
+                if (message.origin) meta["_claude/origin"] = message.origin;
+                if (modelBreakdown.length > 0) {
+                  meta["_universe/modelBreakdown"] = modelBreakdown;
+                }
                 await sendUpdate({
                   sessionId: params.sessionId,
                   update: attachUsageModel({
@@ -5976,10 +5984,9 @@ export class ClaudeAcpAgent {
                       amount: message.total_cost_usd,
                       currency: "USD",
                     },
-                    ...(message.origin && {
-                      _meta: { "_claude/origin": message.origin },
-                    }),
-                  }),
+                    ...(Object.keys(meta).length > 0 && { _meta: meta }),
+                  },
+>>>>>>> ddf2591 (feat: usage_update 携带模型级成本明细)
                 });
               }
 
@@ -11683,6 +11690,35 @@ function parseModelConfig(
   if (parsed.modelOverrides !== undefined) result.modelOverrides = parsed.modelOverrides;
   if (parsed.availableModels !== undefined) result.availableModels = parsed.availableModels;
   return Object.keys(result).length > 0 ? result : undefined;
+}
+
+/** Per-model cost/token breakdown carried in the `usage_update` `_meta`. */
+export type ModelCostBreakdown = {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreateTokens: number;
+  costUSD: number;
+};
+
+/**
+ * Flatten the SDK's `modelUsage` map into a stable array for the wire. Values
+ * are session-cumulative and already include sub-agent (Task) work, so this is
+ * the authoritative per-model cost breakdown for the whole session.
+ */
+function toModelBreakdown(
+  modelUsage: Record<string, ModelUsage> | undefined,
+): ModelCostBreakdown[] {
+  if (!modelUsage) return [];
+  return Object.entries(modelUsage).map(([model, u]) => ({
+    model,
+    inputTokens: u.inputTokens ?? 0,
+    outputTokens: u.outputTokens ?? 0,
+    cacheReadTokens: u.cacheReadInputTokens ?? 0,
+    cacheCreateTokens: u.cacheCreationInputTokens ?? 0,
+    costUSD: u.costUSD ?? 0,
+  }));
 }
 
 function getMatchingModelUsage(modelUsage: Record<string, ModelUsage>, currentModel: string) {
