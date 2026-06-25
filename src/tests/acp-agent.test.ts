@@ -3002,6 +3002,66 @@ describe("usage_update computation", () => {
     expect(usageUpdate.update.used).toBe(1800);
   });
 
+  it("carries per-model cost breakdown in usage_update _meta", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createAssistantMessage({ model: "claude-opus-4-20250514" }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-opus-4-20250514": {
+            inputTokens: 1000,
+            outputTokens: 500,
+            cacheReadInputTokens: 200,
+            cacheCreationInputTokens: 100,
+            webSearchRequests: 0,
+            costUSD: 0.42,
+            contextWindow: 1000000,
+            maxOutputTokens: 16384,
+          },
+          // A sub-agent (Task) ran on Haiku — its usage is folded into the same
+          // session-cumulative map, so it shows up as its own breakdown row.
+          "claude-haiku-4-5-20251001": {
+            inputTokens: 300,
+            outputTokens: 80,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.03,
+            contextWindow: 200000,
+            maxOutputTokens: 8192,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const finalUpdate = updates
+      .filter((u: any) => u.update?.sessionUpdate === "usage_update")
+      .at(-1);
+    const breakdown = finalUpdate.update._meta?.["_universe/modelBreakdown"];
+    expect(breakdown).toBeDefined();
+    expect(breakdown).toEqual([
+      {
+        model: "claude-opus-4-20250514",
+        inputTokens: 1000,
+        outputTokens: 500,
+        cacheReadTokens: 200,
+        cacheCreateTokens: 100,
+        costUSD: 0.42,
+      },
+      {
+        model: "claude-haiku-4-5-20251001",
+        inputTokens: 300,
+        outputTokens: 80,
+        cacheReadTokens: 0,
+        cacheCreateTokens: 0,
+        costUSD: 0.03,
+      },
+    ]);
+  });
+
   it("coerces null input/output tokens so wire `used` is never null", async () => {
     // Synthetic or third-party-backend stream events have been observed
     // emitting input_tokens/output_tokens as null. Without coercion the
