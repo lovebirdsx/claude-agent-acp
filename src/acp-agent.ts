@@ -916,6 +916,10 @@ export class ClaudeAcpAgent {
           cwd: session.cwd as string,
           title: sanitizeTitle(session.summary),
           updatedAt: await this.lastActivityIso(session),
+          // ACP `SessionInfo` has no standard branch field; carry the SDK's
+          // end-of-session git branch through `_meta` so the editor can group
+          // sessions by worktree.
+          ...(session.gitBranch ? { _meta: { gitBranch: session.gitBranch } } : {}),
         })),
     );
     return {
