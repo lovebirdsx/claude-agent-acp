@@ -49,6 +49,7 @@ import {
   getSessionInfo,
   getSessionMessages,
   query,
+  renameSession,
   SDKAssistantMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
@@ -59,6 +60,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     ...actual,
     deleteSession: vi.fn(),
     getSessionInfo: vi.fn(),
+    renameSession: vi.fn(),
   };
 });
 import type {
@@ -3417,6 +3419,57 @@ describe("session/delete", () => {
 
     expect(agent.sessions["session-a"]).toBeUndefined();
     expect(agent.sessions["session-b"]).toBeDefined();
+  });
+});
+
+describe("universe-editor/set_session_title (setSessionTitle)", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AcpClient;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  beforeEach(() => {
+    vi.mocked(renameSession).mockReset();
+    vi.mocked(renameSession).mockResolvedValue(undefined);
+  });
+
+  it("persists the title via renameSession using the live session cwd", async () => {
+    const agent = createMockAgent();
+    agent.sessions["s-1"] = { cwd: "/proj" } as any;
+
+    const result = await agent.setSessionTitle({ sessionId: "s-1", title: "  Fix login bug  " });
+
+    expect(result).toEqual({});
+    // Title is trimmed; cwd is forwarded as the project dir.
+    expect(renameSession).toHaveBeenCalledWith("s-1", "Fix login bug", { dir: "/proj" });
+  });
+
+  it("falls back to searching all projects when the session is not resident", async () => {
+    const agent = createMockAgent();
+
+    await agent.setSessionTitle({ sessionId: "absent", title: "Some title" });
+
+    expect(renameSession).toHaveBeenCalledWith("absent", "Some title", undefined);
+  });
+
+  it("rejects an empty / whitespace-only title without calling renameSession", async () => {
+    const agent = createMockAgent();
+
+    await expect(agent.setSessionTitle({ sessionId: "s-1", title: "   " })).rejects.toThrow(
+      "title must be non-empty",
+    );
+    expect(renameSession).not.toHaveBeenCalled();
+  });
+
+  it("propagates errors from the SDK rename call", async () => {
+    const agent = createMockAgent();
+    vi.mocked(renameSession).mockRejectedValueOnce(new Error("disk full"));
+
+    await expect(agent.setSessionTitle({ sessionId: "s-1", title: "x" })).rejects.toThrow(
+      "disk full",
+    );
   });
 });
 
