@@ -62,6 +62,7 @@ import {
   PermissionUpdate,
   Query,
   query,
+  renameSession,
   Settings,
   SDKAssistantMessageError,
   SDKMessage,
@@ -116,6 +117,19 @@ export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
 
 const MAX_TITLE_LENGTH = 256;
+
+/**
+ * Custom (extension) request the editor sends to persist a session title onto
+ * the agent's durable store. Without this the editor's AI-generated title lives
+ * only client-side and is clobbered by `session/list`'s `summary` after a
+ * `/compact` resets the SDK's auto-summary back to the first prompt.
+ */
+export const SET_SESSION_TITLE_METHOD = "universe-editor/set_session_title";
+
+interface SetSessionTitleRequest {
+  sessionId: string;
+  title: string;
+}
 
 function sanitizeTitle(text: string): string {
   // Replace newlines and collapse whitespace
@@ -1705,10 +1719,7 @@ export class ClaudeAcpAgent {
                   failActive(
                     RequestError.internalError(
                       errorKindData(lastAssistantError),
-                      withToolUseContext(
-                        message.errors.join(", ") || message.subtype,
-                        lastToolUse,
-                      ),
+                      withToolUseContext(message.errors.join(", ") || message.subtype, lastToolUse),
                     ),
                   );
                   break;
@@ -1725,10 +1736,7 @@ export class ClaudeAcpAgent {
                   failActive(
                     RequestError.internalError(
                       errorKindData(lastAssistantError),
-                      withToolUseContext(
-                        message.errors.join(", ") || message.subtype,
-                        lastToolUse,
-                      ),
+                      withToolUseContext(message.errors.join(", ") || message.subtype, lastToolUse),
                     ),
                   );
                   break;
@@ -2443,6 +2451,27 @@ export class ClaudeAcpAgent {
     return { configOptions: session.configOptions };
   }
 
+  /**
+   * Persist a session title to the SDK's durable store via `renameSession`,
+   * which appends a `custom-title` entry. `customTitle` has the highest
+   * precedence in `SDKSessionInfo.summary`, so it survives `/compact` (which
+   * otherwise resets the auto-summary back to the first prompt) and is what
+   * `session/list` reports back on the next hydrate. Backs the editor's
+   * `universe-editor/set_session_title` ext-method.
+   */
+  async setSessionTitle(params: SetSessionTitleRequest): Promise<Record<string, never>> {
+    const title = typeof params.title === "string" ? params.title.trim() : "";
+    if (!title) {
+      throw new Error("title must be non-empty");
+    }
+    // Prefer the live session's cwd so renameSession targets the right project
+    // dir; fall back to searching all projects when the session isn't resident
+    // (e.g. the editor titled it before resuming).
+    const cwd = this.sessions[params.sessionId]?.cwd;
+    await renameSession(params.sessionId, title, cwd ? { dir: cwd } : undefined);
+    return {};
+  }
+
   private async applySessionMode(sessionId: string, modeId: string): Promise<void> {
     switch (modeId) {
       case "auto":
@@ -2473,7 +2502,6 @@ export class ClaudeAcpAgent {
         }
         throw error;
       } else {
-        // eslint-disable-next-line preserve-caught-error
         throw new Error("Invalid Mode");
       }
     }
@@ -4672,6 +4700,11 @@ export function runAcp() {
       agent.setSessionConfigOption(ctx.params),
     )
     .onRequest(methods.agent.authenticate, (ctx) => agent.authenticate(ctx.params))
+    .onRequest(
+      SET_SESSION_TITLE_METHOD,
+      (params) => params as SetSessionTitleRequest,
+      (ctx) => agent.setSessionTitle(ctx.params),
+    )
     .onRequest(methods.agent.session.prompt, (ctx) =>
       runPromptWithCancellation(agent, ctx.params, ctx.signal),
     )
