@@ -4326,7 +4326,7 @@ export function toAcpNotifications(
       case "thinking_delta":
         // Recent models default `thinking.display` to "omitted", which streams
         // signature-only thinking blocks whose text is empty.
-        if (chunk.thinking.length > 0) {
+        if (chunk.thinking && chunk.thinking.length > 0) {
           update = {
             sessionUpdate: "agent_thought_chunk",
             content: {
