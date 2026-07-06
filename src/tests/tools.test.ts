@@ -31,15 +31,11 @@ import {
   taskStateToPlanEntries,
   TaskState,
 } from "../tools.js";
-<<<<<<< HEAD
 import { ClientCapabilities as ToolCallCapabilities } from "../tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
-=======
 import fs from "node:fs";
 import os from "node:os";
-import path from "node:path";
 import type { SessionNotification } from "@agentclientprotocol/sdk";
->>>>>>> 045128d (feat: 支持Explore子代理结果持久化)
 
 /** An AIR client: it gets the ACP tool call contract (`docs/air-extensions.md`). */
 const AIR_CLIENT: ClientCapabilities = {
@@ -4302,6 +4298,8 @@ describe("createSubagentStopHook", () => {
     );
 
     expect(sent).toHaveLength(0);
+  });
+});
   });
 });
 

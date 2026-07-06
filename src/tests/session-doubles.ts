@@ -41,6 +41,7 @@ export function wrapQuery(generator: AsyncGenerator<any>) {
     stopTask: vi.fn(async () => {}),
     close: vi.fn(),
     setModel: vi.fn(async () => {}),
+    rewindFiles: vi.fn(async () => ({ canRewind: true, filesChanged: [], insertions: 0, deletions: 0 })),
   }) as any;
 }
 

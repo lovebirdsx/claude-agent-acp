@@ -19,6 +19,7 @@ import { AcpToolCallRenderer, type RenderedResult } from "./tool-calls/renderer.
 
 export { markdownEscape, toDisplayPath } from "./tool-calls/content.js";
 import fs from "node:fs";
+import path from "node:path";
 import { toolUpdateFromDiffToolResponse } from "./diff.js";
 import { Logger, type ToolUpdateMeta } from "./acp-agent.js";
 

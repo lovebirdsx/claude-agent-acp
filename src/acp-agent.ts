@@ -62,6 +62,7 @@ import {
   deleteSession,
   FastModeDisabledReason,
   FastModeState,
+  forkSession as sdkForkSession,
   getSessionMessages,
   getSubagentMessages,
   listSessions,
@@ -85,7 +86,6 @@ import {
   SDKPartialAssistantMessage,
   SessionMessage,
   SDKUserMessage,
-  Settings,
   SlashCommand,
   ThinkingConfig,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -173,6 +173,7 @@ import {
 import { forkSession } from "./fork-session.js";
 import { subagentHistory } from "./subagent-history.js";
 import {
+  findTranscript,
   readResumedSession,
   readResumedTail,
   type ResumedSessionSnapshot,
@@ -241,7 +242,6 @@ import {
   ClaudePlanEntry,
   clearHookCallbacks,
   completeHookCallback,
-  createPostToolUseHook,
   createPostToolUseHook,
   createSubagentStopHook,
   hasHookCallback,
@@ -333,6 +333,7 @@ function isEmptyUserInterruptionDiagnostic(
     /(?:^|\s)last_content_type=n\/a(?:\s|$)/.test(diagnostic) &&
     /(?:^|\s)stop_reason=null(?:\s|$)/.test(diagnostic)
   );
+}
 
 /**
  * Custom (extension) request the editor sends to persist a session title onto
@@ -346,6 +347,31 @@ interface SetSessionTitleRequest {
   sessionId: string;
   title: string;
 }
+
+/**
+ * Custom ACP request that rewinds a session to a specific user message: it
+ * restores files edited since that message to their on-disk state at that point
+ * (`Query.rewindFiles`, needs `enableFileCheckpointing`) and truncates the
+ * conversation history past it (by recreating the underlying Query with
+ * `resumeSessionAt`). Shared verbatim with the editor's `acpSessionModel.ts`
+ * (`REWIND_SESSION_METHOD`) — keep both in sync. `messageId` is the ACP message
+ * id the client stamped on the user turn (`PromptRequest.messageId`); it is
+ * translated to the SDK message uuid via `Session.messageIdToUuid`.
+ */
+export const REWIND_SESSION_METHOD = "universe-editor/rewind_session";
+
+interface RewindSessionRequest {
+  sessionId: string;
+  messageId: string;
+  /** Preview file changes without modifying disk or truncating the conversation. */
+  dryRun?: boolean;
+  /**
+   * Whether to roll back agent-edited files to their on-disk state at the anchor
+   * (回退时撤销修改). Defaults to true. When false the conversation is still
+   * truncated but the files are left as-is (保留修改并回退) — the two steps of a
+   * rewind are independent, so this simply skips `Query.rewindFiles`.
+   */
+  rewindFiles?: boolean;
 }
 
 /**
@@ -639,7 +665,9 @@ function parseSteerRequest(params: unknown): SteerRequest {
 type Turn = {
   /** uuid stamped on the pushed `SDKUserMessage`; the SDK echoes it back so the
    *  consumer can match the replayed user message to this turn. It is also the
-   *  id of the user message the turn reports as inserted. */
+   *  id of the user message the turn reports as inserted. Equals the
+   *  client-supplied ACP `messageId` when one was provided, so rewind/fork can
+   *  target this exact turn. */
   promptUuid: string;
   /** Where the turn reports how it progresses (see {@link TurnEvents}). */
   events: TurnEvents;
@@ -2197,6 +2225,10 @@ class ChangedMetaClient implements AcpClient {
     private readonly airClient: () => boolean,
   ) {}
 
+  extMethod(method: string, params: Record<string, unknown>): Promise<unknown> {
+    return this.inner.extMethod(method, params);
+  }
+
   async sessionUpdate(params: AcpSessionNotification): Promise<void> {
     if (!this.airClient()) return this.inner.sessionUpdate(params);
     const update = this.filter.apply(params.update as SessionNotification["update"]);
@@ -2799,6 +2831,34 @@ export class ClaudeAcpAgent {
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
+    // Fork's own fork point: the editor passes the ACP messageId of the user
+    // turn to fork from in `_meta.rewindTo`. Translate it to the SDK message
+    // uuid and materialize the fork ON DISK with the SDK's `forkSession`, so the
+    // `session/load` the client issues next replays the inherited history
+    // instead of showing an empty session.
+    //
+    // `forkSession({upToMessageId})` slices the transcript up to and INCLUDING
+    // that uuid, but a fork "from message X" must contain everything BEFORE X
+    // and not X itself — so we key on the predecessor of the anchored user turn.
+    // When X is the very first message there is no predecessor and the fork
+    // degenerates to an empty history, which the editor does not expose.
+    const rewindTo = (params._meta as { rewindTo?: unknown } | undefined)?.rewindTo;
+    if (typeof rewindTo === "string") {
+      const anchorUuid = this.resolveMessageUuid(params.sessionId, rewindTo);
+      const upToMessageId =
+        anchorUuid !== undefined
+          ? await this.messageUuidBefore(params.sessionId, anchorUuid, params.cwd)
+          : undefined;
+      // Do NOT create a resident session here: the client loads the fork next
+      // (session/load), which resumes it from disk and replays its history. A
+      // resident in-memory session would make getOrCreateSession short-circuit
+      // and skip that disk-backed replay.
+      const { sessionId } = await sdkForkSession(params.sessionId, {
+        dir: params.cwd,
+        ...(upToMessageId !== undefined ? { upToMessageId } : {}),
+      });
+      return { sessionId };
+    }
     return forkSession(params, {
       liveMessageIdToUuid: this.sessions[params.sessionId]?.messageIdToUuid,
       logger: this.logger,
@@ -3397,8 +3457,27 @@ export class ClaudeAcpAgent {
     }
 
     const userMessage = promptToClaude(params);
-    const promptUuid = randomUUID();
+    // Honour the client-supplied ACP message id (UUID) as the SDK message uuid so
+    // the id the client anchors its user turn on IS the id the SDK's
+    // rewind/resume APIs key on. Without this the client's anchor (used by
+    // rewind/fork) never matches anything in `messageIdToUuid` and rewind fails
+    // with "Unknown messageId". Falls back to a fresh uuid when the client sends
+    // none.
+    //
+    // The id travels in `_meta.messageId`, NOT the top-level `messageId`: this
+    // fork's ACP schema (`zPromptRequest`) has no `messageId` field, and zod
+    // strips unknown top-level keys before we see them — but `_meta` is an
+    // explicit passthrough bag that survives validation.
+    const metaMessageId = (params._meta as { messageId?: unknown } | undefined)?.messageId;
+    const clientMessageId = typeof metaMessageId === "string" ? metaMessageId : undefined;
+    const promptUuid =
+      clientMessageId && clientMessageId.length > 0
+        ? (clientMessageId as ReturnType<typeof randomUUID>)
+        : randomUUID();
     userMessage.uuid = promptUuid;
+    // Record the mapping eagerly so a rewind/fork targeting this turn resolves
+    // even before the message is echoed back through the consumer loop.
+    session.messageIdToUuid.set(promptUuid, promptUuid);
 
     // Local-only commands (e.g. `/clear`) return a result without replaying the
     // user message, so the consumer can't promote the turn from the echo.
@@ -6004,7 +6083,7 @@ export class ClaudeAcpAgent {
                       currency: "USD",
                     },
                     ...(Object.keys(meta).length > 0 && { _meta: meta }),
-                  },
+                  }),
                 });
               }
 
@@ -7753,6 +7832,221 @@ export class ClaudeAcpAgent {
     return {};
   }
 
+  /**
+   * Translate the ACP messageId the client stamped on a user turn into the SDK
+   * message uuid the Agent SDK's rewind/resume APIs key on, using the live
+   * session's `messageIdToUuid` table (populated during the message loop and on
+   * `replaySessionHistory`). Returns undefined when the session isn't resident or
+   * the id is unknown — callers decide whether that is fatal (rewind) or a
+   * fall-through to whole-session behavior (fork).
+   */
+  private resolveMessageUuid(sessionId: string, messageId: string): string | undefined {
+    return this.sessions[sessionId]?.messageIdToUuid.get(messageId);
+  }
+
+  /**
+   * Resolve the on-disk transcript uuid of the message immediately preceding the
+   * one with `targetUuid`. Both rewind (回退) and fork (分叉) truncate the
+   * conversation to *before* a user turn, but the SDK's `resumeSessionAt` /
+   * `forkSession({upToMessageId})` are BOTH inclusive of the id they're given —
+   * so to exclude the anchored user message we key on its predecessor. Returns
+   * undefined when the target is the first message (nothing precedes it, so the
+   * truncation point is "empty history") or can't be located.
+   */
+  private async messageUuidBefore(
+    sessionId: string,
+    targetUuid: string,
+    dir?: string,
+  ): Promise<string | undefined> {
+    const messages = await getSessionMessages(sessionId, dir !== undefined ? { dir } : {});
+    const idx = messages.findIndex((m) => m.uuid === targetUuid);
+    if (idx <= 0) return undefined;
+    return messages[idx - 1]?.uuid;
+  }
+
+  /**
+   * Physically truncate a session's on-disk JSONL transcript so a rewind (回退)
+   * PERSISTS across reload. This is required because the SDK exposes no public
+   * "truncate conversation" API: `--resume-session-at` only rebuilds the
+   * in-memory Query, never rewriting the append-only transcript at
+   * `<CLAUDE_CONFIG_DIR>/projects/<encoded-cwd>/<sessionId>.jsonl`. Without this,
+   * `session/load` on the next launch replays the full history and the rewound
+   * turns reappear.
+   *
+   * Drops the line whose `uuid === anchorUuid` (the rewound user turn) and every
+   * line after it — matching the in-memory replay boundary
+   * (`replaySessionHistory({stopBeforeUuid: anchorUuid})`), so disk and memory
+   * agree. Non-message lines after the anchor (file-history-snapshot / mode /
+   * custom-title / queue-operation) belong to the discarded turns and go too.
+   *
+   * Best-effort: any failure (file/anchor not found, IO error) is logged and
+   * skipped rather than thrown — a failed persist must not break the live rewind.
+   *
+   * Format assumptions (verified against SDK 0.3.198, re-check on SDK upgrade):
+   * one JSON object per line, each carrying a `uuid` field that equals the uuid
+   * `getSessionMessages` returns; strictly append-ordered; trailing newline.
+   */
+  private async truncateTranscriptBefore(
+    sessionId: string,
+    anchorUuid: string,
+  ): Promise<void> {
+    try {
+      const file = await findTranscript(sessionId);
+      if (file === undefined) {
+        this.logger.error(
+          `rewind persist: no transcript found for ${sessionId}; skipping disk truncation`,
+        );
+        return;
+      }
+      const raw = await fs.readFile(file, "utf8");
+      const lines = raw.split("\n");
+      let cut = -1;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line) continue;
+        try {
+          const obj = JSON.parse(line) as { uuid?: unknown };
+          if (obj.uuid === anchorUuid) {
+            cut = i;
+            break;
+          }
+        } catch {
+          // Non-JSON / blank line — skip.
+        }
+      }
+      if (cut < 0) {
+        this.logger.error(
+          `rewind persist: anchor ${anchorUuid} not found in ${file}; skipping disk truncation`,
+        );
+        return;
+      }
+      // Keep everything before the anchor line, restore the trailing newline.
+      const kept = lines.slice(0, cut);
+      const next = kept.length > 0 ? kept.join("\n") + "\n" : "";
+      // Atomic replace: write a temp file then rename, so an interrupted write
+      // can't leave a half-truncated transcript that corrupts the session.
+      const tmp = `${file}.rewind-${sessionId}.tmp`;
+      await fs.writeFile(tmp, next, "utf8");
+      await fs.rename(tmp, file);
+      this.logger.error(
+        `rewind persist: truncated ${file} at line ${cut} (${lines.length} → ${kept.length} lines)`,
+      );
+    } catch (error) {
+      this.logger.error(`rewind persist: failed to truncate transcript for ${sessionId}: ${error}`);
+    }
+  }
+
+  /**
+   * Rewind a session to a specific user message (回退). Two INDEPENDENT steps,
+   * because the SDK exposes no single "truncate conversation + files" call:
+   *   1. `Query.rewindFiles(uuid)` restores files edited since that message to
+   *      their on-disk state at that point (needs `enableFileCheckpointing`).
+   *      Skipped when `rewindFiles === false` (保留修改并回退): the conversation
+   *      is truncated but the working tree is left as the user left it.
+   *   2. Recreate the underlying Query with `resumeSessionAt` truncated to the
+   *      message *before* the anchor, then replay the (now-shortened) history —
+   *      stopping before the anchor — so the client's timeline drops the rewound
+   *      turn and everything after it.
+   * A `dryRun` performs only step 1 in preview mode and reports the file stats
+   * without mutating disk or the conversation. Backs the editor's
+   * `universe-editor/rewind_session` ext-method.
+   */
+  async rewindSession(params: RewindSessionRequest): Promise<Record<string, unknown>> {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
+      throw RequestError.resourceNotFound(params.sessionId);
+    }
+    const uuid = this.resolveMessageUuid(params.sessionId, params.messageId);
+    if (uuid === undefined) {
+      throw RequestError.invalidParams(
+        { messageId: params.messageId },
+        `Unknown messageId for session ${params.sessionId}; cannot resolve a rewind target`,
+      );
+    }
+
+    // Step 1: roll the files back to the anchored user turn (or preview them for a
+    // dry run). `rewindFiles` keys on the user-message uuid itself: it restores
+    // the disk to the state captured just before that turn ran. Skipped entirely
+    // when the client opted to keep its edits (`rewindFiles === false`), in which
+    // case we still truncate the conversation below. A dry run always previews.
+    const shouldRewindFiles = params.rewindFiles !== false;
+    if (params.dryRun === true) {
+      return { ...(await session.query.rewindFiles(uuid, { dryRun: true })) };
+    }
+    if (shouldRewindFiles) {
+      const fileResult = await session.query.rewindFiles(uuid, { dryRun: false });
+      // A failed file rewind (no checkpoint) aborts the whole operation so the
+      // conversation and files stay consistent.
+      if (!fileResult.canRewind) {
+        return { ...fileResult };
+      }
+    }
+
+    // Step 2: recreate the Query truncated to BEFORE the anchor, then replay the
+    // shortened history. `resumeSessionAt` is inclusive and wants the assistant
+    // uuid preceding the user turn; `replaySessionHistory` reads the still-whole
+    // disk transcript, so it must also stop before the anchor. When the anchor is
+    // the first message there is no predecessor — resume the session whole (empty
+    // truncation point) and replay nothing.
+    const beforeUuid = await this.messageUuidBefore(params.sessionId, uuid, session.cwd);
+    // Persist the truncation to disk BEFORE tearing the session down (we still
+    // have its cwd here). `resumeSessionAt` only rebuilds the in-memory Query, so
+    // without this the rewound turns reappear on the next reload.
+    await this.truncateTranscriptBefore(params.sessionId, uuid);
+    const recreateParams = session.creationParams ?? { cwd: session.cwd, mcpServers: [] };
+    await this.teardownSession(params.sessionId);
+    await this.createSession(recreateParams, {
+      resume: params.sessionId,
+      ...(beforeUuid !== undefined ? { resumeSessionAt: beforeUuid } : {}),
+    });
+    await this.replaySessionHistory(params.sessionId, undefined, undefined, uuid);
+    // Report the truncation as a successful rewind. When files were kept there is
+    // nothing to roll back, so the file stats are all zero.
+    return { canRewind: true, filesChanged: [], insertions: 0, deletions: 0 };
+  }
+
+  private async applySessionMode(sessionId: string, modeId: string): Promise<void> {
+    switch (modeId) {
+      case "auto":
+      case "default":
+      case "acceptEdits":
+      case "bypassPermissions":
+      case "dontAsk":
+      case "plan":
+        break;
+      default:
+        throw new Error("Invalid Mode");
+    }
+
+    const session = this.sessions[sessionId];
+    if (!session) {
+      throw new Error("Session not found");
+    }
+    if (!session.modes.availableModes.some((mode) => mode.id === modeId)) {
+      throw new Error(`Mode ${modeId} is not available in this session`);
+    }
+
+    try {
+      await session.query.setPermissionMode(modeId);
+    } catch (error) {
+      if (error instanceof Error) {
+        if (!error.message) {
+          error.message = "Invalid Mode";
+        }
+        throw error;
+      } else {
+        throw new Error("Invalid Mode");
+      }
+    }
+  }
+
+  private async replaySessionHistory(
+    sessionId: string,
+    resumedMessages?: SessionMessage[],
+    pending?: PendingReplay,
+    stopBeforeUuid?: string,
+  ): Promise<void> {
+    const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
     const messages = resumedMessages ?? (await getSessionMessages(sessionId));
     const historyLoadedAt = performance.now();
@@ -8153,7 +8447,16 @@ export class ClaudeAcpAgent {
         }
       }
     };
-    for (const message of messages) await replayMessage(message);
+    for (const message of messages) {
+      // Rewind (回退) truncates the conversation to *before* the anchored user
+      // turn. `resumeSessionAt` only truncates the in-memory Query — the on-disk
+      // transcript this reads is still whole — so stop the replay at the anchor
+      // ourselves, or the client re-renders the un-truncated history.
+      if (stopBeforeUuid !== undefined && message.uuid === stopBeforeUuid) {
+        break;
+      }
+      await replayMessage(message);
+    }
 
     if (nativeReplayEnabled && !pending?.stopped) {
       // Claude history persists sidechain messages and Agent/Task tool uses,
@@ -9271,6 +9574,10 @@ export class ClaudeAcpAgent {
       resumedModelHint?: string | Promise<string | undefined>;
       /** The state that a replay on the same session uses before this record exists. */
       replayState?: ReplayState;
+      /** Truncate the recreated query to the message with this uuid (inclusive).
+       *  Used by rewind (回退): the query resumes up to the message *before* the
+       *  anchored user turn. */
+      resumeSessionAt?: string;
     } = {},
   ): Promise<NewSessionResponse> {
     const createStartedAt = performance.now();
@@ -9531,6 +9838,10 @@ export class ClaudeAcpAgent {
       cwd: params.cwd,
       includePartialMessages: true,
       forwardSubagentText,
+      // Snapshot files before edits so `Query.rewindFiles()` can restore them to
+      // their state at any user message — the backing mechanism for the client's
+      // rewind (回退) feature. Without this, rewindFiles rejects with canRewind:false.
+      enableFileCheckpointing: true,
       mcpServers: {
         ...(userProvidedOptions?.mcpServers || {}),
         ...mcpServers,
@@ -11531,6 +11842,11 @@ export function v1AgentApp(
       SET_SESSION_TITLE_METHOD,
       (params) => params as SetSessionTitleRequest,
       (ctx) => agent.setSessionTitle(ctx.params),
+    )
+    .onRequest(
+      REWIND_SESSION_METHOD,
+      (params) => params as RewindSessionRequest,
+      (ctx) => agent.rewindSession(ctx.params),
     )
     .onRequest(methods.agent.session.prompt, (ctx) =>
       runPromptWithCancellation(agent, ctx.params, ctx.signal),

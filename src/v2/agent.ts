@@ -146,6 +146,15 @@ class V2ClientConnection implements AcpClient {
     return this.ctx.notify(method, params);
   }
 
+  /** Extension request counterpart of {@link extNotification}, backing the
+   *  `universe-editor/ask_user_question` round-trip on a v2 connection. */
+  extMethod(method: string, params: Record<string, unknown>): Promise<unknown> {
+    if (!isExtensionMethod(method)) {
+      return Promise.reject(new Error(`${method} is not an ACP extension method`));
+    }
+    return this.ctx.request(method, params);
+  }
+
   async sessionUpdate({ update, ...notification }: AcpSessionNotification): Promise<void> {
     const updates = this.v2Updates(notification.sessionId, update).flatMap((v2Update) => {
       const clear = this.replayClear(notification.sessionId, v2Update);
