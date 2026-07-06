@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from "vitest";
 import { spawn, spawnSync } from "child_process";
 import {
   AvailableCommand,
@@ -40,12 +40,14 @@ import {
   createFastModeConfigOption,
   discoverCustomAgents,
   runPromptWithCancellation,
+  CLAUDE_CONFIG_DIR,
   type AcpClient,
   type SDKMessageFilter,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import {
   deleteSession,
+  forkSession,
   getSessionInfo,
   getSessionMessages,
   query,
@@ -53,6 +55,8 @@ import {
   SDKAssistantMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
+import * as nodeFs from "node:fs/promises";
+import * as nodePath from "node:path";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
@@ -61,6 +65,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     deleteSession: vi.fn(),
     getSessionInfo: vi.fn(),
     renameSession: vi.fn(),
+    forkSession: vi.fn(),
+    // Default to the real implementation so transcript-reading tests keep
+    // working; individual tests override per-call with mockResolvedValueOnce.
+    getSessionMessages: vi.fn(actual.getSessionMessages),
   };
 });
 import type {
@@ -103,6 +111,7 @@ function wrapQuery(generator: AsyncGenerator<any>) {
     interrupt: vi.fn(async () => {}),
     close: vi.fn(),
     setModel: vi.fn(async () => {}),
+    rewindFiles: vi.fn(async () => ({ canRewind: true, filesChanged: [], insertions: 0, deletions: 0 })),
   }) as any;
 }
 
@@ -3470,6 +3479,393 @@ describe("universe-editor/set_session_title (setSessionTitle)", () => {
     await expect(agent.setSessionTitle({ sessionId: "s-1", title: "x" })).rejects.toThrow(
       "disk full",
     );
+  });
+});
+
+describe("prompt messageId anchoring", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AcpClient;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  function injectSession(agent: ClaudeAcpAgent) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield {
+        type: "result" as const,
+        subtype: "success" as const,
+        stop_reason: null,
+        is_error: false,
+        result: "",
+        errors: [],
+        duration_ms: 0,
+        duration_api_ms: 0,
+        num_turns: 1,
+        total_cost_usd: 0,
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+        modelUsage: {},
+        permission_denials: [],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+  }
+
+  it("uses the client _meta.messageId as the SDK uuid and maps it for rewind/fork", async () => {
+    const agent = createMockAgent();
+    injectSession(agent);
+    const clientMessageId = randomUUID();
+
+    await agent.prompt({
+      sessionId: "test-session",
+      _meta: { messageId: clientMessageId },
+      prompt: [{ type: "text", text: "hello" }],
+    } as any);
+
+    // The anchor the client will later rewind/fork against resolves to a uuid
+    // (recorded eagerly by prompt(), so it works even before the echo lands).
+    expect(agent.sessions["test-session"]!.messageIdToUuid.get(clientMessageId)).toBe(
+      clientMessageId,
+    );
+  });
+
+  it("falls back to a generated uuid when the client sends no messageId", async () => {
+    const agent = createMockAgent();
+    injectSession(agent);
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "hello" }],
+    });
+
+    // Exactly one anchor recorded, and it's a non-empty generated uuid.
+    const map = agent.sessions["test-session"]!.messageIdToUuid;
+    const keys = [...map.keys()];
+    expect(keys.length).toBe(1);
+    expect(keys[0]!.length).toBeGreaterThan(0);
+    expect(map.get(keys[0]!)).toBe(keys[0]);
+  });
+});
+
+describe("universe-editor/rewind_session (rewindSession)", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AcpClient;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  it("rejects an unknown messageId with invalidParams", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, async function* () {});
+    await expect(
+      agent.rewindSession({ sessionId: "test-session", messageId: "nope" }),
+    ).rejects.toMatchObject({ code: -32602 });
+  });
+
+  it("rejects an unknown session with resourceNotFound", async () => {
+    const agent = createMockAgent();
+    await expect(
+      agent.rewindSession({ sessionId: "ghost", messageId: "m1" }),
+    ).rejects.toMatchObject({ code: -32002 });
+  });
+
+  it("dry run previews files via rewindFiles(dryRun) without tearing down the session", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, async function* () {});
+    const session = agent.sessions["test-session"]!;
+    session.messageIdToUuid.set("acp-msg-1", "sdk-uuid-1");
+    session.query.rewindFiles = vi.fn(async () => ({
+      canRewind: true,
+      filesChanged: ["a.ts"],
+      insertions: 3,
+      deletions: 1,
+    }));
+
+    const result = await agent.rewindSession({
+      sessionId: "test-session",
+      messageId: "acp-msg-1",
+      dryRun: true,
+    });
+
+    expect(session.query.rewindFiles).toHaveBeenCalledWith("sdk-uuid-1", { dryRun: true });
+    expect(result).toMatchObject({ canRewind: true, filesChanged: ["a.ts"] });
+    // Dry run must not tear the session down.
+    expect(agent.sessions["test-session"]).toBe(session);
+  });
+
+  it("translates the ACP messageId to the SDK uuid when rewinding files", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, async function* () {});
+    const session = agent.sessions["test-session"]!;
+    session.messageIdToUuid.set("acp-msg-42", "sdk-uuid-42");
+    // canRewind:false short-circuits before the teardown/recreate step, so we can
+    // assert the uuid translation without spawning a real Query.
+    session.query.rewindFiles = vi.fn(async () => ({ canRewind: false, error: "no checkpoint" }));
+
+    const result = await agent.rewindSession({
+      sessionId: "test-session",
+      messageId: "acp-msg-42",
+    });
+
+    expect(session.query.rewindFiles).toHaveBeenCalledWith("sdk-uuid-42", { dryRun: false });
+    expect(result).toMatchObject({ canRewind: false });
+    // A failed rewind leaves the session intact.
+    expect(agent.sessions["test-session"]).toBe(session);
+  });
+
+  it("keeps files when rewindFiles is false: skips rewindFiles but still truncates", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, async function* () {});
+    const session = agent.sessions["test-session"]!;
+    session.messageIdToUuid.set("acp-msg-7", "sdk-uuid-7");
+    session.query.rewindFiles = vi.fn(async () => ({
+      canRewind: true,
+      filesChanged: ["a.ts"],
+      insertions: 2,
+      deletions: 1,
+    }));
+    // Isolate step 2 (teardown/recreate/replay) so we assert the file-skip only.
+    const teardown = vi.spyOn(agent as any, "teardownSession").mockResolvedValue(undefined);
+    const create = vi.spyOn(agent as any, "createSession").mockResolvedValue({} as any);
+    const replay = vi.spyOn(agent as any, "replaySessionHistory").mockResolvedValue(undefined);
+    const truncate = vi
+      .spyOn(agent as any, "truncateTranscriptBefore")
+      .mockResolvedValue(undefined);
+    vi.spyOn(agent as any, "messageUuidBefore").mockResolvedValue("sdk-uuid-6");
+
+    const result = await agent.rewindSession({
+      sessionId: "test-session",
+      messageId: "acp-msg-7",
+      rewindFiles: false,
+    });
+
+    // Files were NOT rolled back...
+    expect(session.query.rewindFiles).not.toHaveBeenCalled();
+    // ...but the conversation was still truncated on disk + in memory + replayed.
+    expect(truncate).toHaveBeenCalledWith("test-session", "sdk-uuid-7", "/test");
+    expect(teardown).toHaveBeenCalledWith("test-session");
+    expect(create).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ resume: "test-session", resumeSessionAt: "sdk-uuid-6" }),
+    );
+    expect(replay).toHaveBeenCalledWith("test-session", { stopBeforeUuid: "sdk-uuid-7" });
+    // Reported as a successful rewind with no file changes.
+    expect(result).toMatchObject({ canRewind: true, filesChanged: [], insertions: 0, deletions: 0 });
+  });
+
+  it("dry run still previews files even when rewindFiles is false", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, async function* () {});
+    const session = agent.sessions["test-session"]!;
+    session.messageIdToUuid.set("acp-msg-8", "sdk-uuid-8");
+    session.query.rewindFiles = vi.fn(async () => ({
+      canRewind: true,
+      filesChanged: ["b.ts"],
+      insertions: 5,
+      deletions: 0,
+    }));
+    const teardown = vi.spyOn(agent as any, "teardownSession").mockResolvedValue(undefined);
+
+    const result = await agent.rewindSession({
+      sessionId: "test-session",
+      messageId: "acp-msg-8",
+      rewindFiles: false,
+      dryRun: true,
+    });
+
+    // Dry run wins: it previews via rewindFiles(dryRun) and never truncates.
+    expect(session.query.rewindFiles).toHaveBeenCalledWith("sdk-uuid-8", { dryRun: true });
+    expect(teardown).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ canRewind: true, filesChanged: ["b.ts"] });
+  });
+});
+
+describe("rewind persistence (truncateTranscriptBefore)", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AcpClient;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  // Isolate under a unique project dir inside the real CLAUDE_CONFIG_DIR so the
+  // agent's transcript scan finds it; cleaned up after each test.
+  const sessionId = "trunc-test-session";
+  let projectDir: string;
+  let transcript: string;
+
+  beforeEach(async () => {
+    projectDir = nodePath.join(CLAUDE_CONFIG_DIR, "projects", `__rewind_trunc_test_${randomUUID()}`);
+    await nodeFs.mkdir(projectDir, { recursive: true });
+    transcript = nodePath.join(projectDir, `${sessionId}.jsonl`);
+  });
+
+  afterEach(async () => {
+    await nodeFs.rm(projectDir, { recursive: true, force: true });
+  });
+
+  function line(obj: Record<string, unknown>): string {
+    return JSON.stringify(obj);
+  }
+
+  it("drops the anchor line and everything after it, keeping the trailing newline", async () => {
+    const content =
+      [
+        line({ type: "user", uuid: "u1", parentUuid: null, message: { role: "user" } }),
+        line({ type: "assistant", uuid: "a1", parentUuid: "u1", message: { role: "assistant" } }),
+        line({ type: "file-history-snapshot" }),
+        line({ type: "user", uuid: "u2", parentUuid: "a1", message: { role: "user" } }),
+        line({ type: "assistant", uuid: "a2", parentUuid: "u2", message: { role: "assistant" } }),
+      ].join("\n") + "\n";
+    await nodeFs.writeFile(transcript, content, "utf8");
+
+    const agent = createMockAgent();
+    // Truncate at the second user turn (u2): it and everything after must go.
+    await (agent as any).truncateTranscriptBefore(sessionId, "u2");
+
+    const after = await nodeFs.readFile(transcript, "utf8");
+    const lines = after.split("\n");
+    expect(after.endsWith("\n")).toBe(true);
+    // u1, a1, file-history-snapshot kept (3 lines + trailing empty).
+    expect(lines.filter((l) => l.length > 0)).toHaveLength(3);
+    expect(after).toContain('"uuid":"u1"');
+    expect(after).toContain('"uuid":"a1"');
+    expect(after).not.toContain('"uuid":"u2"');
+    expect(after).not.toContain('"uuid":"a2"');
+  });
+
+  it("empties the transcript when the anchor is the first line", async () => {
+    const content =
+      [
+        line({ type: "user", uuid: "u1", parentUuid: null, message: { role: "user" } }),
+        line({ type: "assistant", uuid: "a1", parentUuid: "u1", message: { role: "assistant" } }),
+      ].join("\n") + "\n";
+    await nodeFs.writeFile(transcript, content, "utf8");
+
+    const agent = createMockAgent();
+    await (agent as any).truncateTranscriptBefore(sessionId, "u1");
+
+    const after = await nodeFs.readFile(transcript, "utf8");
+    expect(after).toBe("");
+  });
+
+  it("leaves the transcript untouched when the anchor is not found", async () => {
+    const content =
+      line({ type: "user", uuid: "u1", parentUuid: null, message: { role: "user" } }) + "\n";
+    await nodeFs.writeFile(transcript, content, "utf8");
+
+    const agent = createMockAgent();
+    await (agent as any).truncateTranscriptBefore(sessionId, "does-not-exist");
+
+    const after = await nodeFs.readFile(transcript, "utf8");
+    expect(after).toBe(content);
+  });
+
+  it("is a no-op (no throw) when the transcript file does not exist", async () => {
+    const agent = createMockAgent();
+    await expect(
+      (agent as any).truncateTranscriptBefore("no-such-session-id-anywhere", "u1"),
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe("unstable_forkSession fork point (excludes anchored user turn)", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AcpClient;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  beforeEach(() => {
+    vi.mocked(forkSession).mockReset();
+    vi.mocked(forkSession).mockResolvedValue({ sessionId: "forked-session" });
+    vi.mocked(getSessionMessages).mockReset();
+  });
+
+  it("forks up to the message BEFORE the anchor (SDK upToMessageId is inclusive)", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, async function* () {});
+    const session = agent.sessions["test-session"]!;
+    session.cwd = "/proj";
+    // Anchor is the 3rd user turn; its predecessor on disk is the 2nd assistant.
+    session.messageIdToUuid.set("acp-user-3", "uuid-user-3");
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      { type: "user", uuid: "uuid-user-1", session_id: "s", message: {}, parent_tool_use_id: null },
+      { type: "assistant", uuid: "uuid-asst-1", session_id: "s", message: {}, parent_tool_use_id: null },
+      { type: "user", uuid: "uuid-user-2", session_id: "s", message: {}, parent_tool_use_id: null },
+      { type: "assistant", uuid: "uuid-asst-2", session_id: "s", message: {}, parent_tool_use_id: null },
+      { type: "user", uuid: "uuid-user-3", session_id: "s", message: {}, parent_tool_use_id: null },
+    ] as any);
+
+    const result = await agent.unstable_forkSession({
+      sessionId: "test-session",
+      cwd: "/proj",
+      _meta: { rewindTo: "acp-user-3" },
+    } as any);
+
+    expect(result).toEqual({ sessionId: "forked-session" });
+    expect(forkSession).toHaveBeenCalledWith("test-session", {
+      dir: "/proj",
+      upToMessageId: "uuid-asst-2",
+    });
+  });
+
+  it("forks the whole session when no fork point is given", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, async function* () {});
+
+    await agent.unstable_forkSession({
+      sessionId: "test-session",
+      cwd: "/proj",
+    } as any);
+
+    expect(getSessionMessages).not.toHaveBeenCalled();
+    expect(forkSession).toHaveBeenCalledWith("test-session", { dir: "/proj" });
+  });
+
+  it("omits upToMessageId when the anchor is the first message (no predecessor)", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, async function* () {});
+    const session = agent.sessions["test-session"]!;
+    session.messageIdToUuid.set("acp-user-1", "uuid-user-1");
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      { type: "user", uuid: "uuid-user-1", session_id: "s", message: {}, parent_tool_use_id: null },
+      { type: "assistant", uuid: "uuid-asst-1", session_id: "s", message: {}, parent_tool_use_id: null },
+    ] as any);
+
+    await agent.unstable_forkSession({
+      sessionId: "test-session",
+      cwd: "/proj",
+      _meta: { rewindTo: "acp-user-1" },
+    } as any);
+
+    expect(forkSession).toHaveBeenCalledWith("test-session", { dir: "/proj" });
   });
 });
 
