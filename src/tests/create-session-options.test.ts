@@ -167,8 +167,9 @@ describe("createSession options merging", () => {
       },
     });
 
-    // User's PreToolUse hooks should be preserved
-    expect(capturedOptions!.hooks?.PreToolUse).toEqual([userPreToolUseHook]);
+    // PreToolUse should contain both the user hook and the ACP live-bash hook
+    expect(capturedOptions!.hooks?.PreToolUse).toHaveLength(2);
+    expect(capturedOptions!.hooks?.PreToolUse?.[0]).toEqual(userPreToolUseHook);
     // PostToolUse should contain both user and ACP hooks
     expect(capturedOptions!.hooks?.PostToolUse).toHaveLength(2);
   });

@@ -99,6 +99,14 @@ import {
   refusalFallbackResultFromResponse,
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
+import {
+  createLiveBashCorrelationStore,
+  createLiveBashPreToolUseHook,
+  createLiveBashServer,
+  LIVE_BASH_QUALIFIED_NAME,
+  LIVE_BASH_SERVER_NAME,
+  type LiveBashContext,
+} from "./liveBashTool.js";
 import { SettingsManager } from "./settings.js";
 import {
   applyTaskCreate,
@@ -3296,7 +3304,13 @@ export class ClaudeAcpAgent {
 
   canUseTool(sessionId: string): CanUseTool {
     return async (toolName, toolInput, { signal, suggestions, toolUseID }) => {
-      const alwaysAllowLabel = describeAlwaysAllow(suggestions, toolName);
+      // Our live Bash tool is reached via `toolAliases`. Depending on where the
+      // CLI resolves the alias, `canUseTool` may see either the original `Bash`
+      // or the mapped MCP name; normalize to `Bash` so the permission card, the
+      // always-allow rule (`Bash(cmd:*)`), and the execute-card mapping are all
+      // identical to the built-in tool. `toolInput` still carries `{command,…}`.
+      const effectiveToolName = toolName === LIVE_BASH_QUALIFIED_NAME ? "Bash" : toolName;
+      const alwaysAllowLabel = describeAlwaysAllow(suggestions, effectiveToolName);
       const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
       const session = this.sessions[sessionId];
       if (!session) {
@@ -3439,7 +3453,12 @@ export class ClaudeAcpAgent {
           behavior: "allow",
           updatedInput: toolInput,
           updatedPermissions: suggestions ?? [
-            { type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" },
+            {
+              type: "addRules",
+              rules: [{ toolName: effectiveToolName }],
+              behavior: "allow",
+              destination: "session",
+            },
           ],
         };
       }
@@ -3460,13 +3479,13 @@ export class ClaudeAcpAgent {
             toolCallId: toolUseID,
             rawInput: toolInput,
             ...toolInfoFromToolUse(
-              { name: toolName, input: toolInput, id: toolUseID },
+              { name: effectiveToolName, input: toolInput, id: toolUseID },
               supportsTerminalOutput,
               session?.cwd,
             ),
           },
         },
-        toolName,
+        effectiveToolName,
         signal,
       );
       if (signal.aborted || response.outcome?.outcome === "cancelled") {
@@ -3484,7 +3503,7 @@ export class ClaudeAcpAgent {
             updatedPermissions: suggestions ?? [
               {
                 type: "addRules",
-                rules: [{ toolName }],
+                rules: [{ toolName: effectiveToolName }],
                 behavior: "allow",
                 destination: "session",
               },
@@ -4091,6 +4110,32 @@ export class ClaudeAcpAgent {
     // the same Map that the streaming message handler will read from.
     const taskState: TaskState = new Map();
 
+    // Redirect the SDK's built-in Bash to our in-process MCP tool so command
+    // output streams live (方案 B). We correlate our run with the model's `Bash`
+    // tool_use id (== the ACP toolCallId the renderer keys its execute card on)
+    // via the `PreToolUse` hook: it fires before the command runs, carrying the
+    // tool_use id, command, and (for sub-agent calls) an agent_id — all atomic.
+    // The hook records these into `liveBashCorrelation`; the handler looks them up
+    // by command. This replaces the earlier tool_use *cache* scan, which was a
+    // timing gamble that lost for sub-agents: a sub-agent's tool_use chunk can
+    // land in the cache only *after* its aliased handler already ran, so the
+    // handler fell back to a synthetic id and the renderer spawned a phantom
+    // top-level card (docs/plan/claude-shell-live-output-plan.md §3.5).
+    // Permission is enforced by the SDK routing the aliased call through
+    // `canUseTool` (which normalizes it back to Bash), so no in-handler gate here.
+    const liveBashCorrelation = createLiveBashCorrelationStore();
+    const liveBashContext: LiveBashContext = {
+      sessionId,
+      cwd: params.cwd,
+      logger: this.logger,
+      client: this.client,
+      env: userProvidedOptions?.env
+        ? { ...process.env, ...userProvidedOptions.env }
+        : process.env,
+      resolveCorrelation: (command) => liveBashCorrelation.resolve(command),
+    };
+    mcpServers[LIVE_BASH_SERVER_NAME] = createLiveBashServer(liveBashContext);
+
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],
@@ -4153,8 +4198,21 @@ export class ClaudeAcpAgent {
       },
       disallowedTools: [...(userProvidedOptions?.disallowedTools || [])],
       tools,
+      // Route the model's built-in `Bash` to our live-streaming MCP tool. The
+      // model still emits a `Bash` tool_use (so its execute card renders
+      // unchanged); only execution is redirected. User-provided aliases win.
+      toolAliases: {
+        Bash: LIVE_BASH_QUALIFIED_NAME,
+        ...userProvidedOptions?.toolAliases,
+      },
       hooks: {
         ...userProvidedOptions?.hooks,
+        PreToolUse: [
+          ...(userProvidedOptions?.hooks?.PreToolUse || []),
+          {
+            hooks: [createLiveBashPreToolUseHook(liveBashCorrelation, this.logger)],
+          },
+        ],
         PostToolUse: [
           ...(userProvidedOptions?.hooks?.PostToolUse || []),
           {

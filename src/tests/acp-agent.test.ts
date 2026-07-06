@@ -7958,3 +7958,108 @@ describe("agent selection config option", () => {
     });
   });
 });
+
+describe("live Bash tool permission normalization", () => {
+  function injectSession(agent: ClaudeAcpAgent, sessionId: string, modeId = "default") {
+    function* empty() {}
+    const gen = Object.assign(empty(), { interrupt: vi.fn(), close: vi.fn() });
+    agent.sessions[sessionId] = {
+      query: gen as any,
+      input: new Pushable(),
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: modeId, availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      agents: [],
+      currentAgent: "default",
+      fastModeEnabled: false,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+      toolUseCache: {},
+      emittedToolCalls: new Set(),
+      messageIdToUuid: new Map(),
+    } as any;
+    return agent.sessions[sessionId]!;
+  }
+
+  const LIVE_BASH = "mcp__universe-live-bash__bash";
+
+  it("routes the aliased live-bash tool through the same Bash permission card", async () => {
+    let permittedToolName: string | undefined;
+    let permittedTitle: string | null | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: RequestPermissionRequest) => {
+        permittedTitle = params.toolCall.title;
+        return { outcome: { outcome: "selected", optionId: "allow" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+
+    const result = await agent.canUseTool("session-1")(LIVE_BASH, { command: "ls -la" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-42",
+    } as any);
+
+    // Rendered as a Bash execute card (command as the title), not an MCP tool.
+    expect(permittedTitle).toBe("ls -la");
+    // Allowed with the command passed through untouched. Correlation no longer
+    // rides in updatedInput — it comes from the PreToolUse hook instead.
+    expect(result?.behavior).toBe("allow");
+    expect((result as any).updatedInput.command).toBe("ls -la");
+    expect((result as any).updatedInput.__acpToolCallId).toBeUndefined();
+    void permittedToolName;
+  });
+
+  it("denies the live-bash tool when the user rejects, so nothing runs", async () => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "reject" } }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+
+    const result = await agent.canUseTool("session-1")(LIVE_BASH, { command: "rm -rf /" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-43",
+    } as any);
+
+    expect(result?.behavior).toBe("deny");
+  });
+
+  it("always-allow adds a Bash rule (not the MCP name) so future runs match", async () => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async () => ({
+        outcome: { outcome: "selected", optionId: "allow_always" },
+      }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+
+    const result = await agent.canUseTool("session-1")(LIVE_BASH, { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: undefined,
+      toolUseID: "tool-44",
+    } as any);
+
+    expect(result?.behavior).toBe("allow");
+    const rules = (result as any).updatedPermissions?.[0]?.rules;
+    expect(rules?.[0]?.toolName).toBe("Bash");
+  });
+});
