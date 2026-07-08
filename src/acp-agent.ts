@@ -1972,7 +1972,15 @@ export class ClaudeAcpAgent {
             // otherwise discard the window learned on a prior turn and
             // leave the next prompt's mid-stream updates reporting 200k.
             if (matchingModelUsage) {
-              session.contextWindowSize = matchingModelUsage.contextWindow;
+              // Clamp the model's physical window by any autoCompactWindow
+              // setting so that, if the authoritative getContextUsage refresh
+              // below fails, we still fall back to the effective window rather
+              // than the raw physical one.
+              const clamp = resolveAutoCompactWindow(session.settingsManager.getSettings());
+              session.contextWindowSize =
+                clamp != null
+                  ? Math.min(matchingModelUsage.contextWindow, clamp)
+                  : matchingModelUsage.contextWindow;
             }
             // Prefer the SDK's effective window (autoCompactWindow clamp applied)
             // over the model's physical window from modelUsage — it's what
@@ -2222,10 +2230,10 @@ export class ClaudeAcpAgent {
                   // `syncSessionConfigState`, which resets us back to the
                   // default so this branch runs again for the new model.
                   if (session.contextWindowSize === DEFAULT_CONTEXT_WINDOW) {
-                    const inferred = inferContextWindowFromModel(model);
-                    if (inferred !== null) {
-                      session.contextWindowSize = inferred;
-                    }
+                    session.contextWindowSize = computeInitialContextWindow(
+                      session.settingsManager.getSettings(),
+                      model,
+                    );
                   }
                 }
               } else {
@@ -3676,12 +3684,12 @@ export class ClaudeAcpAgent {
         // to the new model's heuristic so mid-stream updates between now and
         // the next `result` reflect the user's selection instead of the old
         // model's window.
-        session.contextWindowSize =
-          inferContextWindowFromModel(
-            value,
-            newModelInfo?.displayName,
-            newModelInfo?.description,
-          ) ?? DEFAULT_CONTEXT_WINDOW;
+        session.contextWindowSize = computeInitialContextWindow(
+          session.settingsManager.getSettings(),
+          value,
+          newModelInfo?.displayName,
+          newModelInfo?.description,
+        );
       }
       session.models = { ...session.models, currentModelId: value };
 
@@ -4453,11 +4461,12 @@ export class ClaudeAcpAgent {
         // lane than the verbatim live id (e.g. an "opus[1m]" row matched for
         // a bare 200k id), so on the fallback path only the id itself is a
         // trustworthy window signal.
-        inferContextWindowFromModel(
+        computeInitialContextWindow(
+          settingsManager.getSettings(),
           models.currentModelId,
           allowlistedModelInfo?.displayName,
           allowlistedModelInfo?.description,
-        ) ?? DEFAULT_CONTEXT_WINDOW,
+        ),
       taskState,
       toolUseCache: {},
       emittedToolCalls: new Set(),
@@ -6033,6 +6042,48 @@ function commonPrefixLength(a: string, b: string) {
 function inferContextWindowFromModel(...texts: Array<string | undefined>): number | null {
   if (texts.some((text) => text != null && /\b1m\b/i.test(text))) return 1_000_000;
   return null;
+}
+
+/** Resolve the user's `autoCompactWindow` clamp, which caps the effective
+ *  context window below the model's physical size (e.g. a 1M model with
+ *  `CLAUDE_CODE_AUTO_COMPACT_WINDOW=300000` auto-compacts at 300k, so 300k — not
+ *  1M — is the correct `size` denominator). The SDK applies this clamp inside
+ *  the CLI binary and only surfaces it via `getContextUsage().maxTokens`, which
+ *  we don't call until a turn's `result`; reading it here lets us report the
+ *  clamped window from session creation instead of flashing the physical size
+ *  until the first turn completes.
+ *
+ *  Checked in priority order: the resolved `settings.autoCompactWindow` field,
+ *  the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` entry in `settings.env`, then the same
+ *  env var on the process. Returns null when unset/invalid so callers keep the
+ *  physical window. */
+function resolveAutoCompactWindow(settings: Settings | undefined): number | null {
+  const candidates = [
+    settings?.autoCompactWindow,
+    settings?.env?.["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+    process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+  ];
+  for (const candidate of candidates) {
+    if (candidate == null) continue;
+    const value = typeof candidate === "number" ? candidate : Number.parseInt(candidate, 10);
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+  return null;
+}
+
+/** Seed `contextWindowSize` at session creation / model switch: the model's
+ *  inferred physical window, clamped down by any `autoCompactWindow` setting. We
+ *  never clamp *up* — a clamp above the physical window is meaningless — and a
+ *  missing physical inference falls back to DEFAULT_CONTEXT_WINDOW before the
+ *  clamp so the denominator is still correct for a clamped default-window
+ *  model. */
+function computeInitialContextWindow(
+  settings: Settings | undefined,
+  ...modelTexts: Array<string | undefined>
+): number {
+  const physical = inferContextWindowFromModel(...modelTexts) ?? DEFAULT_CONTEXT_WINDOW;
+  const clamp = resolveAutoCompactWindow(settings);
+  return clamp != null ? Math.min(physical, clamp) : physical;
 }
 
 /** Fetch the SDK's authoritative context-window occupancy via the
