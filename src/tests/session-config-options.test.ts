@@ -110,7 +110,7 @@ describe("session config options", () => {
       input: null,
       cancelled: false,
       permissionMode: "default",
-      settingsManager: {},
+      settingsManager: { getSettings: () => ({}) },
       modes: structuredClone(MOCK_MODES),
       models: structuredClone(MOCK_MODELS),
       modelInfos: MOCK_MODELS.availableModels.map((m): ModelInfo => ({
