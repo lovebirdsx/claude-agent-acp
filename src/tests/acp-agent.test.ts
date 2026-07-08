@@ -126,7 +126,7 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     modes: { currentModeId: "default", availableModes: [] },
     models: { currentModelId: "default", availableModels: [] },
     modelInfos: [],
-    settingsManager: { dispose: vi.fn() },
+    settingsManager: { dispose: vi.fn(), getSettings: () => ({}) },
     accumulatedUsage: {
       inputTokens: 0,
       outputTokens: 0,
@@ -4559,6 +4559,77 @@ describe("usage_update computation", () => {
     expect(session.contextWindowSize).toBe(200000);
 
     await (agent as any).applyConfigOptionValue("test-session", session, "model", "default");
+
+    expect(session.contextWindowSize).toBe(1000000);
+  });
+
+  it("clamps the seeded 1M window by autoCompactWindow at model switch (issue: shows 1M until compact)", async () => {
+    // Repro: a 1M model with CLAUDE_CODE_AUTO_COMPACT_WINDOW=300000 auto-compacts
+    // at 300k, so `size` must be 300k from the moment the model is selected — not
+    // the physical 1M that only gets corrected once the first turn's result calls
+    // getContextUsage. The clamp is read from the settings so the fix does not
+    // depend on that late round-trip.
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [{ type: "system", subtype: "session_state_changed", state: "idle" }]);
+    const session = agent.sessions["test-session"];
+    session.settingsManager = {
+      dispose: vi.fn(),
+      getSettings: () => ({ autoCompactWindow: 300000 }),
+    } as any;
+    session.modelInfos = [
+      { value: "claude-opus-4-6-1m", displayName: "Opus 4.6 (1M)", description: "1M context" },
+    ] as any;
+
+    await (agent as any).applyConfigOptionValue(
+      "test-session",
+      session,
+      "model",
+      "claude-opus-4-6-1m",
+    );
+
+    expect(session.contextWindowSize).toBe(300000);
+  });
+
+  it("reads the autoCompactWindow clamp from settings.env at model switch", async () => {
+    // The user configures the clamp via `env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW }`
+    // in settings.json (not the top-level autoCompactWindow field), so the clamp
+    // must be resolved from there too.
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [{ type: "system", subtype: "session_state_changed", state: "idle" }]);
+    const session = agent.sessions["test-session"];
+    session.settingsManager = {
+      dispose: vi.fn(),
+      getSettings: () => ({ env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: "300000" } }),
+    } as any;
+    session.modelInfos = [
+      { value: "claude-opus-4-6-1m", displayName: "Opus 4.6 (1M)", description: "1M context" },
+    ] as any;
+
+    await (agent as any).applyConfigOptionValue(
+      "test-session",
+      session,
+      "model",
+      "claude-opus-4-6-1m",
+    );
+
+    expect(session.contextWindowSize).toBe(300000);
+  });
+
+  it("leaves the physical 1M window intact at model switch when no clamp is set", async () => {
+    // Without an autoCompactWindow clamp, a 1M model must still report 1M.
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [{ type: "system", subtype: "session_state_changed", state: "idle" }]);
+    const session = agent.sessions["test-session"];
+    session.modelInfos = [
+      { value: "claude-opus-4-6-1m", displayName: "Opus 4.6 (1M)", description: "1M context" },
+    ] as any;
+
+    await (agent as any).applyConfigOptionValue(
+      "test-session",
+      session,
+      "model",
+      "claude-opus-4-6-1m",
+    );
 
     expect(session.contextWindowSize).toBe(1000000);
   });
