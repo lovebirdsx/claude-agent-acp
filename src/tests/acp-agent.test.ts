@@ -3703,6 +3703,90 @@ describe("universe-editor/rewind_session (rewindSession)", () => {
     expect(teardown).not.toHaveBeenCalled();
     expect(result).toMatchObject({ canRewind: true, filesChanged: ["b.ts"] });
   });
+
+  it("re-applies the session's runtime model + effort after recreating the Query", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, async function* () {});
+    const session = agent.sessions["test-session"]!;
+    session.messageIdToUuid.set("acp-msg-9", "sdk-uuid-9");
+    session.query.rewindFiles = vi.fn(async () => ({
+      canRewind: true,
+      filesChanged: [],
+      insertions: 0,
+      deletions: 0,
+    }));
+
+    // The user picked Opus + high effort at runtime (differs from the default the
+    // recreated Query would come up with from newSessionParams / settings).
+    const models = {
+      currentModelId: "claude-opus-4-8",
+      availableModels: [
+        { modelId: "claude-fable-5", name: "Claude Fable 5" },
+        { modelId: "claude-opus-4-8", name: "Claude Opus 4.8" },
+      ],
+    };
+    const modelInfos = [
+      { value: "claude-fable-5", displayName: "Claude Fable 5", description: "" },
+      {
+        value: "claude-opus-4-8",
+        displayName: "Claude Opus 4.8",
+        description: "",
+        supportsEffort: true,
+        supportedEffortLevels: ["low", "medium", "high"],
+      },
+    ];
+    const modes = { currentModeId: "default", availableModes: [{ id: "default", name: "Default", description: "" }] };
+    session.models = models as any;
+    session.modelInfos = modelInfos as any;
+    session.modes = modes as any;
+    session.configOptions = buildConfigOptions(modes as any, models as any, modelInfos as any, "high");
+
+    // Isolate step 2 so we control what the recreated session looks like.
+    vi.spyOn(agent as any, "teardownSession").mockResolvedValue(undefined);
+    vi.spyOn(agent as any, "replaySessionHistory").mockResolvedValue(undefined);
+    vi.spyOn(agent as any, "truncateTranscriptBefore").mockResolvedValue(undefined);
+    vi.spyOn(agent as any, "messageUuidBefore").mockResolvedValue("sdk-uuid-8");
+
+    // The recreated Query comes back on the DEFAULT model + effort (the bug: it
+    // uses the original newSessionParams and settings, losing the runtime pick).
+    const setModel = vi.fn(async () => {});
+    const applyFlagSettings = vi.fn(async () => {});
+    vi.spyOn(agent as any, "createSession").mockImplementation(async () => {
+      const recreated = mockSessionState({
+        query: Object.assign((async function* () {})(), {
+          interrupt: vi.fn(),
+          close: vi.fn(),
+          setModel,
+          applyFlagSettings,
+        }),
+        models: {
+          currentModelId: "claude-fable-5",
+          availableModels: models.availableModels,
+        },
+        modelInfos,
+        modes,
+        // Rebuilt at the default effort for the default model.
+        configOptions: buildConfigOptions(modes as any, {
+          currentModelId: "claude-fable-5",
+          availableModels: models.availableModels,
+        } as any, modelInfos as any, "default"),
+      });
+      agent.sessions["test-session"] = recreated;
+      return {} as any;
+    });
+
+    await agent.rewindSession({ sessionId: "test-session", messageId: "acp-msg-9" });
+
+    // The runtime model + effort must be restored on the recreated Query.
+    expect(setModel).toHaveBeenCalledWith("claude-opus-4-8");
+    expect(applyFlagSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ effortLevel: "high" }),
+    );
+    const recreated = agent.sessions["test-session"]!;
+    expect(recreated.models.currentModelId).toBe("claude-opus-4-8");
+    const effortOpt = recreated.configOptions.find((o) => o.id === "effort");
+    expect(effortOpt?.currentValue).toBe("high");
+  });
 });
 
 describe("rewind persistence (truncateTranscriptBefore)", () => {

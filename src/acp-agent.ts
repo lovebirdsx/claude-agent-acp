@@ -3130,15 +3130,78 @@ export class ClaudeAcpAgent {
     // without this the rewound turns reappear on the next reload.
     await this.truncateTranscriptBefore(params.sessionId, uuid, session.cwd);
     const recreateParams = session.newSessionParams ?? { cwd: session.cwd, mcpServers: [] };
+    // Snapshot the RUNTIME config (model / effort / fast / agent) before teardown.
+    // `newSessionParams` only carries the session's *initial* creation params, so
+    // recreating from it — and re-seeding effort from settings.json — would drop
+    // any model/effort/etc. the user switched to mid-session via setConfigOption.
+    // We re-apply the snapshot onto the fresh Query below so the rewound session
+    // keeps running the config the user actually selected.
+    const configSnapshot = this.snapshotRuntimeConfig(session);
     await this.teardownSession(params.sessionId);
     await this.createSession(recreateParams, {
       resume: params.sessionId,
       ...(beforeUuid !== undefined ? { resumeSessionAt: beforeUuid } : {}),
     });
+    await this.reapplyRuntimeConfig(params.sessionId, configSnapshot);
     await this.replaySessionHistory(params.sessionId, { stopBeforeUuid: uuid });
     // Report the truncation as a successful rewind. When files were kept there is
     // nothing to roll back, so the file stats are all zero.
     return { canRewind: true, filesChanged: [], insertions: 0, deletions: 0 };
+  }
+
+  /**
+   * Capture the config the session is *currently running* (model / effort / fast
+   * mode / agent), read from its live `configOptions`, so a rewind can restore it
+   * onto the freshly recreated Query. Ordered model-first because re-applying the
+   * model rebuilds the dependent options (effort/fast) — see
+   * {@link reapplyRuntimeConfig}. Boolean (fast) and string (the rest) values are
+   * both carried; `undefined` currentValues are skipped.
+   */
+  private snapshotRuntimeConfig(session: Session): Array<{ configId: string; value: string | boolean }> {
+    const order = [MODEL_CONFIG_ID, EFFORT_CONFIG_ID, FAST_MODE_CONFIG_ID, AGENT_CONFIG_ID];
+    const snapshot: Array<{ configId: string; value: string | boolean }> = [];
+    for (const configId of order) {
+      const opt = session.configOptions.find((o) => o.id === configId);
+      if (!opt) continue;
+      if (opt.type === "select" && typeof opt.currentValue === "string") {
+        snapshot.push({ configId, value: opt.currentValue });
+      } else if (opt.type === "boolean" && typeof opt.currentValue === "boolean") {
+        snapshot.push({ configId, value: opt.currentValue });
+      }
+    }
+    return snapshot;
+  }
+
+  /**
+   * Re-apply a {@link snapshotRuntimeConfig} snapshot onto the recreated session.
+   * The rebuilt Query comes up on the default model/effort (it only knows the
+   * original `newSessionParams` + settings.json), so without this a rewind
+   * silently reverts a mid-session model/effort switch. Applied in snapshot order
+   * (model first) via the same `setSessionConfigOption` path a user-driven change
+   * takes — so the model→effort cascade (a model switch resets effort, then the
+   * effort entry re-pins it) reconciles exactly as usual. Each option is skipped
+   * when the recreated session already matches, and is best-effort: a failure
+   * (e.g. an effort level the recreated model no longer offers) is logged, not
+   * thrown, so it can't brick the rewind.
+   */
+  private async reapplyRuntimeConfig(
+    sessionId: string,
+    snapshot: Array<{ configId: string; value: string | boolean }>,
+  ): Promise<void> {
+    for (const { configId, value } of snapshot) {
+      const session = this.sessions[sessionId];
+      if (!session) return;
+      const current = session.configOptions.find((o) => o.id === configId)?.currentValue;
+      if (current === value) continue;
+      try {
+        await this.setSessionConfigOption({ sessionId, configId, value });
+      } catch (err) {
+        this.logger.error(
+          `rewind: failed to re-apply config option ${configId}=${String(value)} after recreate:`,
+          err,
+        );
+      }
+    }
   }
 
   private async applySessionMode(sessionId: string, modeId: string): Promise<void> {
