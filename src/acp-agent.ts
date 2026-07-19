@@ -399,6 +399,96 @@ interface CompactionNotification {
 }
 
 /**
+ * A raw line of the on-disk session transcript
+ * (`<CLAUDE_CONFIG_DIR>/projects/<encoded-cwd>/<sessionId>.jsonl`). Only the
+ * fields the display-chain rebuild reads are declared; `message` stays
+ * `unknown` because replay feeds it through the same untyped
+ * `toAcpNotifications` path as `getSessionMessages` results.
+ */
+export interface RawTranscriptEntry {
+  uuid: string;
+  parentUuid?: string | null;
+  /** On a `compact_boundary` the physical parent chain is severed
+   *  (`parentUuid: null`); this preserves the display-order link to the last
+   *  pre-compaction message. */
+  logicalParentUuid?: string | null;
+  type?: string;
+  subtype?: string;
+  isSidechain?: boolean;
+  isMeta?: boolean;
+  teamName?: string;
+  parent_tool_use_id?: string | null;
+  /** The generated summary user message written right after a compaction. */
+  isCompactSummary?: boolean;
+  message?: unknown;
+}
+
+export function isCompactBoundaryEntry(entry: RawTranscriptEntry): boolean {
+  return entry.type === "system" && entry.subtype === "compact_boundary";
+}
+
+function isDisplayMessageEntry(entry: RawTranscriptEntry): boolean {
+  return (
+    (entry.type === "user" || entry.type === "assistant") &&
+    entry.isSidechain !== true &&
+    entry.isMeta !== true &&
+    !entry.teamName
+  );
+}
+
+/**
+ * Rebuild the FULL display history of a transcript that contains compaction
+ * boundaries. The SDK's `getSessionMessages` reconstructs the *effective
+ * context* by walking `parentUuid` links from the newest leaf — a
+ * `compact_boundary` carries `parentUuid: null`, so everything before the
+ * compaction is unreachable and a reloaded session appears to start at the
+ * summary. This walk bridges each boundary through its `logicalParentUuid`,
+ * recovering the pre-compaction history for display.
+ *
+ * Walking the parent chain (rather than taking raw file order) keeps abandoned
+ * branches out of the replay: transcripts produced by the Claude Code CLI may
+ * contain forks from its native rewind, and only the chain reachable from the
+ * newest leaf is live history.
+ *
+ * Returns the chronologically ordered entries to replay — user/assistant
+ * messages plus the boundary markers themselves (the caller turns those into
+ * compaction cards) — or undefined when the transcript has no boundary, so the
+ * common uncompacted path stays on `getSessionMessages` unchanged.
+ */
+export function rebuildTranscriptDisplayChain(
+  entries: RawTranscriptEntry[],
+): RawTranscriptEntry[] | undefined {
+  if (!entries.some(isCompactBoundaryEntry)) return undefined;
+
+  const byUuid = new Map<string, RawTranscriptEntry>();
+  for (const entry of entries) byUuid.set(entry.uuid, entry);
+
+  let leaf: RawTranscriptEntry | undefined;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry !== undefined && isDisplayMessageEntry(entry)) {
+      leaf = entry;
+      break;
+    }
+  }
+  if (leaf === undefined) return undefined;
+
+  const chain: RawTranscriptEntry[] = [];
+  const seen = new Set<string>();
+  let cursor: RawTranscriptEntry | undefined = leaf;
+  while (cursor !== undefined && !seen.has(cursor.uuid)) {
+    seen.add(cursor.uuid);
+    chain.push(cursor);
+    // Bridge severed boundaries: `parentUuid ?? logicalParentUuid` falls
+    // through to the logical link exactly when the physical one is null.
+    const parent: string | null | undefined = cursor.parentUuid ?? cursor.logicalParentUuid;
+    cursor = parent != null ? byUuid.get(parent) : undefined;
+  }
+  chain.reverse();
+
+  return chain.filter((entry) => isCompactBoundaryEntry(entry) || isDisplayMessageEntry(entry));
+}
+/**
  * Logger interface for customizing logging output
  */
 export interface Logger {
@@ -8146,6 +8236,53 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /**
+   * Read the raw on-disk transcript and rebuild the full display chain across
+   * compaction boundaries (see {@link rebuildTranscriptDisplayChain}). Returns
+   * undefined — sending the caller to `getSessionMessages` — when the file
+   * can't be located/parsed or contains no boundary, so only compacted
+   * sessions take this path.
+   */
+  private async readTranscriptDisplayChain(
+    sessionId: string,
+  ): Promise<RawTranscriptEntry[] | undefined> {
+    try {
+      const file = await findTranscript(sessionId);
+      if (file === undefined) return undefined;
+      const raw = await fs.readFile(file, "utf8");
+      const entries: RawTranscriptEntry[] = [];
+      for (const line of raw.split("\n")) {
+        if (!line) continue;
+        try {
+          const parsed = JSON.parse(line) as unknown;
+          if (
+            parsed !== null &&
+            typeof parsed === "object" &&
+            typeof (parsed as { uuid?: unknown }).uuid === "string"
+          ) {
+            entries.push(parsed as RawTranscriptEntry);
+          }
+        } catch {
+          // Non-JSON / blank line — skip.
+        }
+      }
+      const chain = rebuildTranscriptDisplayChain(entries);
+      if (chain !== undefined) {
+        this.logger.log(
+          `replay: rebuilt full display chain for ${sessionId}: ${chain.length} entries ` +
+            `(${chain.filter(isCompactBoundaryEntry).length} compaction boundaries, ` +
+            `${entries.length} raw transcript entries)`,
+        );
+      }
+      return chain;
+    } catch (error) {
+      this.logger.error(
+        `replay: failed to read transcript for ${sessionId}, falling back to the effective chain: ${error}`,
+      );
+      return undefined;
+    }
+  }
+
   private async replaySessionHistory(
     sessionId: string,
     resumedMessages?: SessionMessage[],
@@ -8154,7 +8291,16 @@ export class ClaudeAcpAgent {
   ): Promise<void> {
     const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
-    const messages = resumedMessages ?? (await getSessionMessages(sessionId));
+    const fullChain =
+      resumedMessages === undefined
+        ? await this.readTranscriptDisplayChain(sessionId)
+        : undefined;
+    // A compacted session's effective chain (`getSessionMessages`) starts at
+    // the summary — the pre-compaction history is unreachable there. Replay
+    // the full display chain from the raw transcript instead, so reloading a
+    // compacted session restores everything the user saw live.
+    const messages: Array<RawTranscriptEntry | SessionMessage> =
+      resumedMessages ?? fullChain ?? (await getSessionMessages(sessionId));
     const historyLoadedAt = performance.now();
     this.logger.log(
       `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
@@ -8167,7 +8313,12 @@ export class ClaudeAcpAgent {
     const forwardSubagentText =
       session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities);
     const supportsTypedFailures = supportsAirSessionFailures(this.clientCapabilities);
-    const activeUsageLimit = supportsTypedFailures ? activeUsageLimitMessage(messages) : undefined;
+    // The raw transcript entries carry the same message payloads as the SDK's
+    // `getSessionMessages` results, so the scans that only read `.type` /
+    // `.message` run over either shape (see `RawTranscriptEntry`).
+    const activeUsageLimit = supportsTypedFailures
+      ? activeUsageLimitMessage(messages as SessionMessage[])
+      : undefined;
     const sessionFailures =
       session && supportsTypedFailures
         ? new SessionFailureController({
@@ -8266,7 +8417,7 @@ export class ClaudeAcpAgent {
         if (child) child.terminalState = terminalState;
       }
     };
-    if (nativeReplayEnabled) registerLaunches(messages);
+    if (nativeReplayEnabled) registerLaunches(messages as SessionMessage[]);
 
     const announceReplayChild = async (
       parentToolUseId: string,
@@ -8561,7 +8712,22 @@ export class ClaudeAcpAgent {
       if (stopBeforeUuid !== undefined && message.uuid === stopBeforeUuid) {
         break;
       }
-      await replayMessage(message);
+      if (fullChain !== undefined) {
+        // Surface each boundary as the same compaction card the live stream
+        // shows; the generated summary duplicates the (now fully restored)
+        // history it summarizes, so it stays hidden — matching the live view,
+        // where the SDK never streams it either.
+        if (isCompactBoundaryEntry(message as RawTranscriptEntry)) {
+          await this.client.extNotification(COMPACTION_METHOD, {
+            sessionId,
+            id: randomUUID(),
+            phase: "success",
+          } satisfies CompactionNotification);
+          continue;
+        }
+        if ((message as RawTranscriptEntry).isCompactSummary === true) continue;
+      }
+      await replayMessage(message as SessionMessage);
     }
 
     if (nativeReplayEnabled && !pending?.stopped) {
