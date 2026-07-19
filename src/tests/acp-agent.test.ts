@@ -41,6 +41,9 @@ import {
   discoverCustomAgents,
   runPromptWithCancellation,
   CLAUDE_CONFIG_DIR,
+  COMPACTION_METHOD,
+  rebuildTranscriptDisplayChain,
+  type RawTranscriptEntry,
   type AcpClient,
   type SDKMessageFilter,
 } from "../acp-agent.js";
@@ -8126,5 +8129,287 @@ describe("agent selection config option", () => {
       const agentOption = session.configOptions.find((o) => o.id === "agent");
       expect(agentOption?.currentValue).toBe("default");
     });
+  });
+});
+
+describe("rebuildTranscriptDisplayChain (compaction-crossing history)", () => {
+  const entry = (e: Partial<RawTranscriptEntry> & { uuid: string }): RawTranscriptEntry =>
+    e as RawTranscriptEntry;
+
+  it("returns undefined when the transcript has no compact_boundary", () => {
+    const chain = rebuildTranscriptDisplayChain([
+      entry({ uuid: "u1", parentUuid: null, type: "user" }),
+      entry({ uuid: "a1", parentUuid: "u1", type: "assistant" }),
+    ]);
+    expect(chain).toBeUndefined();
+  });
+
+  it("bridges a compact_boundary through logicalParentUuid, recovering pre-compaction history", () => {
+    const chain = rebuildTranscriptDisplayChain([
+      entry({ uuid: "u1", parentUuid: null, type: "user" }),
+      entry({ uuid: "a1", parentUuid: "u1", type: "assistant" }),
+      entry({
+        uuid: "cb",
+        parentUuid: null,
+        logicalParentUuid: "a1",
+        type: "system",
+        subtype: "compact_boundary",
+      }),
+      entry({ uuid: "sum", parentUuid: "cb", type: "user", isCompactSummary: true }),
+      entry({ uuid: "u2", parentUuid: "sum", type: "user" }),
+      entry({ uuid: "a2", parentUuid: "u2", type: "assistant" }),
+    ]);
+    expect(chain?.map((e) => e.uuid)).toEqual(["u1", "a1", "cb", "sum", "u2", "a2"]);
+  });
+
+  it("keeps abandoned rewind branches out — only the chain from the newest leaf is live", () => {
+    // u2a/a2a is an abandoned fork (CLI-native rewind); u2b/a2b is the live branch.
+    const chain = rebuildTranscriptDisplayChain([
+      entry({ uuid: "u1", parentUuid: null, type: "user" }),
+      entry({ uuid: "a1", parentUuid: "u1", type: "assistant" }),
+      entry({
+        uuid: "cb",
+        parentUuid: null,
+        logicalParentUuid: "a1",
+        type: "system",
+        subtype: "compact_boundary",
+      }),
+      entry({ uuid: "sum", parentUuid: "cb", type: "user", isCompactSummary: true }),
+      entry({ uuid: "u2a", parentUuid: "sum", type: "user" }),
+      entry({ uuid: "a2a", parentUuid: "u2a", type: "assistant" }),
+      entry({ uuid: "u2b", parentUuid: "sum", type: "user" }),
+      entry({ uuid: "a2b", parentUuid: "u2b", type: "assistant" }),
+    ]);
+    expect(chain?.map((e) => e.uuid)).toEqual(["u1", "a1", "cb", "sum", "u2b", "a2b"]);
+  });
+
+  it("walks through non-display entries but drops them (and sidechain/meta) from the result", () => {
+    const chain = rebuildTranscriptDisplayChain([
+      entry({ uuid: "u1", parentUuid: null, type: "user" }),
+      entry({ uuid: "meta", parentUuid: "u1", type: "user", isMeta: true }),
+      entry({ uuid: "prog", parentUuid: "meta", type: "progress" }),
+      entry({ uuid: "side", parentUuid: null, type: "assistant", isSidechain: true }),
+      entry({
+        uuid: "cb",
+        parentUuid: null,
+        logicalParentUuid: "prog",
+        type: "system",
+        subtype: "compact_boundary",
+      }),
+      entry({ uuid: "u2", parentUuid: "cb", type: "user" }),
+    ]);
+    expect(chain?.map((e) => e.uuid)).toEqual(["u1", "cb", "u2"]);
+  });
+
+  it("crosses multiple compactions in one session", () => {
+    const chain = rebuildTranscriptDisplayChain([
+      entry({ uuid: "u1", parentUuid: null, type: "user" }),
+      entry({
+        uuid: "cb1",
+        parentUuid: null,
+        logicalParentUuid: "u1",
+        type: "system",
+        subtype: "compact_boundary",
+      }),
+      entry({ uuid: "u2", parentUuid: "cb1", type: "user" }),
+      entry({
+        uuid: "cb2",
+        parentUuid: null,
+        logicalParentUuid: "u2",
+        type: "system",
+        subtype: "compact_boundary",
+      }),
+      entry({ uuid: "u3", parentUuid: "cb2", type: "user" }),
+    ]);
+    expect(chain?.map((e) => e.uuid)).toEqual(["u1", "cb1", "u2", "cb2", "u3"]);
+  });
+
+  it("survives a parentUuid cycle without hanging", () => {
+    const chain = rebuildTranscriptDisplayChain([
+      entry({ uuid: "x", parentUuid: "y", type: "user" }),
+      entry({ uuid: "y", parentUuid: "x", type: "user" }),
+      entry({
+        uuid: "cb",
+        parentUuid: null,
+        logicalParentUuid: "y",
+        type: "system",
+        subtype: "compact_boundary",
+      }),
+      entry({ uuid: "u2", parentUuid: "cb", type: "user" }),
+    ]);
+    // The walk enters the cycle at y, continues to x, and stops on revisiting
+    // y — termination is the point here, not the exact order inside the cycle.
+    expect(chain?.map((e) => e.uuid)).toEqual(["x", "y", "cb", "u2"]);
+  });
+});
+
+describe("replaySessionHistory across compaction (full transcript replay)", () => {
+  type ReplayEvent =
+    | { kind: "user" | "agent"; text: string }
+    | { kind: "compaction"; phase: unknown };
+
+  function createRecordingAgent() {
+    const events: ReplayEvent[] = [];
+    const client = {
+      sessionUpdate: async (notification: SessionNotification) => {
+        const update = notification.update;
+        if (
+          (update.sessionUpdate === "user_message_chunk" ||
+            update.sessionUpdate === "agent_message_chunk") &&
+          update.content.type === "text"
+        ) {
+          events.push({
+            kind: update.sessionUpdate === "user_message_chunk" ? "user" : "agent",
+            text: update.content.text,
+          });
+        }
+      },
+      extNotification: async (method: string, params: Record<string, unknown>) => {
+        if (method === COMPACTION_METHOD) events.push({ kind: "compaction", phase: params.phase });
+      },
+    } as unknown as AcpClient;
+    return { agent: new ClaudeAcpAgent(client, { log: () => {}, error: () => {} }), events };
+  }
+
+  // Isolate under a unique project dir inside the real CLAUDE_CONFIG_DIR so the
+  // agent's transcript scan finds it; cleaned up after each test.
+  let sessionId: string;
+  let projectDir: string;
+  let transcript: string;
+
+  beforeEach(async () => {
+    sessionId = randomUUID();
+    projectDir = nodePath.join(
+      CLAUDE_CONFIG_DIR,
+      "projects",
+      `__compact_replay_test_${randomUUID()}`,
+    );
+    await nodeFs.mkdir(projectDir, { recursive: true });
+    transcript = nodePath.join(projectDir, `${sessionId}.jsonl`);
+    vi.mocked(getSessionMessages).mockClear();
+  });
+
+  afterEach(async () => {
+    await nodeFs.rm(projectDir, { recursive: true, force: true });
+  });
+
+  function line(obj: Record<string, unknown>): string {
+    return JSON.stringify(obj);
+  }
+
+  async function writeCompactedTranscript() {
+    const content =
+      [
+        line({
+          type: "user",
+          uuid: "u1",
+          parentUuid: null,
+          message: { role: "user", content: "first question" },
+        }),
+        line({
+          type: "assistant",
+          uuid: "a1",
+          parentUuid: "u1",
+          message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "first answer" }] },
+        }),
+        line({
+          type: "system",
+          subtype: "compact_boundary",
+          uuid: "cb",
+          parentUuid: null,
+          logicalParentUuid: "a1",
+          compactMetadata: { trigger: "auto", preTokens: 100000 },
+        }),
+        line({
+          type: "user",
+          uuid: "sum",
+          parentUuid: "cb",
+          isCompactSummary: true,
+          isVisibleInTranscriptOnly: true,
+          message: { role: "user", content: "This session is being continued from a previous conversation…" },
+        }),
+        line({
+          type: "user",
+          uuid: "u2",
+          parentUuid: "sum",
+          message: { role: "user", content: "second question" },
+        }),
+        line({
+          type: "assistant",
+          uuid: "a2",
+          parentUuid: "u2",
+          message: { id: "msg_2", role: "assistant", content: [{ type: "text", text: "second answer" }] },
+        }),
+      ].join("\n") + "\n";
+    await nodeFs.writeFile(transcript, content, "utf8");
+  }
+
+  it("replays pre-compaction history, a compaction card in place, and hides the summary", async () => {
+    await writeCompactedTranscript();
+    const { agent, events } = createRecordingAgent();
+
+    await (agent as any).replaySessionHistory(sessionId);
+
+    expect(events).toEqual([
+      { kind: "user", text: "first question" },
+      { kind: "agent", text: "first answer" },
+      { kind: "compaction", phase: "success" },
+      { kind: "user", text: "second question" },
+      { kind: "agent", text: "second answer" },
+    ]);
+    // The full-chain path never consults the SDK's effective chain.
+    expect(getSessionMessages).not.toHaveBeenCalled();
+  });
+
+  it("still honors stopBeforeUuid (rewind anchor) on the full chain", async () => {
+    await writeCompactedTranscript();
+    const { agent, events } = createRecordingAgent();
+
+    await (agent as any).replaySessionHistory(sessionId, { stopBeforeUuid: "u2" });
+
+    expect(events).toEqual([
+      { kind: "user", text: "first question" },
+      { kind: "agent", text: "first answer" },
+      { kind: "compaction", phase: "success" },
+    ]);
+  });
+
+  it("falls back to getSessionMessages when the transcript has no boundary", async () => {
+    await nodeFs.writeFile(
+      transcript,
+      line({
+        type: "user",
+        uuid: "u1",
+        parentUuid: null,
+        message: { role: "user", content: "plain question" },
+      }) + "\n",
+      "utf8",
+    );
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "u1",
+        session_id: "s",
+        message: { role: "user", content: "from effective chain" },
+        parent_tool_use_id: null,
+      },
+    ] as any);
+    const { agent, events } = createRecordingAgent();
+
+    await (agent as any).replaySessionHistory(sessionId);
+
+    expect(getSessionMessages).toHaveBeenCalledWith(sessionId);
+    expect(events).toEqual([{ kind: "user", text: "from effective chain" }]);
+  });
+
+  it("falls back to getSessionMessages when no transcript file exists", async () => {
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([] as any);
+    const missingSessionId = randomUUID();
+    const { agent, events } = createRecordingAgent();
+
+    await (agent as any).replaySessionHistory(missingSessionId);
+
+    expect(getSessionMessages).toHaveBeenCalledWith(missingSessionId);
+    expect(events).toEqual([]);
   });
 });
