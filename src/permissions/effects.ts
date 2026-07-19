@@ -10,6 +10,13 @@ import { PERMISSION_OPTION_ID } from "./options.js";
 export interface ClaudePermissionSelection {
   optionId: string;
   contextResetMode?: PermissionMode;
+  /**
+   * The editor's free-form steering note, attached to the ExitPlanMode
+   * "keep planning" reject as `outcome._meta.feedback`. It becomes the deny
+   * message so the model gets the note AND it persists as a replayable
+   * tool_result (a queued follow-up prompt would be dropped on resume).
+   */
+  feedback?: string;
 }
 
 export interface ClaudePermissionEffectContext {
@@ -28,7 +35,17 @@ export function parseClaudePermissionSelection(
   const optionId = response.outcome.optionId;
   const contextResetMode =
     toolName === "ExitPlanMode" ? exitPlanClearContextMode(optionId) : undefined;
-  return { optionId, ...(contextResetMode ? { contextResetMode } : {}) };
+  const rawFeedback =
+    toolName === "ExitPlanMode" ? response.outcome._meta?.["feedback"] : undefined;
+  const feedback =
+    typeof rawFeedback === "string" && rawFeedback.trim().length > 0
+      ? rawFeedback.trim()
+      : undefined;
+  return {
+    optionId,
+    ...(contextResetMode ? { contextResetMode } : {}),
+    ...(feedback !== undefined ? { feedback } : {}),
+  };
 }
 
 function allow(
@@ -151,9 +168,11 @@ function applyExitPlanModeSelection(
   }
   if (selection.optionId === PERMISSION_OPTION_ID.reject) {
     // A regular deny lets Claude continue planning and ask another question.
-    // Interrupt stops this ACP turn; the adapter maps Claude's internal
-    // diagnostic for that intentional stop back to cancellation.
-    return deny(context, "User chose to keep planning", true);
+    // Unlike upstream we do not interrupt: the editor's "keep planning"
+    // steering input feeds the model the user's note (or the default reject
+    // text) in the same turn and reads the note back off the failed
+    // tool_call body (see `DEFAULT_KEEP_PLANNING_MESSAGE` in the editor).
+    return deny(context, selection.feedback ?? "User rejected request to exit plan mode.");
   }
   return applyCommonSelection(selection, context);
 }

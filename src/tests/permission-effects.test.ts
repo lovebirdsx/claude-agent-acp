@@ -215,8 +215,27 @@ describe("Claude permission response effects", () => {
     );
     expect(rejected).toMatchObject({
       behavior: "deny",
-      message: "User chose to keep planning",
-      interrupt: true,
+      message: "User rejected request to exit plan mode.",
+      decisionClassification: "user_reject",
+    });
+    expect(rejected.behavior === "deny" && rejected.interrupt).toBeFalsy();
+
+    const rejectedWithFeedback = permissionResult(
+      {
+        outcome: {
+          outcome: "selected",
+          optionId: PERMISSION_OPTION_ID.reject,
+          _meta: { feedback: "  先补测试再实现  " },
+        },
+      },
+      "ExitPlanMode",
+      input,
+      "tool-plan",
+      offered,
+    );
+    expect(rejectedWithFeedback).toMatchObject({
+      behavior: "deny",
+      message: "先补测试再实现",
       decisionClassification: "user_reject",
     });
   });
