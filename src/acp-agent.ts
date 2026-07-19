@@ -535,15 +535,16 @@ type Session = {
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Seeded synchronously at
    *  session creation and on model switches from the per-model cache or the
-   *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss; on session/load the
-   *  resumed session's own `getContextUsage` report wins, see
-   *  `readResumedLiveModel`), then confirmed — and the cache populated — by each
-   *  result's modelUsage. No extra `getContextUsage` IPC is on these paths: on a
-   *  fresh session it stalls until the first turn runs (see the seeding call
-   *  sites and `contextWindowCache`). At each turn's result / compact boundary
-   *  the *effective* window (getContextUsage's `maxTokens`, i.e. after any
-   *  `autoCompactWindow` clamp) overrides it, so `used / size` matches the
-   *  point auto-compaction actually fires at. */
+   *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss), then confirmed —
+   *  and the cache populated — by each result's modelUsage; on session/load the
+   *  resumed session's `getContextUsage` report corrects it from the background
+   *  reconciliation (`reconcileResumedSessionModel`). No extra `getContextUsage`
+   *  IPC is on these paths: on a fresh session it stalls until the first turn
+   *  runs, and on a resumed session it re-assembles the whole transcript (see
+   *  the seeding call sites and `contextWindowCache`). At each turn's result /
+   *  compact boundary the *effective* window (getContextUsage's `maxTokens`,
+   *  i.e. after any `autoCompactWindow` clamp) overrides it, so `used / size`
+   *  matches the point auto-compaction actually fires at. */
   contextWindowSize: number;
   /** Whether `contextWindowSize` came from an authoritative source (the
    *  cross-session cache, a resumed session's `getContextUsage` report, or a
@@ -1673,9 +1674,15 @@ export class ClaudeAcpAgent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    const loadStart = Date.now();
     const result = await this.getOrCreateSession(params);
+    const createDone = Date.now();
 
     await this.replaySessionHistory(params.sessionId);
+    this.logger.log(
+      `[perf] session/load ${params.sessionId}: getOrCreateSession ${createDone - loadStart}ms, ` +
+        `replaySessionHistory ${Date.now() - createDone}ms`,
+    );
 
     // Send available commands after replay so it doesn't interleave with history
     setTimeout(() => {
@@ -5703,6 +5710,110 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /** Background half of the resumed-session model sync (issue #845): the CLI
+   *  round-trips involved — `getContextUsage` to read the live model,
+   *  `setModel` to re-assert an env/settings pin — take seconds on a large
+   *  transcript, so `getAvailableModels` no longer runs them on the
+   *  session/load critical path; this task runs them after the load response
+   *  and pushes a `config_option_update` when the bookkeeping was corrected.
+   *  Best-effort: the session may be torn down, or the user may switch models
+   *  while a round-trip is in flight — both abort silently, the later writer
+   *  wins. `sdkModels` is the SDK's unfiltered list, used to recover
+   *  capability flags for a live model outside the user's `availableModels`
+   *  allowlist (same synthesis `createSession` applies to its own fallback). */
+  private async reconcileResumedSessionModel(
+    sessionId: string,
+    sync: ResumedModelSync,
+    sdkModels: ModelInfo[],
+  ): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    const reportedModelId = session.models.currentModelId;
+
+    if (sync === "reassert-override") {
+      // A resumed session lands on the transcript's model regardless of
+      // env/settings, so the override must be re-asserted to keep the
+      // reported model truthful.
+      const start = Date.now();
+      try {
+        await session.query.setModel(reportedModelId);
+        this.logger.log(
+          `[perf] resume sync ${sessionId}: setModel("${reportedModelId}") ${Date.now() - start}ms`,
+        );
+        return;
+      } catch (error) {
+        // The session already runs fine on the transcript's model, so keep it
+        // usable and fall through to reading the live model back — reporting
+        // the pin the session isn't running would be worse.
+        this.logger.error(`Failed to re-assert model "${reportedModelId}" on resume:`, error);
+      }
+    }
+
+    const live = await readResumedLiveModel(session.query, session.modelInfos, this.logger);
+    if (this.sessions[sessionId] !== session) return;
+    // The same report carries the authoritative post-resume occupancy and the
+    // effective context window — the load path only seeded from cache/heuristic
+    // (no CLI round-trips there, see createSession), so adopt the real values
+    // now and push them to the client.
+    if (live.contextWindow != null) {
+      const clamp = resolveAutoCompactWindow(session.settingsManager.getSettings());
+      session.contextWindowSize =
+        clamp != null ? Math.min(live.contextWindow, clamp) : live.contextWindow;
+      session.contextWindowAuthoritative = true;
+    }
+    if (live.used != null) {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "usage_update",
+          used: live.used,
+          size: session.contextWindowSize,
+        },
+      });
+    }
+    const liveModel = live.model;
+    if (!liveModel) return;
+    // A user- or SDK-driven model change landed while the read was in flight;
+    // it is newer than the transcript snapshot we just read, so it wins.
+    if (session.models.currentModelId !== reportedModelId) return;
+    if (liveModel.value === reportedModelId) return;
+
+    // A live model with no picker counterpart still has SDK-known
+    // capabilities; register them under the verbatim id (identity fields
+    // overridden, see the matching synthesis in `createSession`) so mode
+    // gating and the effort/Fast-mode rebuild below agree with what the
+    // session is running.
+    if (!session.modelInfos.some((m) => m.value === liveModel.value)) {
+      const fallbackInfo = resolveModelPreference(sdkModels, liveModel.value);
+      session.modelInfos = [
+        ...session.modelInfos,
+        fallbackInfo
+          ? {
+              ...fallbackInfo,
+              value: liveModel.value,
+              displayName: liveModel.value,
+              description: "",
+              resolvedModel: undefined,
+            }
+          : liveModel,
+      ];
+    }
+
+    try {
+      await this.updateConfigOption(sessionId, MODEL_CONFIG_ID, liveModel.value);
+      this.logger.log(
+        `Resumed session ${sessionId}: reported model corrected from "${reportedModelId}" to live "${liveModel.value}".`,
+      );
+    } catch (err) {
+      // Same containment as syncModelAfterRefusalFallback: stale bookkeeping
+      // beats failing a session that is otherwise running fine.
+      this.logger.error(
+        `Failed to reconcile resumed session model to "${liveModel.value}":`,
+        err,
+      );
+    }
+  }
+
   /** Replace the Fast mode option in `session.configOptions` so it reflects
    *  `enabled` (and the client's current boolean-capability). A no-op when the
    *  option isn't present, so callers must confirm the current model surfaces
@@ -6179,6 +6290,7 @@ export class ClaudeAcpAgent {
       options,
     });
 
+    const initStart = Date.now();
     let initializationResult;
     try {
       initializationResult = await q.initializationResult();
@@ -6193,6 +6305,12 @@ export class ClaudeAcpAgent {
       }
       throw error;
     }
+
+    const initDone = Date.now();
+    this.logger.log(
+      `[perf] createSession ${sessionId}: initializationResult ${initDone - initStart}ms` +
+        `${creationOpts.resume !== undefined ? " (resume)" : ""}`,
+    );
 
     if (
       shouldHideClaudeAuth() &&
@@ -6220,13 +6338,17 @@ export class ClaudeAcpAgent {
         )
       : initializationResult.models;
 
-    const { modelState: models, resumedContextWindow } = await getAvailableModels(
+    const modelsStart = Date.now();
+    const { state: models, resumeSync } = await getAvailableModels(
       q,
       allowedModels,
       initializationResult.models,
       settingsManager,
       this.logger,
       creationOpts.resume !== undefined,
+    );
+    this.logger.log(
+      `[perf] createSession ${sessionId}: getAvailableModels ${Date.now() - modelsStart}ms`,
     );
 
     // Gate `auto` (and future model-specific modes) on the resolved model's
@@ -6355,18 +6477,19 @@ export class ClaudeAcpAgent {
         effortLevel: toSdkEffortLevel(initialEffort.currentValue),
       });
     }
-    // Seed the context window WITHOUT any extra IPC on the session/new path.
-    // On session/load, the resumed session's own `getContextUsage` report — a
-    // response `getAvailableModels` already awaited to learn the live model
-    // (resumed sessions ARE serviced pre-turn, unlike fresh ones) — is
-    // authoritative and wins. Otherwise: the cached authoritative window if a
-    // prior turn has learned it for this model (`result.modelUsage`,
-    // cross-session), else the text heuristic, else the default. We
-    // deliberately do NOT issue a getContextUsage call here: on a fresh
-    // session that control request is not serviced until the first prompt
-    // turn runs, so awaiting it — as 0.59.0 did — made session/new take ~15s
-    // (issues #886/#880). The authoritative window arrives on the first
-    // `result.modelUsage` and is cached from there.
+    // Seed the context window WITHOUT any extra IPC on the session/new OR
+    // session/load path. The cached authoritative window wins if a prior turn
+    // has learned it for this model (`result.modelUsage`, cross-session),
+    // else the text heuristic, else the default. We deliberately do NOT issue
+    // a getContextUsage call here: on a fresh session that control request is
+    // not serviced until the first prompt turn runs, so awaiting it — as
+    // 0.59.0 did — made session/new take ~15s (issues #886/#880); and on a
+    // resumed session it re-assembles the whole transcript for token counting
+    // (~6-7s on multi-MB transcripts), which moved session/load from ~2s to
+    // 20s+ — so resume reconciliation (model AND window) runs in the
+    // background instead, see `reconcileResumedSessionModel`. The
+    // authoritative window arrives on the first `result.modelUsage` and is
+    // cached from there.
     //
     // Text inference alone misses aliases that resolve to extended-context
     // models with no "1m" token anywhere in their id or description (e.g.
@@ -6374,18 +6497,19 @@ export class ClaudeAcpAgent {
     // `usage_update.size: 200000` until the first result's modelUsage corrects
     // it — but the cache means only the FIRST session to ever run a turn on such
     // a model eats that window, not every fresh session after a process
-    // restart (issue #596; a post-restart session/load is covered by the
-    // resumed report above).
+    // restart (issue #596; a post-restart session/load is corrected by the
+    // background resume reconciliation, see `reconcileResumedSessionModel`).
     //
     // The inference fallback is deliberately keyed to the allowlisted entry: a
     // fallback-resolved sibling's resolvedModel/displayName/description can
     // describe a different context lane than the verbatim live id (e.g. an
     // "opus[1m]" row matched for a bare 200k id), so on the fallback path only
     // the id itself is a trustworthy window signal.
-    const seededWindowRaw =
-      resumedContextWindow !== null
-        ? { size: resumedContextWindow, authoritative: true }
-        : immediateContextWindow(providerCacheKey, models.currentModelId, allowlistedModelInfo);
+    const seededWindowRaw = immediateContextWindow(
+      providerCacheKey,
+      models.currentModelId,
+      allowlistedModelInfo,
+    );
     // Cap the seed by any autoCompactWindow clamp so a fresh session reports the
     // effective window from the start instead of flashing the physical size
     // until the first turn's getContextUsage refresh.
@@ -6431,6 +6555,10 @@ export class ClaudeAcpAgent {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     };
+
+    if (resumeSync !== undefined) {
+      void this.reconcileResumedSessionModel(sessionId, resumeSync, initializationResult.models);
+    }
 
     return {
       sessionId,
@@ -7278,41 +7406,47 @@ async function readResumedLiveModel(
   query: Query,
   models: ModelInfo[],
   logger: Logger,
-): Promise<{ model: ModelInfo | null; contextWindow: number | null }> {
+): Promise<{ model: ModelInfo | null; contextWindow: number | null; used: number | null }> {
+  const start = Date.now();
   try {
     const usage = await query.getContextUsage();
+    logger.log(`[perf] readResumedLiveModel: getContextUsage ${Date.now() - start}ms`);
     return {
       model: usage.model ? matchResumedModel(models, usage.model) : null,
-      contextWindow: usage.rawMaxTokens > 0 ? usage.rawMaxTokens : null,
+      contextWindow: pickWindowSize(usage.maxTokens) ?? pickWindowSize(usage.rawMaxTokens),
+      used: usage.totalTokens,
     };
   } catch (error) {
-    logger.error("Failed to read the resumed session's live model:", error);
-    return { model: null, contextWindow: null };
+    logger.error(
+      `Failed to read the resumed session's live model (${Date.now() - start}ms):`,
+      error,
+    );
+    return { model: null, contextWindow: null, used: null };
   }
 }
 
-async function getAvailableModels(
+/** How a resumed session's model still needs to be synced with the CLI after
+ *  session/load has responded — see `reconcileResumedSessionModel`. */
+export type ResumedModelSync = "read-live-model" | "reassert-override";
+
+export async function getAvailableModels(
   query: Query,
   models: ModelInfo[],
   sdkModels: ModelInfo[],
   settingsManager: SettingsManager,
   logger: Logger,
   isResumedSession: boolean,
-): Promise<{ modelState: SessionModelState; resumedContextWindow: number | null }> {
+): Promise<{ state: SessionModelState; resumeSync?: ResumedModelSync }> {
   const settings = settingsManager.getSettings();
 
   let currentModel = models[0];
   let resolvedFromInput: string | undefined;
-  // The context window reported alongside a resumed session's live model.
-  // Only ever non-null on the paths where `currentModel` IS the live model
-  // (no override, or a failed override re-assert), so the window always
-  // describes the model the session actually runs.
-  let resumedContextWindow: number | null = null;
 
   // Model priority (highest to lowest):
   // 1. ANTHROPIC_MODEL environment variable
   // 2. settings.model (user configuration)
-  // 3. the resumed session's live model (resumed sessions only)
+  // 3. the resumed session's live model (resumed sessions only, reconciled
+  //    asynchronously after session/load — see below)
   // 4. models[0] (default first model)
   if (process.env.ANTHROPIC_MODEL) {
     const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
@@ -7328,66 +7462,56 @@ async function getAvailableModels(
     }
   }
 
+  const state: SessionModelState = {
+    availableModels: models.map((model) => ({
+      modelId: model.value,
+      name: model.displayName,
+      description: model.description,
+    })),
+    currentModelId: currentModel.value,
+  };
+
   // A resumed session restores the model it was previously running (the CLI
-  // re-reads it from the transcript), so without an env/settings override the
-  // freshly-computed default above can disagree with what the session actually
-  // runs — session/load then reports a model the session isn't using (issue
-  // #845). Ask the CLI for the live model and reflect it. No `setModel` here:
-  // the SDK is already running this model, and pushing a picker alias back
-  // (e.g. "opus[1m]") could change the live model rather than describe it.
-  if (resolvedFromInput === undefined && isResumedSession) {
-    const live = await readResumedLiveModel(query, models, logger);
-    currentModel = live.model ?? currentModel;
-    resumedContextWindow = live.contextWindow;
+  // re-reads it from the transcript), so the locally-computed choice above can
+  // disagree with what the session actually runs (issue #845). Reconciling
+  // takes CLI control requests — `getContextUsage` to read the live model, or
+  // `setModel` to re-assert an env/settings pin — which run for several
+  // seconds on a large transcript and were the dominant cost of session/load
+  // (~2s → 20s+ regression). Neither runs on the load critical path anymore:
+  // report the local resolution immediately and let the caller schedule
+  // `reconcileResumedSessionModel` to fix up the bookkeeping in the
+  // background, notifying the client via `config_option_update`.
+  if (isResumedSession) {
+    return {
+      state,
+      resumeSync: resolvedFromInput === undefined ? "read-live-model" : "reassert-override",
+    };
   }
 
   // Skip the setModel round-trip when we can prove the SDK has already landed
   // on the same model. Two cases qualify:
-  //  (a) No override applied — currentModel is the SDK's own default (or, on
-  //      resume, the live model read back from the SDK above); nothing to sync.
+  //  (a) No override applied — currentModel is the SDK's own default; nothing
+  //      to sync.
   //  (b) The resolver returned the user's input verbatim AND that value exists
   //      in the SDK's original model list — meaning no fuzzy match or
   //      allowlist rewrite was involved, and the SDK (which reads the same
   //      ANTHROPIC_MODEL / settings.json) will have arrived at the same entry.
-  //      This only holds for fresh sessions: a resumed session lands on the
-  //      transcript's model regardless of env/settings, so the override must
-  //      be re-asserted to keep the reported model truthful.
   // Anything else (fuzzy match, allowlist-synthesized value, alias) gets a
-  // setModel call so we don't drift from the user's intended pin.
+  // setModel call so we don't drift from the user's intended pin. On a fresh
+  // session the pin is a defining option, so a failure here fails loudly.
   const sdkSawSameValue = sdkModels.some((m) => m.value === currentModel.value);
   const skipSetModel =
     resolvedFromInput === undefined ||
-    (!isResumedSession && currentModel.value === resolvedFromInput && sdkSawSameValue);
+    (currentModel.value === resolvedFromInput && sdkSawSameValue);
   if (!skipSetModel) {
-    try {
-      await query.setModel(currentModel.value);
-    } catch (error) {
-      // On a fresh session the pin is a defining option — fail loudly. A
-      // resumed session already runs fine on the transcript's model, so
-      // failing the whole session/load over the re-assert would be worse
-      // than loading with the pin unapplied (mirrors the setPermissionMode
-      // containment in createSession). The SDK then stayed on the
-      // transcript's model, so read that back rather than reporting the
-      // pin the session isn't running.
-      if (!isResumedSession) throw error;
-      logger.error(`Failed to re-assert model "${currentModel.value}" on resume:`, error);
-      const live = await readResumedLiveModel(query, models, logger);
-      currentModel = live.model ?? currentModel;
-      resumedContextWindow = live.contextWindow;
-    }
+    const setModelStart = Date.now();
+    await query.setModel(currentModel.value);
+    logger.log(
+      `[perf] getAvailableModels: setModel("${currentModel.value}") ${Date.now() - setModelStart}ms`,
+    );
   }
 
-  return {
-    modelState: {
-      availableModels: models.map((model) => ({
-        modelId: model.value,
-        name: model.displayName,
-        description: model.description,
-      })),
-      currentModelId: currentModel.value,
-    },
-    resumedContextWindow,
-  };
+  return { state };
 }
 
 function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[] {

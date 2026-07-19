@@ -698,14 +698,14 @@ describe("createSession options merging", () => {
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
     });
 
-    it("session/load seeds the window from the resumed session's getContextUsage report", async () => {
-      // Resumed sessions get getContextUsage serviced pre-turn (issue #845 uses
-      // it to restore the live model), and the same response carries the
-      // authoritative window (`rawMaxTokens`). After a process restart the
-      // module cache is empty and text inference misses natively-1M aliases, so
-      // discarding this in-hand value would replay the issue-#596 flicker on
-      // every reload — the flagship scenario. 888_000 can only come from the
-      // report: inference on the mock model yields null → 200_000 default.
+    it("session/load seeds no window from getContextUsage; the background reconciliation corrects it", async () => {
+      // Fork semantics (see reconcileResumedSessionModel): session/load issues
+      // NO getContextUsage round-trip — on a large transcript the report takes
+      // seconds to assemble, which regressed session/load from ~2s to 20s+. The
+      // load response seeds from cache/heuristic only; the background
+      // reconciliation then reads the report (live model + window) and corrects
+      // the session. 888_000 can only come from the report: inference on the
+      // mock model yields null → 200_000 default.
       contextUsageResult = async () => ({ rawMaxTokens: 888_000, model: "claude-sonnet-4-6" });
 
       await (
@@ -715,7 +715,11 @@ describe("createSession options merging", () => {
       ).createSession({ cwd: process.cwd(), mcpServers: [] }, { resume: "resumed-window-probe" });
 
       const session = sessionFor("resumed-window-probe");
-      expect(session.contextWindowSize).toBe(888_000);
+      // Synchronous path: no report consulted, heuristic/default seed stands.
+      expect(session.contextWindowSize).toBe(200000);
+      expect(session.contextWindowAuthoritative).toBe(false);
+      // Background reconciliation corrects the window from the report.
+      await vi.waitFor(() => expect(session.contextWindowSize).toBe(888_000));
       expect(session.contextWindowAuthoritative).toBe(true);
     });
 
