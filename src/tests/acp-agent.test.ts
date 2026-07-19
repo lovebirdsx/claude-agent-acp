@@ -224,6 +224,9 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
   class TestClient {
     files: Map<string, string> = new Map();
     receivedText: string = "";
+    // Records the `_universe/compaction` extension notifications for the
+    // /compact lifecycle test.
+    compactionNotifications: Array<{ id: string; phase: string; reason?: string }> = [];
     // Records for the AskUserQuestion elicitation test.
     elicitations: CreateElicitationRequest[] = [];
     permissionToolInputs: unknown[] = [];
@@ -327,6 +330,13 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     // handle as `connection.agent`, valid for the lifetime of the connection.
     const { agent: ctx } = acpClient({ name: "test-client" })
       .onNotification(methods.client.session.update, (c) => client.sessionUpdate(c.params))
+      .onNotification(
+        "_universe/compaction",
+        (params) => params as { id: string; phase: string; reason?: string },
+        (c) => {
+          client.compactionNotifications.push(c.params)
+        },
+      )
       .onRequest(methods.client.session.requestPermission, (c) =>
         client.requestPermission(c.params),
       )
@@ -452,7 +462,12 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       sessionId: newSessionResponse.sessionId,
     });
 
-    expect(client.takeReceivedText()).toContain("Compacting...\n\nCompacting completed.");
+    // Compaction lifecycle is surfaced as structured `_universe/compaction`
+    // extension notifications (start → success), not plain-text chunks, so the
+    // editor can render a dedicated status card. Both phases must share one id.
+    const phases = client.compactionNotifications;
+    expect(phases.map((n) => n.phase)).toEqual(["start", "success"]);
+    expect(phases[0].id).toBe(phases[1].id);
   }, 60000);
 
   // Regression guard for the SDK's AskUserQuestion routing. The built-in
@@ -1605,6 +1620,7 @@ describe("synthetic login message (issue #863)", () => {
       sessionUpdate: async (u: SessionNotification) => {
         updates.push(u);
       },
+      extNotification: async () => {},
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
 
@@ -2059,6 +2075,7 @@ describe("permission request cancellation", () => {
     let receivedSignal: AbortSignal | undefined;
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
       // A `$/cancel_request`-aware client settles the request once the agent
       // aborts it; model that by rejecting when the forwarded signal fires.
       requestPermission: (_params: RequestPermissionRequest, signal?: AbortSignal) => {
@@ -2097,6 +2114,7 @@ describe("permission request cancellation", () => {
   it("treats a cancelled permission outcome as an aborted tool use", async () => {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
       requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
@@ -2321,6 +2339,7 @@ describe("tool_call emitted before permission request", () => {
         events.push(`update:${n.update.sessionUpdate}`);
         updates.push(n);
       },
+      extNotification: async () => {},
       requestPermission: async () => {
         events.push("permission");
         return { outcome: { outcome: "selected", optionId: "allow" } };
@@ -2605,6 +2624,7 @@ describe("canUseTool in bypassPermissions mode", () => {
     const events: string[] = [];
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
       requestPermission: async () => {
         events.push("permission");
         return { outcome: { outcome: "selected", optionId: "allow" } };
@@ -2672,6 +2692,7 @@ describe("subagent permission attribution (issue #851)", () => {
       sessionUpdate: async (n: SessionNotification) => {
         updates.push(n);
       },
+      extNotification: async () => {},
       requestPermission: async (params: RequestPermissionRequest) => {
         requests.push(params);
         return { outcome: { outcome: "selected", optionId: "allow" } };
@@ -2965,6 +2986,7 @@ describe("stop reason propagation", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -3164,6 +3186,7 @@ describe("stop reason propagation", () => {
       sessionUpdate: async (n: any) => {
         updates.push(n);
       },
+      extNotification: async () => {},
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     (agent as any).clientCapabilities = { session: { configOptions: { boolean: {} } } };
@@ -3402,6 +3425,7 @@ describe("stop reason propagation", () => {
       sessionUpdate: async (u: any) => {
         sessionUpdates.push(u);
       },
+    extNotification: async () => {},
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
 
@@ -3470,6 +3494,7 @@ describe("stop reason propagation", () => {
       sessionUpdate: async (u: any) => {
         sessionUpdates.push(u);
       },
+      extNotification: async () => {},
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
 
@@ -3516,6 +3541,7 @@ describe("stop reason propagation", () => {
       sessionUpdate: async (u: any) => {
         sessionUpdates.push(u);
       },
+      extNotification: async () => {},
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
 
@@ -4129,6 +4155,7 @@ describe("logout", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -4147,6 +4174,7 @@ describe("session/close", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -4246,6 +4274,7 @@ describe("session/delete", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -4343,6 +4372,7 @@ describe("universe-editor/set_session_title (setSessionTitle)", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -4394,6 +4424,7 @@ describe("prompt messageId anchoring", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -4483,6 +4514,7 @@ describe("universe-editor/rewind_session (rewindSession)", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -4701,6 +4733,7 @@ describe("rewind persistence (truncateTranscriptBefore)", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -4790,6 +4823,7 @@ describe("unstable_forkSession fork point (excludes anchored user turn)", () => 
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -4865,6 +4899,7 @@ describe("getOrCreateSession param change detection", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -5100,6 +5135,7 @@ describe("usage_update computation", () => {
       sessionUpdate: async (notification: any) => {
         updates.push(notification);
       },
+      extNotification: async () => {},
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     return { agent, updates };
@@ -6681,6 +6717,7 @@ describe("assembled assistant text fallback", () => {
       sessionUpdate: async (notification: any) => {
         updates.push(notification);
       },
+      extNotification: async () => {},
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     return { agent, updates };
@@ -7257,8 +7294,9 @@ describe("assembled assistant text fallback", () => {
   it("does not forward the result text of a turn that only emitted status text", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // `/compact` carries no echo, so it is promoted at its own result, and its
-    // status text is emitted directly rather than through the forwarding loops.
-    // That text still counts as delivered, so the result must not follow it.
+    // status surfaces directly (the fork's structured compaction card via
+    // COMPACTION_METHOD — not a text chunk — but still marked delivered).
+    // That still counts as delivered, so the result must not follow it.
     injectSession(agent, [
       { type: "system", subtype: "status", status: "compacting", session_id: "test-session" },
       replayedResult("conversation summarized"),
@@ -7267,7 +7305,7 @@ describe("assembled assistant text fallback", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
 
-    expect(messageChunkTexts(updates)).toEqual(["Compacting..."]);
+    expect(messageChunkTexts(updates)).toEqual([]);
   });
 
   // Like injectSession, but serves two prompts: each turn's echo is yielded
@@ -7500,8 +7538,8 @@ describe("emitRawSDKMessages", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     // Should have emitted extNotifications for all messages (user replay + system + result + session_state_changed)
-    expect(extNotifications.length).toBeGreaterThanOrEqual(3);
-    expect(extNotifications.every((n) => n.method === "_claude/sdkMessage")).toBe(true);
+    const rawMessages = extNotifications.filter((n) => n.method === "_claude/sdkMessage");
+    expect(rawMessages.length).toBeGreaterThanOrEqual(3);
   });
 
   it("does not emit when set to false", async () => {
@@ -7518,7 +7556,9 @@ describe("emitRawSDKMessages", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
-    expect(extNotifications).toHaveLength(0);
+    // The structured compaction card (COMPACTION_METHOD) is not a raw-message
+    // passthrough — it fires regardless of emitRawSDKMessages.
+    expect(extNotifications.filter((n) => n.method === "_claude/sdkMessage")).toHaveLength(0);
   });
 
   it("emits only messages matching a filter array", async () => {
@@ -7641,6 +7681,7 @@ describe("result origin handling", () => {
       sessionUpdate: async (notification: any) => {
         updates.push(notification);
       },
+      extNotification: async () => {},
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     return { agent, updates };
@@ -7795,6 +7836,7 @@ describe("memory_recall handling", () => {
       sessionUpdate: async (notification: any) => {
         updates.push(notification);
       },
+      extNotification: async () => {},
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     return { agent, updates };
@@ -7952,6 +7994,7 @@ describe("post-error recovery", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -9667,6 +9710,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -9726,6 +9770,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
           events.push(`chunk:${u.update.content?.text}`);
         }
       },
+      extNotification: async () => {},
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     return { agent, events };
@@ -10696,6 +10741,7 @@ describe("turn steering (_session/steering)", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -11177,6 +11223,7 @@ describe("turn abandoned by the SDK (issue #825)", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -12007,6 +12054,7 @@ describe("streamEventToAcpNotifications", () => {
         index: 0,
         delta: { type: "text_delta", text: "hello" },
       },
+      extNotification: async () => {},
     } as Parameters<typeof streamEventToAcpNotifications>[0];
 
     const result = streamEventToAcpNotifications(message, "test", {}, {} as AcpClient, console, {

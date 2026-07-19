@@ -180,6 +180,26 @@ interface RewindSessionRequest {
   rewindFiles?: boolean;
 }
 
+/**
+ * Custom (extension) notification the agent sends to surface context-compaction
+ * lifecycle so the editor can render a dedicated status card instead of parsing
+ * plain-text chunks out of the assistant message stream. Shared verbatim with
+ * the editor's `acpSessionModel.ts` (`COMPACTION_METHOD`) — keep both in sync.
+ *
+ * `phase` is `start` when a compaction begins, `success`/`failed` at its
+ * terminal `compact_result`. `id` is stable across a single compaction so the
+ * editor can replace the in-progress card in place with its outcome; `reason`
+ * carries the failure detail on `phase: 'failed'`.
+ */
+export const COMPACTION_METHOD = "_universe/compaction";
+
+interface CompactionNotification {
+  sessionId: string;
+  id: string;
+  phase: "start" | "success" | "failed";
+  reason?: string;
+}
+
 function sanitizeTitle(text: string): string {
   // Replace newlines and collapse whitespace
   const sanitized = text
@@ -2100,7 +2120,13 @@ export class ClaudeAcpAgent {
     // `status` (compact_result success/failed) twice for a single failed
     // compaction, and the two messages are indistinguishable — so we report the
     // outcome only while a compaction is in progress, then clear this.
+    //
+    // `currentCompactionId` is a stable id minted at `compacting` start so the
+    // editor can replace the in-progress compaction card in place with its
+    // `success`/`failed` outcome (see COMPACTION_METHOD). Cleared alongside the
+    // flag.
     let compactionInProgress = false;
+    let currentCompactionId: string | undefined;
     // Anthropic API message id of the assistant message currently being
     // streamed, captured from `message_start` so the streamed chunks that follow
     // (whose delta events don't carry it) can all be tagged with the same,
@@ -2154,6 +2180,7 @@ export class ClaudeAcpAgent {
       lastAssistantError = undefined;
       lastRefusalExplanation = null;
       compactionInProgress = false;
+      currentCompactionId = undefined;
       // Do NOT reset currentStreamMessageId or streamedBlocks here. Turn
       // activation can fire mid-message (the replayed user echo with
       // --replay-user-messages lands between a message's blocks); clearing the
@@ -2726,49 +2753,50 @@ export class ClaudeAcpAgent {
                 );
                 break;
               case "status": {
-                // These banners count as delivered text (via sendUpdate), so
-                // an echo-less turn that only ever emits them (e.g. `/compact`,
-                // promoted at its own result) doesn't have its result text
-                // re-emitted by the issue-#453 fallback.
+                // These banners count as delivered content, so an echo-less
+                // turn that only ever emits them (e.g. `/compact`, promoted at
+                // its own result) doesn't have its result text re-emitted by
+                // the issue-#453 fallback. The fork surfaces them as a
+                // structured compaction card (COMPACTION_METHOD) instead of a
+                // text chunk, so the delivery flag is set explicitly rather
+                // than through sendUpdate.
                 if (message.status === "compacting") {
                   compactionInProgress = true;
-                  await sendUpdate({
+                  session.emittedAssistantText = true;
+                  currentCompactionId = randomUUID();
+                  await this.client.extNotification(COMPACTION_METHOD, {
                     sessionId: message.session_id,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: "Compacting..." },
-                    },
-                  });
+                    id: currentCompactionId,
+                    phase: "start",
+                  } satisfies CompactionNotification);
                 } else if (message.compact_result === "success" && compactionInProgress) {
                   // The SDK signals manual `/compact` completion with a status
                   // message carrying `compact_result`, not the `compact_boundary`
                   // message (which only fires when there's content to compact).
-                  compactionInProgress = false;
-                  await sendUpdate({
+                  await this.client.extNotification(COMPACTION_METHOD, {
                     sessionId: message.session_id,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: "\n\nCompacting completed." },
-                    },
-                  });
+                    id: currentCompactionId ?? randomUUID(),
+                    phase: "success",
+                  } satisfies CompactionNotification);
+                  compactionInProgress = false;
+                  currentCompactionId = undefined;
                 } else if (message.compact_result === "failed" && compactionInProgress) {
-                  compactionInProgress = false;
-                  const reason = message.compact_error ? `: ${message.compact_error}` : ".";
-                  await sendUpdate({
+                  await this.client.extNotification(COMPACTION_METHOD, {
                     sessionId: message.session_id,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: `\n\nCompacting failed${reason}` },
-                    },
-                  });
+                    id: currentCompactionId ?? randomUUID(),
+                    phase: "failed",
+                    ...(message.compact_error ? { reason: message.compact_error } : {}),
+                  } satisfies CompactionNotification);
+                  compactionInProgress = false;
+                  currentCompactionId = undefined;
                 }
                 break;
               }
               case "compact_boundary": {
                 // Refresh the displayed usage immediately so the client doesn't
                 // keep showing the stale pre-compaction size (e.g. "944k/1m")
-                // right after the user sees "Compacting completed", which is
-                // confusing and wrong.
+                // right after the user sees the compaction card complete, which
+                // is confusing and wrong.
                 //
                 // Prefer the SDK's authoritative post-compaction `used` via
                 // getContextUsage — it reflects the real retained context
@@ -2784,9 +2812,9 @@ export class ClaudeAcpAgent {
                 // in session.contextWindowSize; otherwise the previously learned
                 // window (modelUsage / the model heuristic) stands.
                 //
-                // The "Compacting completed." text is emitted from the `status`
-                // handler (keyed on `compact_result`), not here, so the failure
-                // path gets a message too.
+                // The compaction outcome card is emitted from the `status`
+                // handler (keyed on `compact_result`) via COMPACTION_METHOD, not
+                // here, so the failure path gets a card too.
                 const usage = await fetchContextUsage(session.query, this.logger);
                 lastAssistantUsage = null;
                 lastAssistantTotalUsage = usage?.used ?? 0;
