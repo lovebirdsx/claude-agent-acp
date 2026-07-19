@@ -8069,7 +8069,11 @@ export class ClaudeAcpAgent {
         typeof current === "boolean" ? (current ? FAST_MODE_ON : FAST_MODE_OFF) : current;
       if (currentValue === value) continue;
       try {
-        await this.setSessionConfigOption({ sessionId, configId, value });
+        await this.setSessionConfigOption(
+          typeof value === "boolean"
+            ? { sessionId, configId, type: "boolean", value }
+            : { sessionId, configId, value },
+        );
       } catch (err) {
         this.logger.error(
           `rewind: failed to re-apply config option ${configId}=${String(value)} after recreate:`,
