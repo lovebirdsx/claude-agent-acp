@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { randomUUID } from "crypto";
 import { RequestError, SessionNotification } from "@agentclientprotocol/sdk";
 import { query, getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
@@ -335,18 +335,28 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
 
   // Regression test for https://github.com/agentclientprotocol/claude-agent-acp/issues/845
   // On resume the CLI restores the model the session's transcript was running,
-  // so loadSession must report that live model instead of recomputing the
-  // env/settings/default choice from scratch. Haiku is used because no account
-  // resolves its default there, so the restored model provably differs from
-  // the freshly-computed default. Requires no ANTHROPIC_MODEL env var and no
-  // "model" key in settings.json (either would pin the model on resume and
-  // mask the reconciliation this test covers).
-  it("ACP: loadSession reports the model the resumed session is actually running", async () => {
+  // so the client must end up seeing that live model instead of the
+  // env/settings/default choice recomputed from scratch. Haiku is used because
+  // no account resolves its default there, so the restored model provably
+  // differs from the freshly-computed default. Requires no ANTHROPIC_MODEL env
+  // var and no "model" key in settings.json (either would pin the model on
+  // resume and mask the reconciliation this test covers).
+  //
+  // Reading the live model takes a getContextUsage round-trip that runs for
+  // seconds on a large transcript, so it happens AFTER the loadSession
+  // response (see reconcileResumedSessionModel): the load itself reports the
+  // locally-computed choice and the correction arrives asynchronously as a
+  // config_option_update notification.
+  it("ACP: resumed session's live model arrives via config_option_update after loadSession", async () => {
     const agentChunks: string[] = [];
+    let latestConfigOptions: { id: string; currentValue?: unknown }[] | undefined;
     const client = createMockClient(async (notification) => {
       if (notification.update.sessionUpdate === "agent_message_chunk") {
         const content = notification.update.content;
         if (content.type === "text") agentChunks.push(content.text);
+      }
+      if (notification.update.sessionUpdate === "config_option_update") {
+        latestConfigOptions = notification.update.configOptions;
       }
     });
 
@@ -368,8 +378,11 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
       });
       await agent.closeSession({ sessionId });
 
-      const loadResp = await agent.loadSession({ sessionId, cwd, mcpServers: [] });
-      expect(modelOf(loadResp.configOptions)).toBe("haiku");
+      await agent.loadSession({ sessionId, cwd, mcpServers: [] });
+      await vi.waitFor(() => expect(modelOf(latestConfigOptions)).toBe("haiku"), {
+        timeout: 60000,
+        interval: 250,
+      });
 
       // And the reported option agrees with the live session (`/context`).
       agentChunks.length = 0;
