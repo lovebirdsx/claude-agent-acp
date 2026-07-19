@@ -1020,9 +1020,15 @@ export class ClaudeAcpAgent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    const loadStart = Date.now();
     const result = await this.getOrCreateSession(params);
+    const createDone = Date.now();
 
     await this.replaySessionHistory(params.sessionId);
+    this.logger.log(
+      `[perf] session/load ${params.sessionId}: getOrCreateSession ${createDone - loadStart}ms, ` +
+        `replaySessionHistory ${Date.now() - createDone}ms`,
+    );
 
     // Send available commands after replay so it doesn't interleave with history
     setTimeout(() => {
@@ -3935,6 +3941,89 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /** Background half of the resumed-session model sync (issue #845): the CLI
+   *  round-trips involved — `getContextUsage` to read the live model,
+   *  `setModel` to re-assert an env/settings pin — take seconds on a large
+   *  transcript, so `getAvailableModels` no longer runs them on the
+   *  session/load critical path; this task runs them after the load response
+   *  and pushes a `config_option_update` when the bookkeeping was corrected.
+   *  Best-effort: the session may be torn down, or the user may switch models
+   *  while a round-trip is in flight — both abort silently, the later writer
+   *  wins. `sdkModels` is the SDK's unfiltered list, used to recover
+   *  capability flags for a live model outside the user's `availableModels`
+   *  allowlist (same synthesis `createSession` applies to its own fallback). */
+  private async reconcileResumedSessionModel(
+    sessionId: string,
+    sync: ResumedModelSync,
+    sdkModels: ModelInfo[],
+  ): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    const reportedModelId = session.models.currentModelId;
+
+    if (sync === "reassert-override") {
+      // A resumed session lands on the transcript's model regardless of
+      // env/settings, so the override must be re-asserted to keep the
+      // reported model truthful.
+      const start = Date.now();
+      try {
+        await session.query.setModel(reportedModelId);
+        this.logger.log(
+          `[perf] resume sync ${sessionId}: setModel("${reportedModelId}") ${Date.now() - start}ms`,
+        );
+        return;
+      } catch (error) {
+        // The session already runs fine on the transcript's model, so keep it
+        // usable and fall through to reading the live model back — reporting
+        // the pin the session isn't running would be worse.
+        this.logger.error(`Failed to re-assert model "${reportedModelId}" on resume:`, error);
+      }
+    }
+
+    const live = await readResumedLiveModel(session.query, session.modelInfos, this.logger);
+    if (!live) return;
+    if (this.sessions[sessionId] !== session) return;
+    // A user- or SDK-driven model change landed while the read was in flight;
+    // it is newer than the transcript snapshot we just read, so it wins.
+    if (session.models.currentModelId !== reportedModelId) return;
+    if (live.value === reportedModelId) return;
+
+    // A live model with no picker counterpart still has SDK-known
+    // capabilities; register them under the verbatim id (identity fields
+    // overridden, see the matching synthesis in `createSession`) so mode
+    // gating and the effort/Fast-mode rebuild below agree with what the
+    // session is running.
+    if (!session.modelInfos.some((m) => m.value === live.value)) {
+      const fallbackInfo = resolveModelPreference(sdkModels, live.value);
+      session.modelInfos = [
+        ...session.modelInfos,
+        fallbackInfo
+          ? {
+              ...fallbackInfo,
+              value: live.value,
+              displayName: live.value,
+              description: "",
+              resolvedModel: undefined,
+            }
+          : live,
+      ];
+    }
+
+    try {
+      await this.updateConfigOption(sessionId, MODEL_CONFIG_ID, live.value);
+      this.logger.log(
+        `Resumed session ${sessionId}: reported model corrected from "${reportedModelId}" to live "${live.value}".`,
+      );
+    } catch (err) {
+      // Same containment as syncModelAfterRefusalFallback: stale bookkeeping
+      // beats failing a session that is otherwise running fine.
+      this.logger.error(
+        `Failed to reconcile resumed session model to "${live.value}":`,
+        err,
+      );
+    }
+  }
+
   /** Replace the Fast mode option in `session.configOptions` so it reflects
    *  `enabled` (and the client's current boolean-capability). A no-op when the
    *  option isn't present, so callers must confirm the current model surfaces
@@ -4400,6 +4489,7 @@ export class ClaudeAcpAgent {
       options,
     });
 
+    const initStart = Date.now();
     let initializationResult;
     try {
       initializationResult = await q.initializationResult();
@@ -4414,6 +4504,12 @@ export class ClaudeAcpAgent {
       }
       throw error;
     }
+
+    const initDone = Date.now();
+    this.logger.log(
+      `[perf] createSession ${sessionId}: initializationResult ${initDone - initStart}ms` +
+        `${creationOpts.resume !== undefined ? " (resume)" : ""}`,
+    );
 
     if (
       shouldHideClaudeAuth() &&
@@ -4441,13 +4537,17 @@ export class ClaudeAcpAgent {
         )
       : initializationResult.models;
 
-    const models = await getAvailableModels(
+    const modelsStart = Date.now();
+    const { state: models, resumeSync } = await getAvailableModels(
       q,
       allowedModels,
       initializationResult.models,
       settingsManager,
       this.logger,
       creationOpts.resume !== undefined,
+    );
+    this.logger.log(
+      `[perf] createSession ${sessionId}: getAvailableModels ${Date.now() - modelsStart}ms`,
     );
 
     // Gate `auto` (and future model-specific modes) on the resolved model's
@@ -4608,6 +4708,10 @@ export class ClaudeAcpAgent {
       emittedToolCalls: new Set(),
       messageIdToUuid: new Map(),
     };
+
+    if (resumeSync !== undefined) {
+      void this.reconcileResumedSessionModel(sessionId, resumeSync, initializationResult.models);
+    }
 
     return {
       sessionId,
@@ -5346,23 +5450,32 @@ async function readResumedLiveModel(
   models: ModelInfo[],
   logger: Logger,
 ): Promise<ModelInfo | null> {
+  const start = Date.now();
   try {
     const liveModel = (await query.getContextUsage()).model;
+    logger.log(`[perf] readResumedLiveModel: getContextUsage ${Date.now() - start}ms`);
     return liveModel ? matchResumedModel(models, liveModel) : null;
   } catch (error) {
-    logger.error("Failed to read the resumed session's live model:", error);
+    logger.error(
+      `Failed to read the resumed session's live model (${Date.now() - start}ms):`,
+      error,
+    );
     return null;
   }
 }
 
-async function getAvailableModels(
+/** How a resumed session's model still needs to be synced with the CLI after
+ *  session/load has responded — see `reconcileResumedSessionModel`. */
+export type ResumedModelSync = "read-live-model" | "reassert-override";
+
+export async function getAvailableModels(
   query: Query,
   models: ModelInfo[],
   sdkModels: ModelInfo[],
   settingsManager: SettingsManager,
   logger: Logger,
   isResumedSession: boolean,
-): Promise<SessionModelState> {
+): Promise<{ state: SessionModelState; resumeSync?: ResumedModelSync }> {
   const settings = settingsManager.getSettings();
 
   let currentModel = models[0];
@@ -5371,7 +5484,8 @@ async function getAvailableModels(
   // Model priority (highest to lowest):
   // 1. ANTHROPIC_MODEL environment variable
   // 2. settings.model (user configuration)
-  // 3. the resumed session's live model (resumed sessions only)
+  // 3. the resumed session's live model (resumed sessions only, reconciled
+  //    asynchronously after session/load — see below)
   // 4. models[0] (default first model)
   if (process.env.ANTHROPIC_MODEL) {
     const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
@@ -5387,52 +5501,7 @@ async function getAvailableModels(
     }
   }
 
-  // A resumed session restores the model it was previously running (the CLI
-  // re-reads it from the transcript), so without an env/settings override the
-  // freshly-computed default above can disagree with what the session actually
-  // runs — session/load then reports a model the session isn't using (issue
-  // #845). Ask the CLI for the live model and reflect it. No `setModel` here:
-  // the SDK is already running this model, and pushing a picker alias back
-  // (e.g. "opus[1m]") could change the live model rather than describe it.
-  if (resolvedFromInput === undefined && isResumedSession) {
-    currentModel = (await readResumedLiveModel(query, models, logger)) ?? currentModel;
-  }
-
-  // Skip the setModel round-trip when we can prove the SDK has already landed
-  // on the same model. Two cases qualify:
-  //  (a) No override applied — currentModel is the SDK's own default (or, on
-  //      resume, the live model read back from the SDK above); nothing to sync.
-  //  (b) The resolver returned the user's input verbatim AND that value exists
-  //      in the SDK's original model list — meaning no fuzzy match or
-  //      allowlist rewrite was involved, and the SDK (which reads the same
-  //      ANTHROPIC_MODEL / settings.json) will have arrived at the same entry.
-  //      This only holds for fresh sessions: a resumed session lands on the
-  //      transcript's model regardless of env/settings, so the override must
-  //      be re-asserted to keep the reported model truthful.
-  // Anything else (fuzzy match, allowlist-synthesized value, alias) gets a
-  // setModel call so we don't drift from the user's intended pin.
-  const sdkSawSameValue = sdkModels.some((m) => m.value === currentModel.value);
-  const skipSetModel =
-    resolvedFromInput === undefined ||
-    (!isResumedSession && currentModel.value === resolvedFromInput && sdkSawSameValue);
-  if (!skipSetModel) {
-    try {
-      await query.setModel(currentModel.value);
-    } catch (error) {
-      // On a fresh session the pin is a defining option — fail loudly. A
-      // resumed session already runs fine on the transcript's model, so
-      // failing the whole session/load over the re-assert would be worse
-      // than loading with the pin unapplied (mirrors the setPermissionMode
-      // containment in createSession). The SDK then stayed on the
-      // transcript's model, so read that back rather than reporting the
-      // pin the session isn't running.
-      if (!isResumedSession) throw error;
-      logger.error(`Failed to re-assert model "${currentModel.value}" on resume:`, error);
-      currentModel = (await readResumedLiveModel(query, models, logger)) ?? currentModel;
-    }
-  }
-
-  return {
+  const state: SessionModelState = {
     availableModels: models.map((model) => ({
       modelId: model.value,
       name: model.displayName,
@@ -5440,6 +5509,48 @@ async function getAvailableModels(
     })),
     currentModelId: currentModel.value,
   };
+
+  // A resumed session restores the model it was previously running (the CLI
+  // re-reads it from the transcript), so the locally-computed choice above can
+  // disagree with what the session actually runs (issue #845). Reconciling
+  // takes CLI control requests — `getContextUsage` to read the live model, or
+  // `setModel` to re-assert an env/settings pin — which run for several
+  // seconds on a large transcript and were the dominant cost of session/load
+  // (~2s → 20s+ regression). Neither runs on the load critical path anymore:
+  // report the local resolution immediately and let the caller schedule
+  // `reconcileResumedSessionModel` to fix up the bookkeeping in the
+  // background, notifying the client via `config_option_update`.
+  if (isResumedSession) {
+    return {
+      state,
+      resumeSync: resolvedFromInput === undefined ? "read-live-model" : "reassert-override",
+    };
+  }
+
+  // Skip the setModel round-trip when we can prove the SDK has already landed
+  // on the same model. Two cases qualify:
+  //  (a) No override applied — currentModel is the SDK's own default; nothing
+  //      to sync.
+  //  (b) The resolver returned the user's input verbatim AND that value exists
+  //      in the SDK's original model list — meaning no fuzzy match or
+  //      allowlist rewrite was involved, and the SDK (which reads the same
+  //      ANTHROPIC_MODEL / settings.json) will have arrived at the same entry.
+  // Anything else (fuzzy match, allowlist-synthesized value, alias) gets a
+  // setModel call so we don't drift from the user's intended pin. On a fresh
+  // session the pin is a defining option, so a failure here fails loudly.
+  const sdkSawSameValue = sdkModels.some((m) => m.value === currentModel.value);
+  const skipSetModel =
+    resolvedFromInput === undefined ||
+    (currentModel.value === resolvedFromInput && sdkSawSameValue);
+  if (!skipSetModel) {
+    const setModelStart = Date.now();
+    await query.setModel(currentModel.value);
+    logger.log(
+      `[perf] getAvailableModels: setModel("${currentModel.value}") ${Date.now() - setModelStart}ms`,
+    );
+  }
+
+  return { state };
 }
 
 function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[] {
