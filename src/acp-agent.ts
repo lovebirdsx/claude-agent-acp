@@ -3452,6 +3452,17 @@ export class ClaudeAcpAgent {
         }
         const selectedMode =
           response.outcome?.outcome === "selected" ? response.outcome.optionId : undefined;
+        // The client (editor) may attach the user's free-form steering note on the
+        // "keep planning" reject via `outcome._meta.feedback`. Surfacing it as the
+        // deny message both tells the model what to do next AND persists it as a
+        // replayable tool_result (a queued follow-up prompt would be dropped from
+        // history on session resume). Falls back to the generic reject string.
+        const steerFeedback =
+          response.outcome?.outcome === "selected" &&
+          typeof response.outcome._meta?.["feedback"] === "string" &&
+          (response.outcome._meta["feedback"] as string).trim().length > 0
+            ? (response.outcome._meta["feedback"] as string).trim()
+            : undefined;
         const selectedModeWasOffered = options.some((option) => option.optionId === selectedMode);
         if (
           selectedModeWasOffered &&
@@ -3479,7 +3490,7 @@ export class ClaudeAcpAgent {
         } else {
           return {
             behavior: "deny",
-            message: "User rejected request to exit plan mode.",
+            message: steerFeedback ?? "User rejected request to exit plan mode.",
           };
         }
       }

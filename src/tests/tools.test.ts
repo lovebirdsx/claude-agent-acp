@@ -591,6 +591,44 @@ describe("Bash terminal output", () => {
       expect(update._meta?.terminal_output?.data).toBe("hello\n\n\n");
     });
 
+    describe("ExitPlanMode deny (keep planning)", () => {
+      const exitPlanToolUse = { name: "ExitPlanMode", input: {}, id: "toolu_plan" };
+
+      it("suppresses the default reject message (no user note) as empty content", () => {
+        const toolResult: ToolResultBlockParam = {
+          type: "tool_result",
+          tool_use_id: "toolu_plan",
+          content: "User rejected request to exit plan mode.",
+          is_error: true,
+        };
+        expect(toolUpdateFromToolResult(toolResult, exitPlanToolUse, false)).toEqual({});
+      });
+
+      it("surfaces a user steering note as plain (un-fenced) text", () => {
+        const toolResult: ToolResultBlockParam = {
+          type: "tool_result",
+          tool_use_id: "toolu_plan",
+          content: "先不做了",
+          is_error: true,
+        };
+        expect(toolUpdateFromToolResult(toolResult, exitPlanToolUse, false)).toEqual({
+          content: [{ type: "content", content: { type: "text", text: "先不做了" } }],
+        });
+      });
+
+      it("extracts the note from array-form content", () => {
+        const toolResult: ToolResultBlockParam = {
+          type: "tool_result",
+          tool_use_id: "toolu_plan",
+          content: [{ type: "text", text: "换个方案" }],
+          is_error: true,
+        };
+        expect(toolUpdateFromToolResult(toolResult, exitPlanToolUse, false)).toEqual({
+          content: [{ type: "content", content: { type: "text", text: "换个方案" } }],
+        });
+      });
+    });
+
     describe("with plain string tool_result (production format)", () => {
       const makeStringBashResult = (
         content: string,
