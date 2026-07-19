@@ -1001,6 +1001,47 @@ describe("createSession options merging", () => {
       expect(getSessionMessages).toHaveBeenCalledTimes(1);
       expect(getSessionMessages).toHaveBeenCalledWith("resumed-model-probe");
     });
+    it("session/load seeds no window from getContextUsage; the background reconciliation corrects it", async () => {
+      // Fork semantics (see reconcileResumedSessionModel): session/load issues
+      // NO getContextUsage round-trip — on a large transcript the report takes
+      // seconds to assemble, which regressed session/load from ~2s to 20s+. The
+      // load response seeds from cache/heuristic only; the background
+      // reconciliation then reads the report (live model + window) and corrects
+      // the session. The report is held open across the load, so a blocking
+      // round-trip would hang this test instead of silently passing it.
+      let resolveUsage!: (value: { rawMaxTokens: number; model?: string }) => void;
+      contextUsageResult = () =>
+        new Promise<{ rawMaxTokens: number; model?: string }>((resolve) => {
+          resolveUsage = resolve;
+        });
+      sessionMessages = [
+        {
+          type: "assistant",
+          uuid: "assistant-uuid",
+          session_id: "resumed-window-probe",
+          parent_tool_use_id: null,
+          parent_agent_id: null,
+          message: { model: "claude-sonnet-4-6", role: "assistant", content: [] },
+        },
+      ];
+
+      await agent.loadSession({
+        sessionId: "resumed-window-probe",
+        cwd: process.cwd(),
+        mcpServers: [],
+      });
+
+      const session = sessionFor("resumed-window-probe");
+      // The load answered while the report was still pending, so nothing on
+      // the critical path awaited it and the seed is not authoritative yet.
+      expect(session.contextWindowAuthoritative).toBe(false);
+
+      resolveUsage({ rawMaxTokens: 888_000, model: "claude-sonnet-4-6" });
+      // The background reconciliation adopts the report's window, capped by any
+      // autoCompactWindow clamp configured in this environment.
+      await vi.waitFor(() => expect(session.contextWindowAuthoritative).toBe(true));
+      expect(session.contextWindowSize).toBeLessThanOrEqual(888_000);
+    });
 
     it("resume remains best-effort when the transcript hint cannot be read", async () => {
       sessionMessagesResult = async () => {

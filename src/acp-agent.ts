@@ -288,10 +288,14 @@ import {
   applyAvailableModelsAllowlist,
   buildModelConfigOption,
   getAvailableModels,
+  matchResumedModel,
   MODEL_CONFIG_ID,
   resolveModelPreference,
+  type ResumedModelSync,
   type SessionModelState,
 } from "./session-model.js";
+
+export type { ResumedModelSync };
 import {
   buildEffortConfigOption,
   EFFORT_CONFIG_ID,
@@ -1050,8 +1054,11 @@ export type Session = {
    *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss), refined by a
    *  background `getContextUsage` when that seed was a guess (see
    *  `refreshContextWindowInBackground`), then confirmed — and the cache
-   *  populated — by each result's modelUsage. No awaited IPC is on these
-   *  paths (see the seeding call sites and `contextWindowCache`). */
+   *  populated — by each result's modelUsage. On session/load the resumed
+   *  session's `getContextUsage` report also corrects the model and adopts the
+   *  window/occupancy from the background reconciliation
+   *  (`reconcileResumedSessionModel`). No awaited IPC is on these paths (see
+   *  the seeding call sites and `contextWindowCache`). */
   contextWindowSize: number;
   contextUsedTokens?: number;
   /** Whether `contextWindowSize` came from an authoritative source (the
@@ -9168,6 +9175,113 @@ export class ClaudeAcpAgent {
   }
 
   /**
+   * Background half of the resumed-session model sync (issue #845): the CLI
+   * round-trips involved — `getContextUsage` to read the live model, `setModel`
+   * to re-assert an env/settings pin — take seconds on a large transcript, so
+   * `getAvailableModels` no longer runs them on the session/load critical path;
+   * this task runs them after the load response and pushes a
+   * `config_option_update` when the bookkeeping was corrected. Best-effort: the
+   * session may be torn down, or the user may switch models while a round-trip
+   * is in flight — both abort silently, the later writer wins. `sdkModels` is
+   * the SDK's unfiltered list, used to recover capability flags for a live
+   * model outside the user's `availableModels` allowlist (same synthesis
+   * `createSession` applies to its own fallback).
+   */
+  private async reconcileResumedSessionModel(
+    sessionId: string,
+    sync: ResumedModelSync,
+    sdkModels: ModelInfo[],
+  ): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    const reportedModelId = session.models.currentModelId;
+
+    if (sync === "reassert-override") {
+      // A resumed session lands on the transcript's model regardless of
+      // env/settings, so the override must be re-asserted to keep the reported
+      // model truthful.
+      const start = Date.now();
+      try {
+        await session.query.setModel(reportedModelId);
+        this.logger.log(
+          `[perf] resume sync ${sessionId}: setModel("${reportedModelId}") ${Date.now() - start}ms`,
+        );
+        return;
+      } catch (error) {
+        // The session already runs fine on the transcript's model, so keep it
+        // usable and fall through to reading the live model back — reporting
+        // the pin the session isn't running would be worse.
+        this.logger.error(`Failed to re-assert model "${reportedModelId}" on resume:`, error);
+      }
+    }
+
+    const live = await readResumedLiveModel(session.query, session.modelInfos, this.logger);
+    if (this.sessions[sessionId] !== session) return;
+    // The same report carries the authoritative post-resume occupancy and the
+    // effective context window — the load path only seeded from cache/heuristic
+    // (no CLI round-trips there, see createSession), so adopt the real values
+    // now and push them to the client. A result's modelUsage still overwrites
+    // the window afterwards.
+    if (live.contextWindow != null) {
+      const clamp = resolveAutoCompactWindow(session.settingsManager.getSettings());
+      session.contextWindowSize =
+        clamp != null ? Math.min(live.contextWindow, clamp) : live.contextWindow;
+      session.contextWindowAuthoritative = true;
+    }
+    if (live.used != null) {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "usage_update",
+          used: live.used,
+          size: session.contextWindowSize,
+        },
+      });
+    }
+    const liveModel = live.model;
+    if (!liveModel) return;
+    // A user- or SDK-driven model change landed while the read was in flight;
+    // it is newer than the transcript snapshot we just read, so it wins.
+    if (session.models.currentModelId !== reportedModelId) return;
+    if (liveModel.value === reportedModelId) return;
+
+    // A live model with no picker counterpart still has SDK-known
+    // capabilities; register them under the verbatim id (identity fields
+    // overridden, see the matching synthesis in `createSession`) so mode
+    // gating and the effort/Fast-mode rebuild below agree with what the
+    // session is running.
+    if (!session.modelInfos.some((m) => m.value === liveModel.value)) {
+      const fallbackInfo = resolveModelPreference(sdkModels, liveModel.value);
+      session.modelInfos = [
+        ...session.modelInfos,
+        fallbackInfo
+          ? {
+              ...fallbackInfo,
+              value: liveModel.value,
+              displayName: liveModel.value,
+              description: "",
+              resolvedModel: undefined,
+            }
+          : liveModel,
+      ];
+    }
+
+    try {
+      await this.updateConfigOption(sessionId, MODEL_CONFIG_ID, liveModel.value);
+      this.logger.log(
+        `Resumed session ${sessionId}: reported model corrected from "${reportedModelId}" to live "${liveModel.value}".`,
+      );
+    } catch (err) {
+      // Same containment as syncModelAfterRefusalFallback: stale bookkeeping
+      // beats failing a session that is otherwise running fine.
+      this.logger.error(
+        `Failed to reconcile resumed session model to "${liveModel.value}":`,
+        err,
+      );
+    }
+  }
+
+  /**
    * Replace a heuristic context window with `getContextUsage().rawMaxTokens`
    * without blocking the caller. The text heuristic misses natively-1M models
    * whose picker rows carry no "1m" token (`sonnet`, and since CLI 2.1.283
@@ -10168,6 +10282,11 @@ export class ClaudeAcpAgent {
         sessionId,
         await resumedModelHint,
       );
+      // A resumed session defers every CLI round-trip (re-asserting an
+      // env/settings model pin, reading the live model/window) to
+      // `reconcileResumedSessionModel` after the load response — see
+      // `getAvailableModels`. This marker is the only thing it leaves behind.
+      const resumeSync = models.resumeSync;
       timing.phase("models");
 
       // Resolve the current model's capabilities separately from the stable
@@ -10353,7 +10472,18 @@ export class ClaudeAcpAgent {
         fileChangeReporter,
       };
       timing.phase("register");
-      this.refreshContextWindowInBackground(sessionId, this.sessions[sessionId]);
+      if (resumeSync !== undefined) {
+        // The resumed session's own reconciliation reads the same
+        // `getContextUsage` report and adopts model, window and occupancy, so
+        // the generic window refresh would only duplicate that CLI round-trip.
+        void this.reconcileResumedSessionModel(
+          sessionId,
+          resumeSync,
+          initializationResult.models,
+        );
+      } else {
+        this.refreshContextWindowInBackground(sessionId, this.sessions[sessionId]);
+      }
 
       return {
         sessionId,
@@ -12136,6 +12266,42 @@ function immediateContextWindow(
       ) ?? DEFAULT_CONTEXT_WINDOW,
     authoritative: false,
   };
+}
+
+/** Read the model a resumed session is actually running (via the
+ *  `getContextUsage` control request — the same source `/context` prints) and
+ *  map it onto the picker, along with the report's effective context window
+ *  (`maxTokens`, i.e. after any `autoCompactWindow` clamp, else the physical
+ *  `rawMaxTokens`) and the live occupancy. Resumed sessions get this request
+ *  serviced before any turn runs in the new process — unlike fresh sessions,
+ *  where it stalls until the first prompt turn (issues #886/#880) — but it
+ *  still re-assembles the whole transcript (seconds on multi-MB ones), so it
+ *  runs from the background reconciliation
+ *  (`reconcileResumedSessionModel`), never on the session/load critical path.
+ *  Best-effort: a control-request failure is logged and returns nulls so
+ *  callers keep their current choice; failing the whole session/load over an
+ *  unreadable report would be worse. */
+async function readResumedLiveModel(
+  query: Query,
+  models: ModelInfo[],
+  logger: Logger,
+): Promise<{ model: ModelInfo | null; contextWindow: number | null; used: number | null }> {
+  const start = Date.now();
+  try {
+    const usage = await query.getContextUsage();
+    logger.log(`[perf] readResumedLiveModel: getContextUsage ${Date.now() - start}ms`);
+    return {
+      model: usage.model ? matchResumedModel(models, usage.model) : null,
+      contextWindow: pickWindowSize(usage.maxTokens) ?? pickWindowSize(usage.rawMaxTokens),
+      used: usage.totalTokens,
+    };
+  } catch (error) {
+    logger.error(
+      `Failed to read the resumed session's live model (${Date.now() - start}ms):`,
+      error,
+    );
+    return { model: null, contextWindow: null, used: null };
+  }
 }
 
 /** A usable context-window size is a finite positive number; anything else

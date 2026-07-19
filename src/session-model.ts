@@ -388,6 +388,12 @@ function isPreModelSwitchHookBlock(error: unknown): boolean {
   return error instanceof Error && error.message.includes("blocked by a PreModelSwitch hook");
 }
 
+/** How a resumed session's model still needs to be synced with the CLI after
+ *  session/load has responded — see `reconcileResumedSessionModel` in
+ *  `acp-agent.ts`. `getAvailableModels` returns one on every resumed session
+ *  instead of running the CLI round-trips on the load critical path. */
+export type ResumedModelSync = "read-live-model" | "reassert-override";
+
 export async function getAvailableModels(
   query: Query,
   models: ModelInfo[],
@@ -397,7 +403,7 @@ export async function getAvailableModels(
   isResumedSession: boolean,
   sessionId: string,
   resumedModelHint?: string,
-): Promise<SessionModelState> {
+): Promise<SessionModelState & { resumeSync?: ResumedModelSync }> {
   const settings = settingsManager.getSettings();
 
   let currentModel = models[0];
@@ -431,23 +437,51 @@ export async function getAvailableModels(
     currentModel = resumedModelHint ? matchResumedModel(models, resumedModelHint) : currentModel;
   }
 
+  const displayNames = models.map(versionedModelDisplayName);
+  const displayNameCounts = new Map<string, number>();
+  for (const name of displayNames) {
+    displayNameCounts.set(name, (displayNameCounts.get(name) ?? 0) + 1);
+  }
+  const state = (): SessionModelState => ({
+    availableModels: models.map((model, index) => ({
+      modelId: model.value,
+      name:
+        displayNameCounts.get(displayNames[index]) === 1 ? displayNames[index] : model.displayName,
+      description: model.description,
+    })),
+    currentModelId: currentModel.value,
+  });
+
+  // Fork: a resumed session issues NO CLI round-trip on the session/load
+  // critical path. `query()` control requests are serialized and run for
+  // seconds on a large transcript — `getContextUsage` re-assembles the whole
+  // context to count tokens (~6-7s on multi-MB transcripts, 20s+ in the field)
+  // and `setModel` re-asserts an env/settings pin — so report the local
+  // resolution immediately and let `createSession` schedule
+  // `reconcileResumedSessionModel` to run these after the load response and
+  // correct the bookkeeping (model via `config_option_update`, window and
+  // occupancy via `usage_update`). `resumeSync` names what is left to do:
+  // re-asserting a pinned model, or reading the live model back.
+  if (isResumedSession) {
+    return {
+      ...state(),
+      resumeSync: resolvedFromInput === undefined ? "read-live-model" : "reassert-override",
+    };
+  }
+
   // Skip the setModel round-trip when we can prove the SDK has already landed
   // on the same model. Two cases qualify:
-  //  (a) No override applied — currentModel is the SDK's own default (or, on
-  //      resume, the live model read back from the SDK above); nothing to sync.
+  //  (a) No override applied — currentModel is the SDK's own default; nothing
+  //      to sync.
   //  (b) The resolver returned the user's input verbatim AND that value exists
   //      in the SDK's original model list — meaning no fuzzy match or
   //      allowlist rewrite was involved, and the SDK (which reads the same
   //      ANTHROPIC_MODEL / settings.json) will have arrived at the same entry.
-  //      This only holds for fresh sessions: a resumed session lands on the
-  //      transcript's model regardless of env/settings, so the override must
-  //      be re-asserted to keep the reported model truthful.
   // Anything else (fuzzy match, allowlist-synthesized value, alias) gets a
   // setModel call so we don't drift from the user's intended pin.
   const sdkSawSameValue = sdkModels.some((m) => m.value === currentModel.value);
   const skipSetModel =
-    resolvedFromInput === undefined ||
-    (!isResumedSession && currentModel.value === resolvedFromInput && sdkSawSameValue);
+    resolvedFromInput === undefined || (currentModel.value === resolvedFromInput && sdkSawSameValue);
   if (!skipSetModel) {
     const setModelStartedAt = performance.now();
     try {
@@ -459,51 +493,24 @@ export async function getAvailableModels(
       logger.log(
         `[session/models] sessionId=${sessionId} phase=set-model durationMs=${Math.round(performance.now() - setModelStartedAt)} model=${currentModel.value} outcome=error`,
       );
-      // On a fresh session the pin is a defining option — fail loudly. A
-      // resumed session already runs fine on the transcript's model, so
-      // failing the whole session/load over the re-assert would be worse
-      // than loading with the pin unapplied (mirrors the setPermissionMode
-      // containment in createSession). The SDK then stayed on the
-      // transcript's model, so read that back rather than reporting the
-      // pin the session isn't running.
-      //
-      // One fresh-session failure is advisory, not defining: a
-      // user-configured PreModelSwitch hook can veto the pin (CLI 2.1.251+;
-      // 'deny', or 'ask' — which headless sessions refuse), and the SDK
-      // rejects setModel with "Model switch blocked by a PreModelSwitch
-      // hook: …". Terminal Claude Code never lets a hook veto its startup
-      // model (the spawn model isn't a switch), so failing session/new here
-      // would make the same hook config fatal only over ACP. The session
-      // stays on the SDK's own default — report that. We can't read the
-      // live model back on this path: getContextUsage isn't serviced on a
-      // fresh session until the first prompt turn (issues #886/#880).
-      if (!isResumedSession) {
-        if (!isPreModelSwitchHookBlock(error)) throw error;
-        logger.error(
-          `Model pin "${currentModel.value}" was vetoed by a PreModelSwitch hook; staying on the default model:`,
-          error,
-        );
-        currentModel = models[0];
-      } else {
-        logger.error(`Failed to re-assert model "${currentModel.value}" on resume:`, error);
-        currentModel = resumedModelHint ? matchResumedModel(models, resumedModelHint) : models[0];
-      }
+      // The pin is a defining option for a fresh session — fail loudly, with
+      // one advisory exception: a user-configured PreModelSwitch hook can veto
+      // the pin (CLI 2.1.251+; 'deny', or 'ask' — which headless sessions
+      // refuse), and the SDK rejects setModel with "Model switch blocked by a
+      // PreModelSwitch hook: …". Terminal Claude Code never lets a hook veto
+      // its startup model (the spawn model isn't a switch), so failing
+      // session/new here would make the same hook config fatal only over ACP.
+      // The session stays on the SDK's own default — report that. We can't
+      // read the live model back on this path: getContextUsage isn't serviced
+      // on a fresh session until the first prompt turn (issues #886/#880).
+      if (!isPreModelSwitchHookBlock(error)) throw error;
+      logger.error(
+        `Model pin "${currentModel.value}" was vetoed by a PreModelSwitch hook; staying on the default model:`,
+        error,
+      );
+      currentModel = models[0];
     }
   }
 
-  const displayNames = models.map(versionedModelDisplayName);
-  const displayNameCounts = new Map<string, number>();
-  for (const name of displayNames) {
-    displayNameCounts.set(name, (displayNameCounts.get(name) ?? 0) + 1);
-  }
-
-  return {
-    availableModels: models.map((model, index) => ({
-      modelId: model.value,
-      name:
-        displayNameCounts.get(displayNames[index]) === 1 ? displayNames[index] : model.displayName,
-      description: model.description,
-    })),
-    currentModelId: currentModel.value,
-  };
+  return state();
 }
