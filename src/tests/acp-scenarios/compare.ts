@@ -19,6 +19,13 @@
  * - An `available_commands_update` also lists the `mcp` command of the
  *   adapter (see {@link ADAPTER_COMMANDS}), when origin/main did not list
  *   `mcp`. The adapter replaces the text of `/mcp` for every client.
+ * - An `extNotification` of the adapter's own extension namespace
+ *   (see {@link ADAPTER_NOTIFICATION_PREFIX}): the structured report that
+ *   the adapter sends instead of the text chunk origin/main streamed.
+ * - A `usage_update` without a `cost` that the adapter sends while the
+ *   response to `session/load` is still on its way. The adapter reports the
+ *   context window of the session it restored; origin/main reported it only
+ *   from the next prompt on.
  */
 import type { Recorded } from "./harness.js";
 
@@ -37,6 +44,9 @@ export const AIR_ONLY_CLAUDE_CODE_KEYS = new Set(["title", "subagent", "skill", 
 
 /** The names of the commands that the adapter adds to `available_commands_update`. */
 export const ADAPTER_COMMANDS = new Set(["mcp"]);
+
+/** The extension-notification methods that only the adapter sends. */
+export const ADAPTER_NOTIFICATION_PREFIX = "_universe/";
 
 /** The tool call fields that an update replaces as a whole. */
 const REPLACED_FIELDS = [
@@ -185,6 +195,25 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
   const subagentText = new Map<string, string>();
   let next = 0;
 
+  /**
+   * Whether the adapter may send `record`, at `at`, although origin/main did
+   * not (see the allowances of the file comment).
+   */
+  const additional = (record: Recorded | undefined, at: number): boolean => {
+    if (!record) return false;
+    if (record.kind === "extNotification") {
+      const method = (record.payload as Json).method;
+      return typeof method === "string" && method.startsWith(ADAPTER_NOTIFICATION_PREFIX);
+    }
+    const update = updateOf(record);
+    return (
+      update?.sessionUpdate === "usage_update" &&
+      update.used !== undefined &&
+      update.cost === undefined &&
+      current.slice(at + 1).some((later) => later.kind === "loadSession")
+    );
+  };
+
   const remember = (update: Json | undefined) => {
     if (!update) return;
     const chunk = subagentChunk(update);
@@ -264,6 +293,7 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
   };
 
   for (const wanted of expected) {
+    while (additional(current[next], next) && !matches(wanted, current[next])) next++;
     if (matches(wanted, current[next])) {
       remember(updateOf(wanted));
       next++;
@@ -278,6 +308,7 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
     );
     remember(updateOf(wanted));
   }
+  while (additional(current[next], next)) next++;
   for (const extra of current.slice(next)) {
     violations.push(`origin/main did not send ${canonical(extra)}`);
   }

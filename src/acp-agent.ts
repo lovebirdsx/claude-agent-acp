@@ -379,6 +379,26 @@ interface RewindSessionRequest {
 }
 
 /**
+ * Custom (extension) notification the agent sends to surface context-compaction
+ * lifecycle so the editor can render a dedicated status card instead of parsing
+ * plain-text chunks out of the assistant message stream. Shared verbatim with
+ * the editor's `acpSessionModel.ts` (`COMPACTION_METHOD`) — keep both in sync.
+ *
+ * `phase` is `start` when a compaction begins, `success`/`failed` at its
+ * terminal `compact_result`. `id` is stable across a single compaction so the
+ * editor can replace the in-progress card in place with its outcome; `reason`
+ * carries the failure detail on `phase: 'failed'`.
+ */
+export const COMPACTION_METHOD = "_universe/compaction";
+
+interface CompactionNotification {
+  sessionId: string;
+  id: string;
+  phase: "start" | "success" | "failed";
+  reason?: string;
+}
+
+/**
  * Logger interface for customizing logging output
  */
 export interface Logger {
@@ -3954,6 +3974,12 @@ export class ClaudeAcpAgent {
     // an unparseable tool call, we append this to the error detail so clients
     // can see which tool failed — the SDK's message text alone is generic.
     let lastToolUse: { id: string; name: string; rawInput: string } | undefined;
+    // Fork: id of the in-flight compaction, minted at its `compacting` start so
+    // the editor's `_universe/compaction` card is replaced in place with the
+    // terminal phase (see COMPACTION_METHOD). It doubles as the in-progress
+    // guard: the SDK emits a failed compaction's terminal `status` twice, and
+    // the duplicate must not re-emit the card.
+    let currentCompactionId: string | undefined;
     // Anthropic API message id of the assistant message currently being
     // streamed, captured from `message_start` so the streamed chunks that follow
     // (whose delta events don't carry it) can all be tagged with the same,
@@ -4255,6 +4281,7 @@ export class ClaudeAcpAgent {
       lastAssistantWasUsageLimit = false;
       lastAssistantFailureTitle = undefined;
       lastRefusalExplanation = null;
+      currentCompactionId = undefined;
       // Do NOT reset currentStreamMessageId or the streamed blocks here. Turn
       // activation can fire mid-message (the replayed user echo with
       // --replay-user-messages lands between a message's blocks); clearing the
@@ -5160,21 +5187,50 @@ export class ClaudeAcpAgent {
                 break;
               case "status": {
                 if (message.status === "compacting") {
+                  // The fork also surfaces the compaction lifecycle to the
+                  // editor as a structured `_universe/compaction` card keyed by
+                  // a stable id, so the in-progress card is settled in place
+                  // (see COMPACTION_METHOD). The ACP `compaction_update` /
+                  // legacy tool-call presentations stay upstream's (see
+                  // ContextCompactionLifecycle).
+                  currentCompactionId = randomUUID();
+                  await this.client.extNotification(COMPACTION_METHOD, {
+                    sessionId: message.session_id,
+                    id: currentCompactionId,
+                    phase: "start",
+                  } satisfies CompactionNotification);
                   await compaction.start(message.uuid);
                 } else if (message.compact_result === "success") {
                   await compaction.finish(message.uuid, "completed");
+                  if (currentCompactionId !== undefined) {
+                    await this.client.extNotification(COMPACTION_METHOD, {
+                      sessionId: message.session_id,
+                      id: currentCompactionId,
+                      phase: "success",
+                    } satisfies CompactionNotification);
+                    currentCompactionId = undefined;
+                  }
                 } else if (message.compact_result === "failed") {
                   await compaction.finish(message.uuid, "failed", {
                     ...(message.compact_error ? { error: message.compact_error } : {}),
                   });
+                  if (currentCompactionId !== undefined) {
+                    await this.client.extNotification(COMPACTION_METHOD, {
+                      sessionId: message.session_id,
+                      id: currentCompactionId,
+                      phase: "failed",
+                      ...(message.compact_error ? { reason: message.compact_error } : {}),
+                    } satisfies CompactionNotification);
+                    currentCompactionId = undefined;
+                  }
                 }
                 break;
               }
               case "compact_boundary": {
                 // Refresh the displayed usage immediately so the client doesn't
                 // keep showing the stale pre-compaction size (e.g. "944k/1m")
-                // right after the user sees "Compacting completed", which is
-                // confusing and wrong.
+                // right after the user sees the compaction card complete, which
+                // is confusing and wrong.
                 //
                 // The compact boundary already carries the retained token
                 // count. Prefer it over a getContextUsage control request,
@@ -8086,41 +8142,6 @@ export class ClaudeAcpAgent {
           `rewind: failed to re-apply config option ${configId}=${String(value)} after recreate:`,
           err,
         );
-      }
-    }
-  }
-
-  private async applySessionMode(sessionId: string, modeId: string): Promise<void> {
-    switch (modeId) {
-      case "auto":
-      case "default":
-      case "acceptEdits":
-      case "bypassPermissions":
-      case "dontAsk":
-      case "plan":
-        break;
-      default:
-        throw new Error("Invalid Mode");
-    }
-
-    const session = this.sessions[sessionId];
-    if (!session) {
-      throw new Error("Session not found");
-    }
-    if (!session.modes.availableModes.some((mode) => mode.id === modeId)) {
-      throw new Error(`Mode ${modeId} is not available in this session`);
-    }
-
-    try {
-      await session.query.setPermissionMode(modeId);
-    } catch (error) {
-      if (error instanceof Error) {
-        if (!error.message) {
-          error.message = "Invalid Mode";
-        }
-        throw error;
-      } else {
-        throw new Error("Invalid Mode");
       }
     }
   }
