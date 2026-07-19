@@ -488,6 +488,25 @@ export function toolInfoFromToolUse(
   }
 }
 
+/**
+ * 编辑器点击 "No, keep planning"（未填意见）时 fork 回传的默认 deny message。与之
+ * 相等的 tool_result 内容是纯内部文案，不向用户展示。见 acp-agent.ts 的 ExitPlanMode
+ * 分支；renderer 端也据此判定（toolCallDisplay.ts 的 DEFAULT_KEEP_PLANNING_MESSAGE）。
+ */
+export const DEFAULT_EXIT_PLAN_DENY_MESSAGE = "User rejected request to exit plan mode.";
+
+/** 从 ExitPlanMode 的 deny tool_result 内容里抽出纯文本（content 可能是 string 或数组）。 */
+function exitPlanModeDenyText(content: unknown): string {
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .map((c: any) => (c && typeof c === "object" && c.type === "text" ? String(c.text) : ""))
+      .join("")
+      .trim();
+  }
+  return "";
+}
+
 export function toolUpdateFromToolResult(
   toolResult:
     | ToolResultBlockParam
@@ -503,6 +522,17 @@ export function toolUpdateFromToolResult(
   toolUse: any | undefined,
   supportsTerminalOutput: boolean = false,
 ): ToolUpdate {
+  // ExitPlanMode 的"拒绝"不是真正的错误，而是用户选择「继续规划」。默认拒绝文案
+  // （"User rejected request to exit plan mode."）是给模型看的内部提示，对用户无意义，
+  // 不产生任何可见 content；若用户在编辑器 steering 输入框写下了意见，则作为纯文本
+  // （不加错误围栏）透出，成为回放时该意见的唯一可见来源。
+  if (toolUse?.name === "ExitPlanMode" && "is_error" in toolResult && toolResult.is_error) {
+    const text = exitPlanModeDenyText(toolResult.content);
+    if (text && text !== DEFAULT_EXIT_PLAN_DENY_MESSAGE) {
+      return { content: [{ type: "content", content: { type: "text", text } }] };
+    }
+    return {};
+  }
   if (
     "is_error" in toolResult &&
     toolResult.is_error &&
