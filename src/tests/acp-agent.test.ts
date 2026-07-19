@@ -193,6 +193,9 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
   class TestClient {
     files: Map<string, string> = new Map();
     receivedText: string = "";
+    // Records the `_universe/compaction` extension notifications for the
+    // /compact lifecycle test.
+    compactionNotifications: Array<{ id: string; phase: string; reason?: string }> = [];
     // Records for the AskUserQuestion elicitation test.
     elicitations: CreateElicitationRequest[] = [];
     permissionToolInputs: unknown[] = [];
@@ -296,6 +299,13 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     // handle as `connection.agent`, valid for the lifetime of the connection.
     const { agent: ctx } = acpClient({ name: "test-client" })
       .onNotification(methods.client.session.update, (c) => client.sessionUpdate(c.params))
+      .onNotification(
+        "_universe/compaction",
+        (params) => params as { id: string; phase: string; reason?: string },
+        (c) => {
+          client.compactionNotifications.push(c.params)
+        },
+      )
       .onRequest(methods.client.session.requestPermission, (c) =>
         client.requestPermission(c.params),
       )
@@ -421,7 +431,12 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       sessionId: newSessionResponse.sessionId,
     });
 
-    expect(client.takeReceivedText()).toContain("Compacting...\n\nCompacting completed.");
+    // Compaction lifecycle is surfaced as structured `_universe/compaction`
+    // extension notifications (start → success), not plain-text chunks, so the
+    // editor can render a dedicated status card. Both phases must share one id.
+    const phases = client.compactionNotifications;
+    expect(phases.map((n) => n.phase)).toEqual(["start", "success"]);
+    expect(phases[0].id).toBe(phases[1].id);
   }, 60000);
 
   // Regression guard for the SDK's AskUserQuestion routing. The built-in
