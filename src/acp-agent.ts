@@ -111,6 +111,7 @@ import {
 } from "./elicitation.js";
 import { SettingsManager } from "./settings.js";
 import {
+  accumulateSubagentUsage,
   applyTaskCreate,
   applyTaskUpdate,
   ClaudePlanEntry,
@@ -120,6 +121,8 @@ import {
   parseTaskCreateOutput,
   planEntries,
   registerHookCallback,
+  SubagentStatsState,
+  subagentStatsToMeta,
   TaskState,
   taskStateToPlanEntries,
   toolInfoFromToolUse,
@@ -680,6 +683,13 @@ type Session = {
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
+  /** Per-sub-agent (Task/Agent tool) token + model tallies, keyed by the parent
+   *  tool_use id (`parent_tool_use_id`). The SDK never reports a per-sub-agent
+   *  cost breakdown, so we accumulate the raw usage each sub-agent assistant
+   *  message carries and forward the running tally to the client on the parent
+   *  tool call via `_meta._universe/subagentStats`; the client prices it locally.
+   *  Per-session (tool_use ids are only unique within a session). */
+  subagentStats: SubagentStatsState;
   /** Last session title we pushed to the client via `session_info_update`.
    *  The SDK auto-generates a title in a background task and persists it to the
    *  session file; we poll it on each turn-end (`session_state_changed: idle`)
@@ -4067,6 +4077,19 @@ export class ClaudeAcpAgent {
               break;
             }
 
+            // Subagent assistant message (`parent_tool_use_id !== null`): fold
+            // its usage/model into the per-sub-agent tally regardless of how its
+            // text is surfaced below (nested transcript for capable clients,
+            // dropped for legacy) — the SDK reports no per-sub-agent breakdown,
+            // so the client prices the parent Task card from this.
+            if (message.type === "assistant" && message.parent_tool_use_id) {
+              accumulateSubagentUsage(session.subagentStats, message.parent_tool_use_id, {
+                usage: message.message.usage,
+                model: message.message.model,
+                subagentType: message.subagent_type,
+              });
+            }
+
             let content: typeof message.message.content;
             if (message.type === "assistant" && message.parent_tool_use_id === null) {
               // Top-level assistant message: each text/thinking block may have
@@ -4173,6 +4196,22 @@ export class ClaudeAcpAgent {
               // (e.g. a subagent image) carry the stamped parentToolUseId
               // meta and are excluded there.
               await sendUpdate(notification);
+            }
+            // Push the refreshed sub-agent tally onto the parent Task card. A bare
+            // tool_call_update carrying only `_meta` — the client merges the stats
+            // into the existing card without disturbing its title/status/content.
+            if (message.type === "assistant" && message.parent_tool_use_id) {
+              const entry = session.subagentStats.get(message.parent_tool_use_id);
+              if (entry) {
+                await this.client.sessionUpdate({
+                  sessionId: params.sessionId,
+                  update: {
+                    sessionUpdate: "tool_call_update",
+                    toolCallId: message.parent_tool_use_id,
+                    _meta: { "_universe/subagentStats": subagentStatsToMeta(entry) },
+                  },
+                });
+              }
             }
             break;
           }
@@ -6743,6 +6782,7 @@ export class ClaudeAcpAgent {
       contextWindowAuthoritative: seededWindow.authoritative,
       providerCacheKey,
       taskState,
+      subagentStats: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
