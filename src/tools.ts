@@ -803,6 +803,99 @@ export type TaskEntry = {
 export type TaskState = Map<string, TaskEntry>;
 
 /**
+ * Running token + model tally for one sub-agent (Task/Agent tool), accumulated
+ * across every assistant message the sub-agent produces. The SDK reports these
+ * per-message (`message.usage` / `message.model` / `subagent_type`) but never a
+ * per-sub-agent cost breakdown, so the client prices the tally locally.
+ */
+export type SubagentStatsEntry = {
+  /** Latest model id seen on this sub-agent's messages. */
+  model?: string;
+  /** SDK `subagent_type` (the registered agent type), if reported. */
+  subagentType?: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreateTokens: number;
+};
+
+/** Per-session sub-agent tallies keyed by the parent tool_use id. */
+export type SubagentStatsState = Map<string, SubagentStatsEntry>;
+
+/** Raw Anthropic usage block carried on an assistant message. */
+type SubagentUsage = {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+};
+
+/**
+ * Fold one sub-agent assistant message's usage/model into the tally for its
+ * parent tool call. Token counts accumulate across the sub-agent's turns; the
+ * model / subagent_type are last-write-wins (a sub-agent uses one model). No-op
+ * when the usage carries no positive tokens, so empty frames don't create hollow
+ * entries.
+ */
+export function accumulateSubagentUsage(
+  state: SubagentStatsState,
+  parentToolUseId: string,
+  fields: {
+    usage?: SubagentUsage | null;
+    model?: string | null;
+    subagentType?: string | null;
+  },
+): void {
+  const u = fields.usage;
+  const input = num(u?.input_tokens);
+  const output = num(u?.output_tokens);
+  const cacheRead = num(u?.cache_read_input_tokens);
+  const cacheCreate = num(u?.cache_creation_input_tokens);
+  const existing = state.get(parentToolUseId);
+  const model =
+    typeof fields.model === "string" && fields.model.length > 0 && fields.model !== "<synthetic>"
+      ? fields.model
+      : existing?.model;
+  const subagentType =
+    typeof fields.subagentType === "string" && fields.subagentType.length > 0
+      ? fields.subagentType
+      : existing?.subagentType;
+  // Nothing to add and no new metadata → don't manufacture an entry.
+  if (
+    !existing &&
+    input + output + cacheRead + cacheCreate === 0 &&
+    model === undefined &&
+    subagentType === undefined
+  ) {
+    return;
+  }
+  state.set(parentToolUseId, {
+    ...(model !== undefined ? { model } : {}),
+    ...(subagentType !== undefined ? { subagentType } : {}),
+    inputTokens: (existing?.inputTokens ?? 0) + input,
+    outputTokens: (existing?.outputTokens ?? 0) + output,
+    cacheReadTokens: (existing?.cacheReadTokens ?? 0) + cacheRead,
+    cacheCreateTokens: (existing?.cacheCreateTokens ?? 0) + cacheCreate,
+  });
+}
+
+/** Serialize one sub-agent tally into the `_meta._universe/subagentStats` shape. */
+export function subagentStatsToMeta(entry: SubagentStatsEntry): Record<string, unknown> {
+  return {
+    ...(entry.model !== undefined ? { model: entry.model } : {}),
+    ...(entry.subagentType !== undefined ? { subagentType: entry.subagentType } : {}),
+    inputTokens: entry.inputTokens,
+    outputTokens: entry.outputTokens,
+    cacheReadTokens: entry.cacheReadTokens,
+    cacheCreateTokens: entry.cacheCreateTokens,
+  };
+}
+
+function num(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : 0;
+}
+
+/**
  * Best-effort parse of a TaskCreate tool_result content into the structured
  * TaskCreateOutput. The SDK delivers tool outputs either as a string or as
  * an array of TextBlockParam-like blocks containing JSON text; try both.
