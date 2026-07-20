@@ -4025,6 +4025,7 @@ describe("permission request cancellation", () => {
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
+      subagentStats: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
@@ -5870,6 +5871,9 @@ describe("subagent permission attribution (issue #851)", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
     expect(updates.map(({ sessionId, update }) => [sessionId, update.sessionUpdate])).toEqual([
+      // The sub-agent's assistant message folds its usage into the parent Task
+      // card's tally before the spawn flush (see `accumulateSubagentUsage`).
+      ["test-session", "tool_call_update"],
       ["test-session", "subagent_spawned"],
       ["agent-42", "agent_message_chunk"],
       ["agent-42", "tool_call"],
@@ -10438,6 +10442,7 @@ describe("session/close", () => {
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
+      subagentStats: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
@@ -10532,6 +10537,7 @@ describe("session/delete", () => {
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
+      subagentStats: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
@@ -11180,6 +11186,7 @@ describe("getOrCreateSession param change detection", () => {
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
+      subagentStats: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
@@ -15580,6 +15587,7 @@ describe("post-error recovery", () => {
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
+      subagentStats: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
@@ -20982,6 +20990,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
+      subagentStats: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),

@@ -22,6 +22,9 @@
  * - An `extNotification` of the adapter's own extension namespace
  *   (see {@link ADAPTER_NOTIFICATION_PREFIX}): the structured report that
  *   the adapter sends instead of the text chunk origin/main streamed.
+ * - A `_meta` key of the adapter's own namespace (see
+ *   {@link ADAPTER_META_PREFIX}), e.g. the running per-sub-agent tally the
+ *   adapter adds to the parent Task card.
  * - A `usage_update` without a `cost` that the adapter sends while the
  *   response to `session/load` is still on its way. The adapter reports the
  *   context window of the session it restored; origin/main reported it only
@@ -47,6 +50,9 @@ export const ADAPTER_COMMANDS = new Set(["mcp"]);
 
 /** The extension-notification methods that only the adapter sends. */
 export const ADAPTER_NOTIFICATION_PREFIX = "_universe/";
+
+/** The `_meta` keys that only the adapter adds, in the same namespace. */
+export const ADAPTER_META_PREFIX = "_universe/";
 
 /** The tool call fields that an update replaces as a whole. */
 const REPLACED_FIELDS = [
@@ -114,6 +120,7 @@ function flatten(update: Json): Map<string, string> {
   }
   const meta = (update._meta ?? {}) as Json;
   for (const [key, value] of Object.entries(meta)) {
+    if (key.startsWith(ADAPTER_META_PREFIX)) continue;
     if (key === "claudeCode" && value && typeof value === "object") {
       for (const [k, v] of Object.entries(value as Json)) {
         flat.set(`_meta.claudeCode.${k}`, canonical(v));
@@ -135,6 +142,14 @@ function without(value: Json, key: string): Json {
 function updateOf(record: Recorded): Json | undefined {
   if (record.kind !== "sessionUpdate") return undefined;
   return (record.payload as { update: Json }).update;
+}
+
+/** Whether an update carries nothing but adapter-namespace `_meta` (`_meta` does not merge). */
+function adapterMetaOnly(update: Json): boolean {
+  const keys = Object.keys(update).filter((key) => key !== "sessionUpdate" && key !== "toolCallId");
+  if (keys.length !== 1 || keys[0] !== "_meta") return false;
+  const metaKeys = Object.keys((update._meta ?? {}) as Json);
+  return metaKeys.length > 0 && metaKeys.every((key) => key.startsWith(ADAPTER_META_PREFIX));
 }
 
 /** The key and the text of a subagent message or thought chunk. */
@@ -206,8 +221,10 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
       return typeof method === "string" && method.startsWith(ADAPTER_NOTIFICATION_PREFIX);
     }
     const update = updateOf(record);
+    if (!update) return false;
+    if (adapterMetaOnly(update)) return true;
     return (
-      update?.sessionUpdate === "usage_update" &&
+      update.sessionUpdate === "usage_update" &&
       update.used !== undefined &&
       update.cost === undefined &&
       current.slice(at + 1).some((later) => later.kind === "loadSession")

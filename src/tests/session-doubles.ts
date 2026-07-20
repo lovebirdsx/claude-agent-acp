@@ -82,6 +82,7 @@ export function mockSessionState(
     contextWindowAuthoritative: false,
     providerCacheKey: "default",
     taskState: new Map(),
+    subagentStats: new Map(),
     toolUseCache: {},
     emittedToolCalls: new Set(),
     liveBackgroundTasks: new Map(),

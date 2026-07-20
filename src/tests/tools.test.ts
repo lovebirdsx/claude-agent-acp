@@ -29,6 +29,9 @@ import {
   parseTaskCreateOutput,
   parseTaskListOutput,
   taskStateToPlanEntries,
+  accumulateSubagentUsage,
+  subagentStatsToMeta,
+  SubagentStatsState,
   TaskState,
 } from "../tools.js";
 import { ClientCapabilities as ToolCallCapabilities } from "../tool-calls/client-capabilities.js";
@@ -4630,5 +4633,59 @@ describe("NotebookEdit", () => {
     expect(notifications[0].update).toMatchObject({ status: "completed" });
     expect(notifications[0].update).not.toHaveProperty("content");
     expect(notifications[0].update).not.toHaveProperty("rawOutput");
+  });
+});
+describe("accumulateSubagentUsage", () => {
+  it("accumulates token counts across a sub-agent's messages", () => {
+    const state: SubagentStatsState = new Map();
+    accumulateSubagentUsage(state, "task-1", {
+      model: "claude-sonnet-5",
+      subagentType: "general-purpose",
+      usage: {
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_read_input_tokens: 500,
+        cache_creation_input_tokens: 10,
+      },
+    });
+    accumulateSubagentUsage(state, "task-1", {
+      usage: { input_tokens: 50, output_tokens: 5 },
+    });
+    const entry = state.get("task-1")!;
+    expect(entry.model).toBe("claude-sonnet-5");
+    expect(entry.subagentType).toBe("general-purpose");
+    expect(entry.inputTokens).toBe(150);
+    expect(entry.outputTokens).toBe(25);
+    expect(entry.cacheReadTokens).toBe(500);
+    expect(entry.cacheCreateTokens).toBe(10);
+  });
+
+  it("keeps separate tallies per parent tool call", () => {
+    const state: SubagentStatsState = new Map();
+    accumulateSubagentUsage(state, "a", { usage: { input_tokens: 1 } });
+    accumulateSubagentUsage(state, "b", { usage: { input_tokens: 2 } });
+    expect(state.get("a")!.inputTokens).toBe(1);
+    expect(state.get("b")!.inputTokens).toBe(2);
+  });
+
+  it("ignores a synthetic model and empty frames", () => {
+    const state: SubagentStatsState = new Map();
+    accumulateSubagentUsage(state, "task-1", { model: "<synthetic>", usage: null });
+    expect(state.has("task-1")).toBe(false);
+  });
+
+  it("serializes an entry into the _meta shape", () => {
+    const state: SubagentStatsState = new Map();
+    accumulateSubagentUsage(state, "task-1", {
+      model: "claude-opus-4-8",
+      usage: { input_tokens: 3, output_tokens: 4 },
+    });
+    expect(subagentStatsToMeta(state.get("task-1")!)).toEqual({
+      model: "claude-opus-4-8",
+      inputTokens: 3,
+      outputTokens: 4,
+      cacheReadTokens: 0,
+      cacheCreateTokens: 0,
+    });
   });
 });
