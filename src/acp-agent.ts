@@ -340,6 +340,18 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
  *  pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
 
+/** Grace window after the SDK goes idle before a queued-but-never-echoed turn is
+ *  presumed folded/dropped and settled `end_turn`. A mid-turn ("steering")
+ *  prompt the CLI merges into the running generation may never get its own user
+ *  echo or result: the client's `session/prompt` would then hang forever
+ *  (session stuck "running", message "swallowed"). We only presume this AFTER
+ *  idle (the SDK's authoritative turn-over signal) and only if no further
+ *  message arrives within the window — a real late echo cancels the watchdog and
+ *  activates the turn normally. Short relative to the force-cancel floor: idle
+ *  means the SDK already finished, so a genuine echo would follow within a tick;
+ *  the window only absorbs that ordering race. */
+const DEFAULT_ORPHAN_QUEUED_TURN_GRACE_MS = 1_500;
+
 /** Error surfaced when the SDK declares a turn over (`session_state_changed:
  *  idle`, its authoritative turn-over signal) without ever emitting the turn's
  *  `result` — a model stream that dropped mid-turn, or an async agent that
@@ -451,6 +463,13 @@ type Session = {
    *  active turn settles normally so the backstop never fires after a clean
    *  cancel. */
   forceCancelTimer?: ReturnType<typeof setTimeout>;
+  /** Pending grace-period timer armed at idle when the queue holds a turn the
+   *  SDK never echoed. If it fires, that turn is presumed folded into the just-
+   *  finished generation (a "steering" prompt the CLI merged) and is settled
+   *  `end_turn` so its `session/prompt` doesn't hang. Cleared by any subsequent
+   *  consumer message (a real echo activates the turn instead). See
+   *  {@link DEFAULT_ORPHAN_QUEUED_TURN_GRACE_MS}. */
+  orphanQueuedTurnTimer?: ReturnType<typeof setTimeout>;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
   /** Effective context window (after any `autoCompactWindow` clamp) used as the
    *  `size` denominator in usage_update notifications, carried across prompts so
@@ -919,6 +938,11 @@ export class ClaudeAcpAgent {
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
   forceCancelGraceMs: number = DEFAULT_FORCE_CANCEL_GRACE_MS;
+
+  /** Grace period before a queued-but-never-echoed turn is presumed folded into
+   *  the running generation and settled `end_turn`. See
+   *  {@link DEFAULT_ORPHAN_QUEUED_TURN_GRACE_MS}. Mutable so tests can shrink it. */
+  orphanQueuedTurnGraceMs: number = DEFAULT_ORPHAN_QUEUED_TURN_GRACE_MS;
 
   constructor(client: AcpClient, logger?: Logger) {
     this.sessions = {};
@@ -1613,6 +1637,15 @@ export class ClaudeAcpAgent {
         // A message arrived: this next() is consumed; arm a fresh one next pass.
         pendingNext = null;
 
+        // Any message means the stream is still moving, so disarm the orphan-
+        // queued-turn watchdog: a real user echo (which activates the turn) or
+        // any further output proves the queued turn wasn't silently folded. The
+        // watchdog only fires when idle is followed by silence.
+        if (session.orphanQueuedTurnTimer) {
+          clearTimeout(session.orphanQueuedTurnTimer);
+          session.orphanQueuedTurnTimer = undefined;
+        }
+
         const { value: message, done } = raced.result as IteratorResult<SDKMessage, void>;
 
         if (done || !message) {
@@ -1817,6 +1850,21 @@ export class ClaudeAcpAgent {
                   // signal, so it's the point at which a new title may have
                   // landed. Push it to the client if it changed.
                   await this.maybeUpdateSessionTitle(params.sessionId, session);
+
+                  // A queued turn that was never echoed remains after idle: the
+                  // "only a timer could tell those apart" case above. Either the
+                  // SDK is about to echo it (a fresh prompt whose echo lagged the
+                  // idle — the watchdog is cancelled by that echo) or the CLI
+                  // folded it into the just-finished generation and will never
+                  // echo/result it (a mid-turn steering prompt). Arm the watchdog
+                  // to settle the latter `end_turn` so its `session/prompt`
+                  // doesn't hang forever. Guarded on no active turn and no owed
+                  // idles so it never pre-empts a turn the SDK is still running.
+                  this.maybeArmOrphanQueuedTurnWatchdog(
+                    session,
+                    params.sessionId,
+                    owedTrailingIdles,
+                  );
                 }
                 break;
               }
@@ -2903,6 +2951,55 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /** Arm the orphan-queued-turn watchdog if the queue holds a turn the SDK never
+   *  activated (echoed) and there is no active turn / owed trailing idle to
+   *  account for it. Called from the idle handler — the SDK's authoritative
+   *  turn-over signal. If the window elapses with no further consumer message
+   *  (the arm site's `pendingNext` clear cancels it on any message), the turn is
+   *  presumed folded into the just-finished generation (a mid-turn "steering"
+   *  prompt the CLI merged and will never echo/result) and settled `end_turn` so
+   *  its `session/prompt` resolves instead of hanging. At-most-one armed at a
+   *  time. */
+  private maybeArmOrphanQueuedTurnWatchdog(
+    session: Session,
+    sessionId: string,
+    owedTrailingIdles: number,
+  ): void {
+    if (session.orphanQueuedTurnTimer) return;
+    if (session.activeTurn) return;
+    if (session.cancelled) return;
+    if (owedTrailingIdles > 0) return;
+    const orphan = (session.turnQueue ?? []).find((t) => !t.settled);
+    if (!orphan) return;
+    session.orphanQueuedTurnTimer = setTimeout(() => {
+      session.orphanQueuedTurnTimer = undefined;
+      // Re-validate under the timer: a race could have activated a turn or torn
+      // the session down since arming.
+      if (session.queryClosed || session.activeTurn || session.cancelled) return;
+      // Settle every never-echoed queued turn: several steering prompts can be
+      // folded into the same finished generation, so drain the whole queue, not
+      // just the head. Each was already pushed to the SDK (FIFO), so a late
+      // uuid-less result may still arrive for any of them — count one orphan per
+      // settled turn so the result handler skips them rather than misattributing
+      // them to a later prompt (mirrors cancel()'s orphan accounting).
+      const orphans = (session.turnQueue ?? []).filter((t) => !t.settled);
+      if (orphans.length === 0) return;
+      this.logger.error(
+        `Session ${sessionId}: ${orphans.length} queued prompt(s) were never echoed by the SDK ` +
+          `after idle (likely folded into the prior turn as steering); settling them "end_turn" ` +
+          `so their requests do not hang.`,
+      );
+      session.turnQueue = (session.turnQueue ?? []).filter(
+        (t) => t.settled || !orphans.includes(t),
+      );
+      session.pendingOrphanResults = (session.pendingOrphanResults ?? 0) + orphans.length;
+      for (const turn of orphans) {
+        turn.settled = true;
+        turn.resolve({ stopReason: "end_turn", usage: sessionUsage(session) });
+      }
+    }, this.orphanQueuedTurnGraceMs);
+  }
+
   /** Mark a session's SDK query stream as permanently ended and release the
    *  resources tied to it: drop the consumer handle, dispose the settings
    *  watchers, end the input stream, and close the query (which terminates the
@@ -2928,6 +3025,10 @@ export class ClaudeAcpAgent {
     }
     session.queryClosed = true;
     session.consumer = undefined;
+    if (session.orphanQueuedTurnTimer) {
+      clearTimeout(session.orphanQueuedTurnTimer);
+      session.orphanQueuedTurnTimer = undefined;
+    }
     session.settingsManager.dispose();
     session.input.end();
     session.query.close();
@@ -3351,7 +3452,9 @@ export class ClaudeAcpAgent {
    * {@link reapplyRuntimeConfig}. Boolean (fast) and string (the rest) values are
    * both carried; `undefined` currentValues are skipped.
    */
-  private snapshotRuntimeConfig(session: Session): Array<{ configId: string; value: string | boolean }> {
+  private snapshotRuntimeConfig(
+    session: Session,
+  ): Array<{ configId: string; value: string | boolean }> {
     const order = [MODEL_CONFIG_ID, EFFORT_CONFIG_ID, FAST_MODE_CONFIG_ID, AGENT_CONFIG_ID];
     const snapshot: Array<{ configId: string; value: string | boolean }> = [];
     for (const configId of order) {
@@ -4267,10 +4370,7 @@ export class ClaudeAcpAgent {
     } catch (err) {
       // Same containment as syncModelAfterRefusalFallback: stale bookkeeping
       // beats failing a session that is otherwise running fine.
-      this.logger.error(
-        `Failed to reconcile resumed session model to "${live.value}":`,
-        err,
-      );
+      this.logger.error(`Failed to reconcile resumed session model to "${live.value}":`, err);
     }
   }
 
