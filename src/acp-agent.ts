@@ -1268,16 +1268,24 @@ export class ClaudeAcpAgent {
     const sessions = await Promise.all(
       sdk_sessions
         .filter((session) => !!session.cwd)
-        .map(async (session) => ({
-          sessionId: session.sessionId,
-          cwd: session.cwd as string,
-          title: sanitizeTitle(session.summary),
-          updatedAt: await this.lastActivityIso(session),
-          // ACP `SessionInfo` has no standard branch field; carry the SDK's
-          // end-of-session git branch through `_meta` so the editor can group
-          // sessions by worktree.
-          ...(session.gitBranch ? { _meta: { gitBranch: session.gitBranch } } : {}),
-        })),
+        .map(async (session) => {
+          // ACP `SessionInfo` has no standard branch/path fields; carry the
+          // SDK's end-of-session git branch and the transcript JSONL path
+          // through `_meta` so the editor can group sessions by worktree and
+          // reveal the transcript file in the OS file manager.
+          const transcriptPath = await this.findTranscriptFile(session.sessionId, session.cwd);
+          const meta = {
+            ...(session.gitBranch ? { gitBranch: session.gitBranch } : {}),
+            ...(transcriptPath ? { transcriptPath } : {}),
+          };
+          return {
+            sessionId: session.sessionId,
+            cwd: session.cwd as string,
+            title: sanitizeTitle(session.summary),
+            updatedAt: await this.lastActivityIso(session),
+            ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
+          };
+        }),
     );
     return {
       sessions,
