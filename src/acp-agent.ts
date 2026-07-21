@@ -2051,16 +2051,17 @@ const TRANSCRIPT_MARKERS = [...LOCAL_COMMAND_MARKERS, ...INJECTED_CONTEXT_MARKER
 
 // Single-pass scanner that removes each `<tag>…</tag>` marker (matching the
 // nearest closing tag of the same name, like a lazy regex would).
-function stripMarkerTags(text: string): string {
+function stripMarkerTags(
+  text: string,
+  markers: typeof TRANSCRIPT_MARKERS = markerSetFor(text),
+): string {
   const dead = new Set<string>();
   let result = "";
   let copiedUpTo = 0;
   let i = 0;
   while (i < text.length) {
     if (text[i] === "<") {
-      const marker = TRANSCRIPT_MARKERS.find(
-        (m) => !dead.has(m.open) && text.startsWith(m.open, i),
-      );
+      const marker = markers.find((m) => !dead.has(m.open) && text.startsWith(m.open, i));
       if (marker) {
         const end = text.indexOf(marker.close, i + marker.open.length);
         if (end !== -1) {
@@ -2106,9 +2107,90 @@ function commandInvocationFromMarkerOnlyText(text: string): string | null {
 }
 
 function stripLocalCommandMetadataText(text: string): string | null {
-  const stripped = stripMarkerTags(text);
-  if (stripped.trim() !== "") return stripped;
-  return commandInvocationFromMarkerOnlyText(text);
+  // Nothing but the marker envelope: report the invocation the user typed
+  // (`/name args`), and hide a payload the CLI handled locally — nothing in it
+  // is client-visible, so it is not a message.
+  if (stripMarkerTags(text, TRANSCRIPT_MARKERS).trim() === "") {
+    return commandInvocationFromMarkerOnlyText(text);
+  }
+  const stripped = stripCommandPayload(text);
+  return stripped.trim() === "" ? null : stripped;
+}
+
+// Built-in CLI slash commands whose persisted `<command-args>` is a command
+// parameter (e.g. `/model opus`) rather than user prose. Everything else —
+// custom project commands and skills like `/fix-ci-e2e-flake <the user's real
+// request>` — carries the user's actual prompt inside `<command-args>`, so
+// dropping that whole block made their first message vanish on session/load.
+// The bias is deliberate: an unknown command keeps its args (worst case a few
+// stray words render) rather than risk erasing a real user turn.
+const BUILT_IN_COMMANDS = new Set([
+  "/model",
+  "/compact",
+  "/resume",
+  "/effort",
+  "/status",
+  "/clear",
+  "/context",
+  "/heapdump",
+  "/extra-usage",
+]);
+
+const COMMAND_NAME_RE = /<command-name>\s*(\/[^<\s]*)/;
+
+// Choose which marker tags to strip from a given payload. For a built-in
+// command the `<command-args>` is noise and gets stripped with the rest; for a
+// custom command / skill it holds the user's prompt, so `command-args` is
+// omitted from the strip set and its inner text survives (the surrounding
+// `<command-args>` tags are peeled off separately by `unwrapCustomCommandArgs`).
+function markerSetFor(text: string): typeof TRANSCRIPT_MARKERS {
+  const match = COMMAND_NAME_RE.exec(text);
+  if (match && !BUILT_IN_COMMANDS.has(match[1]!)) {
+    return TRANSCRIPT_MARKERS.filter((m) => m.open !== "<command-args>");
+  }
+  return TRANSCRIPT_MARKERS;
+}
+
+// Peel the `<command-args>…</command-args>` wrapper off a custom command's
+// payload and rebuild the invocation as the user originally typed it:
+// `/name args`. Runs after the other marker tags (command-name /
+// command-message) have been stripped, so `before`/`after` are just the blank
+// lines those tags left behind — the CLI's layout, not the user's content. We
+// drop that envelope residue and keep only the rebuilt invocation, so the
+// outline's first-line summary isn't a leading blank line (which would fall
+// back to the bare role label "user"). No-op when there's no args wrapper.
+function unwrapCustomCommandArgs(text: string, commandName?: string): string {
+  const open = "<command-args>";
+  const close = "</command-args>";
+  const start = text.indexOf(open);
+  if (start === -1) return text;
+  const end = text.indexOf(close, start + open.length);
+  if (end === -1) return text;
+  const before = text.slice(0, start);
+  const inner = text.slice(start + open.length, end);
+  const after = text.slice(end + close.length);
+  const invocation =
+    commandName !== undefined
+      ? inner.trim()
+        ? `${commandName} ${inner.trim()}`
+        : commandName
+      : inner.trim();
+  // Keep any real prose that surrounded the invocation, but trim the whitespace
+  // the stripped sibling tags left between it and the args block.
+  return `${before.trimEnd()}${before.trim() ? "\n" : ""}${invocation}${
+    after.trim() ? `\n${after.trimStart()}` : ""
+  }`;
+}
+
+// Strip local-command marker tags, then (for custom commands) rebuild the
+// invocation as `/name args` from the stripped command-name + surviving args
+// block, so the replayed message matches what the user originally typed. A
+// built-in command's payload has no surviving args wrapper to unwrap, so the
+// second step is a no-op there.
+function stripCommandPayload(text: string): string {
+  const match = COMMAND_NAME_RE.exec(text);
+  const commandName = match && !BUILT_IN_COMMANDS.has(match[1]!) ? match[1]! : undefined;
+  return unwrapCustomCommandArgs(stripMarkerTags(text), commandName);
 }
 
 /**
@@ -2116,7 +2198,9 @@ function stripLocalCommandMetadataText(text: string): string | null {
  * tags removed, or `null` if nothing meaningful remains (caller should skip
  * the message). Preserves real prose that's mixed in alongside the markers —
  * e.g. a message like `<command-name>…</command-name>hi` becomes `hi`, and
- * `hi<system-reminder>…</system-reminder>` becomes `hi`.
+ * `hi<system-reminder>…</system-reminder>` becomes `hi`. For a custom command
+ * or skill the `<command-args>` payload is the user's prompt, so it is kept
+ * (unwrapped) rather than dropped like a built-in's parameter.
  */
 export function stripLocalCommandMetadata(content: unknown): unknown | null {
   if (typeof content === "string") {
