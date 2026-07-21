@@ -8434,9 +8434,8 @@ export class ClaudeAcpAgent {
     // without this the rewound turns reappear on the next reload.
     await this.truncateTranscriptBefore(params.sessionId, uuid);
     const recreateParams = session.creationParams ?? { cwd: session.cwd, mcpServers: [] };
-    // Snapshot the RUNTIME config (model / effort / fast / agent) before teardown.
-    // `creationParams` only carries the session's *initial* creation params, so
-    // recreating from it — and re-seeding effort from settings.json — would drop
+    // Snapshot the RUNTIME config (model / mode / effort / fast) before teardown.
+    // `creationParams` only carries the session's *initial* creation params, so    // recreating from it — and re-seeding effort from settings.json — would drop
     // any model/effort/etc. the user switched to mid-session via setConfigOption.
     // We re-apply the snapshot onto the fresh Query below so the rewound session
     // keeps running the config the user actually selected.
@@ -8454,18 +8453,18 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * Capture the config the session is *currently running* (model / effort / fast
-   * mode), read from its live `configOptions`, so a rewind can restore it onto
-   * the freshly recreated Query. Ordered model-first because re-applying the
-   * model rebuilds the dependent options (effort/fast) — see
-   * {@link reapplyRuntimeConfig}. A boolean fast-mode currentValue is carried in
+   * Capture the config the session is *currently running* (model / permission
+   * mode / effort / fast mode), read from its live `configOptions`, so a rewind
+   * can restore it onto the freshly recreated Query. Ordered model-first because
+   * re-applying the model rebuilds the dependent options (effort/fast) and can
+   * clamp the mode — so mode must land *after* model (see
+   * {@link reapplyRuntimeConfig}). A boolean fast-mode currentValue is carried in
    * its "on"/"off" select spelling, the form `setSessionConfigOption` accepts on
    * the wire; empty/undefined currentValues are skipped.
    */
   private snapshotRuntimeConfig(session: Session): Array<{ configId: string; value: string }> {
-    const order = [MODEL_CONFIG_ID, EFFORT_CONFIG_ID, FAST_MODE_CONFIG_ID];
-    const snapshot: Array<{ configId: string; value: string }> = [];
-    for (const configId of order) {
+    const order = [MODEL_CONFIG_ID, MODE_CONFIG_ID, EFFORT_CONFIG_ID, FAST_MODE_CONFIG_ID];
+    const snapshot: Array<{ configId: string; value: string }> = [];    for (const configId of order) {
       const opt = session.configOptions.find((o) => o.id === configId);
       if (!opt) continue;
       if (typeof opt.currentValue === "boolean") {
@@ -8512,6 +8511,20 @@ export class ClaudeAcpAgent {
           err,
         );
       }
+    }
+    // setSessionConfigOption only returns the updated bag in its RPC *response*,
+    // and here the caller is the rewind itself — so without an explicit
+    // notification the client keeps rendering the recreated session's defaults
+    // while the agent runs the restored config.
+    const settled = this.sessions[sessionId];
+    if (settled) {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions: settled.configOptions,
+        },
+      });
     }
   }
 
@@ -9625,17 +9638,35 @@ export class ClaudeAcpAgent {
     sessionId: string,
     configId: string,
     value: string,
+    opts?: { declareChanged?: boolean },
   ): Promise<void> {
     const session = this.sessions[sessionId];
     if (!session) return;
 
+    const before = new Map(session.configOptions.map((o) => [o.id, o.currentValue]));
     await this.applyConfigOptionValue(sessionId, session, configId, value);
+
+    // With `declareChanged`, stamp the ids whose values this call actually
+    // changed (the target plus any knock-on like a mode clamp or effort
+    // rebuild) onto the broadcast. The resume-time model reconciliation needs
+    // this: its bag is otherwise still the recreated session's seed, and
+    // without the declaration the client would treat those stale seeds as
+    // authoritative and override the user's restored values.
+    let meta: Record<string, unknown> | undefined;
+    if (opts?.declareChanged) {
+      const changed = session.configOptions
+        .filter((o) => before.get(o.id) !== o.currentValue)
+        .map((o) => o.id);
+      if (!changed.includes(configId)) changed.unshift(configId);
+      meta = { "universe-editor/changedConfigIds": changed };
+    }
 
     await this.client.sessionUpdate({
       sessionId,
       update: {
         sessionUpdate: "config_option_update",
         configOptions: session.configOptions,
+        ...(meta ? { _meta: meta } : {}),
       },
     });
   }
@@ -9733,7 +9764,9 @@ export class ClaudeAcpAgent {
     }
 
     try {
-      await this.updateConfigOption(sessionId, MODEL_CONFIG_ID, liveModel.value);
+      await this.updateConfigOption(sessionId, MODEL_CONFIG_ID, liveModel.value, {
+        declareChanged: true,
+      });
       this.logger.log(
         `Resumed session ${sessionId}: reported model corrected from "${reportedModelId}" to live "${liveModel.value}".`,
       );
