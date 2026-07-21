@@ -3924,6 +3924,197 @@ describe("universe-editor/rewind_session (rewindSession)", () => {
     const effortOpt = recreated.configOptions.find((o) => o.id === "effort");
     expect(effortOpt?.currentValue).toBe("high");
   });
+
+  it("re-applies the session's permission mode after recreating the Query", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, async function* () {});
+    const session = agent.sessions["test-session"]!;
+    session.messageIdToUuid.set("acp-msg-10", "sdk-uuid-10");
+    session.query.rewindFiles = vi.fn(async () => ({
+      canRewind: true,
+      filesChanged: [],
+      insertions: 0,
+      deletions: 0,
+    }));
+
+    // The user switched to bypassPermissions at runtime; the recreated Query
+    // re-seeds the mode from settings.json (default) and would silently drop it.
+    const availableModes = [
+      { id: "default", name: "Always Ask", description: "" },
+      { id: "bypassPermissions", name: "Bypass Permissions", description: "" },
+    ];
+    const models = {
+      currentModelId: "claude-haiku-4-5",
+      availableModels: [{ modelId: "claude-haiku-4-5", name: "Claude Haiku 4.5" }],
+    };
+    const modelInfos = [{ value: "claude-haiku-4-5", displayName: "Claude Haiku 4.5", description: "" }];
+    const modes = { currentModeId: "bypassPermissions", availableModes };
+    session.models = models as any;
+    session.modelInfos = modelInfos as any;
+    session.modes = modes as any;
+    session.configOptions = buildConfigOptions(modes as any, models as any, modelInfos as any);
+
+    vi.spyOn(agent as any, "teardownSession").mockResolvedValue(undefined);
+    vi.spyOn(agent as any, "replaySessionHistory").mockResolvedValue(undefined);
+    vi.spyOn(agent as any, "truncateTranscriptBefore").mockResolvedValue(undefined);
+    vi.spyOn(agent as any, "messageUuidBefore").mockResolvedValue("sdk-uuid-9");
+
+    const setPermissionMode = vi.fn(async () => {});
+    vi.spyOn(agent as any, "createSession").mockImplementation(async () => {
+      const recreated = mockSessionState({
+        query: Object.assign((async function* () {})(), {
+          interrupt: vi.fn(),
+          close: vi.fn(),
+          setModel: vi.fn(async () => {}),
+          setPermissionMode,
+        }),
+        models,
+        modelInfos,
+        modes: { currentModeId: "default", availableModes },
+        configOptions: buildConfigOptions(
+          { currentModeId: "default", availableModes } as any,
+          models as any,
+          modelInfos as any,
+        ),
+      });
+      agent.sessions["test-session"] = recreated;
+      return {} as any;
+    });
+
+    await agent.rewindSession({ sessionId: "test-session", messageId: "acp-msg-10" });
+
+    // The runtime permission mode must be restored on the recreated Query.
+    expect(setPermissionMode).toHaveBeenCalledWith("bypassPermissions");
+    const recreated = agent.sessions["test-session"]!;
+    expect(recreated.modes.currentModeId).toBe("bypassPermissions");
+    const modeOpt = recreated.configOptions.find((o) => o.id === "mode");
+    expect(modeOpt?.currentValue).toBe("bypassPermissions");
+  });
+
+  it("pushes the settled configOptions to the client after re-applying the snapshot", async () => {
+    // The rewind itself calls setSessionConfigOption, whose updated bag only
+    // travels in the RPC *response* — so without an explicit notification the
+    // client keeps rendering the recreated session's defaults while the agent
+    // runs the restored config.
+    const sessionUpdate = vi.fn(async () => {});
+    const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+    injectGeneratorSession(agent, async function* () {});
+    const session = agent.sessions["test-session"]!;
+    session.messageIdToUuid.set("acp-msg-11", "sdk-uuid-11");
+    session.query.rewindFiles = vi.fn(async () => ({
+      canRewind: true,
+      filesChanged: [],
+      insertions: 0,
+      deletions: 0,
+    }));
+
+    const models = {
+      currentModelId: "claude-opus-4-8",
+      availableModels: [
+        { modelId: "claude-fable-5", name: "Claude Fable 5" },
+        { modelId: "claude-opus-4-8", name: "Claude Opus 4.8" },
+      ],
+    };
+    const modelInfos = [
+      { value: "claude-fable-5", displayName: "Claude Fable 5", description: "" },
+      { value: "claude-opus-4-8", displayName: "Claude Opus 4.8", description: "" },
+    ];
+    const modes = { currentModeId: "default", availableModes: [{ id: "default", name: "Default", description: "" }] };
+    session.models = models as any;
+    session.modelInfos = modelInfos as any;
+    session.modes = modes as any;
+    session.configOptions = buildConfigOptions(modes as any, models as any, modelInfos as any);
+
+    vi.spyOn(agent as any, "teardownSession").mockResolvedValue(undefined);
+    vi.spyOn(agent as any, "replaySessionHistory").mockResolvedValue(undefined);
+    vi.spyOn(agent as any, "truncateTranscriptBefore").mockResolvedValue(undefined);
+    vi.spyOn(agent as any, "messageUuidBefore").mockResolvedValue("sdk-uuid-10");
+
+    vi.spyOn(agent as any, "createSession").mockImplementation(async () => {
+      const recreated = mockSessionState({
+        query: Object.assign((async function* () {})(), {
+          interrupt: vi.fn(),
+          close: vi.fn(),
+          setModel: vi.fn(async () => {}),
+        }),
+        models: { currentModelId: "claude-fable-5", availableModels: models.availableModels },
+        modelInfos,
+        modes,
+        configOptions: buildConfigOptions(modes as any, {
+          currentModelId: "claude-fable-5",
+          availableModels: models.availableModels,
+        } as any, modelInfos as any),
+      });
+      agent.sessions["test-session"] = recreated;
+      return {} as any;
+    });
+
+    await agent.rewindSession({ sessionId: "test-session", messageId: "acp-msg-11" });
+
+    const bags = sessionUpdate.mock.calls
+      .map(([n]: any[]) => n)
+      .filter((n: any) => n?.update?.sessionUpdate === "config_option_update");
+    expect(bags.length).toBeGreaterThan(0);
+    const finalBag = bags[bags.length - 1]!;
+    const modelOpt = finalBag.update.configOptions.find((o: any) => o.id === "model");
+    expect(modelOpt?.currentValue).toBe("claude-opus-4-8");
+  });
+});
+
+describe("reconcileResumedSessionModel", () => {
+  it("declares the corrected ids on the broadcast so the client keeps its restored values", async () => {
+    // The reconciliation corrects only the model, but the broadcast carries the
+    // whole configOptions bag — where mode/effort are still the recreated
+    // session's seeds. Without declaring which ids actually changed, the client
+    // treats the stale seeds as authoritative and overrides the user's restored
+    // values.
+    const sessionUpdate = vi.fn(async () => {});
+    const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+    injectGeneratorSession(agent, async function* () {});
+    const session = agent.sessions["test-session"]!;
+
+    const models = {
+      currentModelId: "claude-sonnet-5",
+      availableModels: [
+        { modelId: "claude-sonnet-5", name: "Claude Sonnet 5" },
+        { modelId: "claude-fable-5", name: "Claude Fable 5" },
+      ],
+    };
+    const modelInfos = [
+      { value: "claude-sonnet-5", displayName: "Claude Sonnet 5", description: "" },
+      { value: "claude-fable-5", displayName: "Claude Fable 5", description: "" },
+    ];
+    const modes = {
+      currentModeId: "default",
+      availableModes: [{ id: "default", name: "Default", description: "" }],
+    };
+    session.models = models as any;
+    session.modelInfos = modelInfos as any;
+    session.modes = modes as any;
+    session.configOptions = buildConfigOptions(modes as any, models as any, modelInfos as any);
+    session.query.getContextUsage = vi.fn(async () => ({ model: "claude-fable-5" })) as any;
+
+    await (agent as any).reconcileResumedSessionModel(
+      "test-session",
+      "read-live-model",
+      modelInfos,
+    );
+
+    const bags = sessionUpdate.mock.calls
+      .map(([n]: any[]) => n)
+      .filter((n: any) => n?.update?.sessionUpdate === "config_option_update");
+    expect(bags.length).toBe(1);
+    const update = bags[0]!.update;
+    const modelOpt = update.configOptions.find((o: any) => o.id === "model");
+    expect(modelOpt?.currentValue).toBe("claude-fable-5");
+    expect(update._meta?.["universe-editor/changedConfigIds"]).toEqual(["model"]);
+  });
 });
 
 describe("rewind persistence (truncateTranscriptBefore)", () => {
