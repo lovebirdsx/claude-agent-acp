@@ -333,6 +333,78 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
     expect(recordedUserChunks.some((c) => c.includes("hi"))).toBe(true);
   }, 60000);
 
+  // Regression: a custom command / skill (unlike a built-in such as /model)
+  // carries the user's real prompt inside <command-args>. The first version of
+  // the marker filter dropped that block wholesale, so the user's opening
+  // message vanished on session/load and the sticky-header showed the skill
+  // body instead. loadSession must preserve the args prose for a non-built-in
+  // command while still stripping the surrounding marker tags.
+  it("ACP: loadSession preserves the user's prompt inside a custom command's <command-args>", async () => {
+    const recordedUserChunks: string[] = [];
+    const client = {
+      sessionUpdate: async (notification: SessionNotification) => {
+        if (notification.update.sessionUpdate === "user_message_chunk") {
+          const content = notification.update.content;
+          if (content.type === "text") recordedUserChunks.push(content.text);
+        }
+      },
+      requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
+      readTextFile: async () => ({ content: "" }),
+      writeTextFile: async () => ({}),
+    } as unknown as AcpClient;
+
+    const userPrompt = "请分析 session 顶部消息粘性定位的 bug 并修复";
+    const customInvocation =
+      "<command-message>acp-session-subsystem-context</command-message>\n" +
+      "<command-name>/acp-session-subsystem-context</command-name>\n" +
+      `<command-args>${userPrompt}</command-args>`;
+
+    const sessionId = randomUUID();
+    const input = new Pushable<SDKUserMessage>();
+    const q = query({
+      prompt: input,
+      options: {
+        systemPrompt: { type: "preset", preset: "claude_code" },
+        sessionId,
+        settingSources: ["user", "project", "local"],
+        includePartialMessages: true,
+      },
+    });
+    await q.initializationResult();
+
+    input.push({
+      type: "user",
+      message: { role: "user", content: customInvocation },
+      session_id: sessionId,
+      parent_tool_use_id: null,
+    });
+    for await (const msg of q) {
+      if (msg.type === "result") break;
+    }
+    input.end();
+    q.return(undefined);
+
+    const agent = new ClaudeAcpAgent(client);
+    try {
+      await agent.loadSession({
+        sessionId,
+        cwd: process.cwd(),
+        mcpServers: [],
+      });
+    } finally {
+      await agent.dispose();
+    }
+
+    for (const chunk of recordedUserChunks) {
+      expect(chunk).not.toContain("<command-name>");
+      expect(chunk).not.toContain("<command-message>");
+      expect(chunk).not.toContain("<command-args>");
+    }
+    // The user's prompt survives the replay instead of being dropped whole.
+    expect(recordedUserChunks.some((c) => c.includes(userPrompt))).toBe(true);
+  }, 60000);
+
+
   // Regression test for https://github.com/agentclientprotocol/claude-agent-acp/issues/845
   // On resume the CLI restores the model the session's transcript was running,
   // so the client must end up seeing that live model instead of the
