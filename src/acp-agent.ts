@@ -1067,6 +1067,15 @@ export class ClaudeAcpAgent {
           claudeCode: {
             promptQueueing: true,
           },
+          // universe-editor/* ext-capability advertisement. The editor reads this
+          // instead of a hardcoded agentId white-list to decide whether to show
+          // the rewind (回退) affordance. claude rolls the working-tree edits back
+          // itself via SDK file-checkpointing, so filesRolledBackByAgent: true.
+          "universe-editor/capabilities": {
+            rewind: {
+              filesRolledBackByAgent: true,
+            },
+          },
         },
         promptCapabilities: {
           image: true,
