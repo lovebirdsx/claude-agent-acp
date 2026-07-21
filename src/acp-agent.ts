@@ -2855,6 +2855,15 @@ export class ClaudeAcpAgent {
           // never a status payload. The state itself travels on
           // `_auth/status_update`; there is nothing for a client to ask for.
           authStatus: authStatusCapability(),
+          // universe-editor/* ext-capability advertisement. The editor reads this
+          // instead of a hardcoded agentId white-list to decide whether to show
+          // the rewind (回退) affordance. claude rolls the working-tree edits back
+          // itself via SDK file-checkpointing, so filesRolledBackByAgent: true.
+          "universe-editor/capabilities": {
+            rewind: {
+              filesRolledBackByAgent: true,
+            },
+          },
         },
         promptCapabilities: {
           image: true,

@@ -23,8 +23,10 @@
  *   (see {@link ADAPTER_NOTIFICATION_PREFIX}): the structured report that
  *   the adapter sends instead of the text chunk origin/main streamed.
  * - A `_meta` key of the adapter's own namespace (see
- *   {@link ADAPTER_META_PREFIX}), e.g. the running per-sub-agent tally the
- *   adapter adds to the parent Task card.
+ *   {@link ADAPTER_META_PREFIXES}), e.g. the running per-sub-agent tally the
+ *   adapter adds to the parent Task card. The capability keys the adapter
+ *   advertises on `initialize` (`universe-editor/capabilities`) are the same
+ *   kind of difference, on a message that is not a session update.
  * - A `usage_update` without a `cost` that the adapter sends while the
  *   response to `session/load` is still on its way. The adapter reports the
  *   context window of the session it restored; origin/main reported it only
@@ -58,8 +60,14 @@ export const ADAPTER_COMMANDS = new Set(["mcp"]);
 /** The extension-notification methods that only the adapter sends. */
 export const ADAPTER_NOTIFICATION_PREFIX = "_universe/";
 
-/** The `_meta` keys that only the adapter adds, in the same namespace. */
-export const ADAPTER_META_PREFIX = "_universe/";
+/** The `_meta` namespaces that only the adapter adds: its extension payloads,
+ *  and the capability keys it advertises on `initialize`. */
+export const ADAPTER_META_PREFIXES = ["_universe/", "universe-editor/"];
+
+/** Whether a `_meta` key is one that only the adapter adds. */
+export function adapterMetaKey(key: string): boolean {
+  return ADAPTER_META_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
 
 /** The tool call fields that an update replaces as a whole. */
 const REPLACED_FIELDS = [
@@ -92,7 +100,7 @@ export function canonical(value: unknown): string {
   );
 }
 
-/** Removes the keys that exist only for AIR, recursively. */
+/** Removes the keys that exist only for AIR and the adapter's own, recursively. */
 export function withoutAirOnlyKeys(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(withoutAirOnlyKeys);
   if (!value || typeof value !== "object") return value;
@@ -101,7 +109,7 @@ export function withoutAirOnlyKeys(value: unknown): unknown {
     if (key === "_meta" && item && typeof item === "object" && !Array.isArray(item)) {
       const meta: Json = {};
       for (const [metaKey, metaValue] of Object.entries(item as Json)) {
-        if (AIR_ONLY_META_KEYS.has(metaKey)) continue;
+        if (AIR_ONLY_META_KEYS.has(metaKey) || adapterMetaKey(metaKey)) continue;
         if (metaKey === "claudeCode" && metaValue && typeof metaValue === "object") {
           const claudeCode = Object.fromEntries(
             Object.entries(metaValue as Json).filter(([k]) => !AIR_ONLY_CLAUDE_CODE_KEYS.has(k)),
@@ -127,7 +135,7 @@ function flatten(update: Json): Map<string, string> {
   }
   const meta = (update._meta ?? {}) as Json;
   for (const [key, value] of Object.entries(meta)) {
-    if (key.startsWith(ADAPTER_META_PREFIX)) continue;
+    if (adapterMetaKey(key)) continue;
     if (key === "claudeCode" && value && typeof value === "object") {
       for (const [k, v] of Object.entries(value as Json)) {
         flat.set(`_meta.claudeCode.${k}`, canonical(v));
@@ -156,7 +164,7 @@ function adapterMetaOnly(update: Json): boolean {
   const keys = Object.keys(update).filter((key) => key !== "sessionUpdate" && key !== "toolCallId");
   if (keys.length !== 1 || keys[0] !== "_meta") return false;
   const metaKeys = Object.keys((update._meta ?? {}) as Json);
-  return metaKeys.length > 0 && metaKeys.every((key) => key.startsWith(ADAPTER_META_PREFIX));
+  return metaKeys.length > 0 && metaKeys.every((key) => adapterMetaKey(key));
 }
 
 /**
@@ -173,7 +181,7 @@ function backgroundSettle(update: Json): boolean {
   if (!Array.isArray(content) || content.length === 0) return false;
   if (!content.every((block) => block.type === "content")) return false;
   const meta = (update._meta ?? {}) as Json;
-  if (!Object.keys(meta).every((key) => key.startsWith(ADAPTER_META_PREFIX))) return false;
+  if (!Object.keys(meta).every((key) => adapterMetaKey(key))) return false;
   return Object.keys(update).every(
     (key) =>
       key === "sessionUpdate" ||
@@ -302,7 +310,16 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
     if (canonical(actual) === canonical(wanted)) return true;
     const want = updateOf(wanted);
     const got = updateOf(actual);
-    if (!want || !got || want.sessionUpdate !== got.sessionUpdate) return false;
+    if (!want || !got) {
+      // A message that is not a session update (the handshake, the session
+      // responses): equal once the keys of the adapter's own namespaces are
+      // out — it advertises its extensions there.
+      return (
+        canonical(withoutAirOnlyKeys(actual.payload ?? null)) ===
+        canonical(withoutAirOnlyKeys(wanted.payload ?? null))
+      );
+    }
+    if (want.sessionUpdate !== got.sessionUpdate) return false;
     if (
       canonical(without(wanted.payload as Json, "update")) !==
       canonical(without(actual.payload as Json, "update"))
