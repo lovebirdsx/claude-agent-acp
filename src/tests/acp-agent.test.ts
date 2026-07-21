@@ -146,6 +146,7 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     subagentStats: new Map(),
     toolUseCache: {},
     emittedToolCalls: new Set(),
+    backgroundToolCalls: new Set(),
     messageIdToUuid: new Map(),
     ...overrides,
   } as any;
@@ -1867,6 +1868,7 @@ describe("permission request cancellation", () => {
       subagentStats: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
     } as any;
     return agent.sessions[sessionId]!;
@@ -2316,6 +2318,78 @@ describe("stop reason propagation", () => {
     // usage_update), not folded into the user turn's response.
     expect(response.usage?.inputTokens).toBe(promptResult.usage.input_tokens);
     expect(response.usage?.outputTokens).toBe(promptResult.usage.output_tokens);
+  });
+
+  it("settles the background sub-agent card when its task_notification arrives", async () => {
+    const sessionUpdates: any[] = [];
+    const mockClient = {
+      sessionUpdate: async (u: any) => {
+        sessionUpdates.push(u);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      // A background sub-agent is dispatched, then settles later.
+      yield {
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-1",
+        tool_use_id: "toolu_agent",
+        description: "调研计划04",
+        session_id: "test-session",
+        uuid: randomUUID(),
+      };
+      yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      yield {
+        type: "system",
+        subtype: "task_notification",
+        task_id: "task-1",
+        tool_use_id: "toolu_agent",
+        status: "completed",
+        output_file: "/tmp/out.md",
+        summary: "调研完成：契约层无破坏性改动。",
+        session_id: "test-session",
+        uuid: randomUUID(),
+      };
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
+
+    // Drain the consumer so the post-resolution task_notification is processed.
+    await agent.sessions["test-session"]?.consumer;
+
+    // task_started registered the id as a background task.
+    expect(agent.sessions["test-session"]?.backgroundToolCalls.has("toolu_agent")).toBe(false);
+
+    const settle = sessionUpdates.find(
+      (u) =>
+        u.update?.sessionUpdate === "tool_call_update" && u.update?.toolCallId === "toolu_agent",
+    );
+    expect(settle).toBeDefined();
+    expect(settle.update.status).toBe("completed");
+    expect(settle.update.content?.[0]?.content?.text).toContain("调研完成");
   });
 
   it("only reconciles Fast mode from user-driven results, not task-notification followups", async () => {
@@ -3311,6 +3385,7 @@ describe("session/close", () => {
       subagentStats: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
@@ -3399,6 +3474,7 @@ describe("session/delete", () => {
       subagentStats: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
@@ -4026,6 +4102,7 @@ describe("getOrCreateSession param change detection", () => {
       subagentStats: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
@@ -6548,6 +6625,7 @@ describe("post-error recovery", () => {
       subagentStats: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
     };
     return { interrupt };
@@ -7319,6 +7397,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       subagentStats: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
     };
     return { interrupt };
@@ -8078,6 +8157,7 @@ describe("agent selection config option", () => {
         subagentStats: new Map(),
         toolUseCache: {},
         emittedToolCalls: new Set(),
+        backgroundToolCalls: new Set(),
         messageIdToUuid: new Map(),
       };
       return { session: agent.sessions[sessionId]!, applyFlagSettings };

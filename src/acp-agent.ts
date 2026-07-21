@@ -489,6 +489,13 @@ type Session = {
    *  tool_use block streams; this set makes the two paths converge regardless of
    *  order. Pruned at `tool_result` time alongside `toolUseCache`. */
   emittedToolCalls: Set<string>;
+  /** Sub-agent / background tool_use ids whose first `tool_result` is only a
+   *  "running in the background" placeholder. Registered when that placeholder
+   *  is seen (or eagerly by a `task_started`), so the placeholder settles the
+   *  card to `in_progress` rather than `completed`; cleared when the matching
+   *  `task_notification` settles it to its real terminal status. Per-session
+   *  (tool_use ids are only unique within a session). */
+  backgroundToolCalls: Set<string>;
   /** Maps the ACP `messageId` we expose to clients (see `messageIdForGrouping`)
    *  to the SDK message uuid that the Agent SDK's rewind/resume APIs key on
    *  (`Query.rewindFiles` takes a user-message uuid; `resumeSessionAt` takes an
@@ -1935,11 +1942,46 @@ export class ClaudeAcpAgent {
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
-              case "task_started":
-              case "task_notification":
               case "task_progress":
               case "task_updated":
                 break;
+              case "task_started": {
+                // A background task (subagent / backgrounded Bash) started. Its
+                // spawning tool_call already landed a card; remember the id so
+                // that card's placeholder "running in the background"
+                // tool_result settles to `in_progress` rather than `completed`.
+                // (Ordering vs. the placeholder result is not guaranteed — the
+                // tool_result path adds the id too, so either arriving first
+                // works.)
+                if (message.tool_use_id) {
+                  session.backgroundToolCalls.add(message.tool_use_id);
+                }
+                break;
+              }
+              case "task_notification": {
+                // The authoritative terminal signal for a background task. Its
+                // `tool_use_id` maps back to the spawning tool_call card, so
+                // settle that card to its real status now (the placeholder
+                // result left it at `in_progress`). No id → nothing to settle.
+                if (message.tool_use_id) {
+                  const status = message.status === "completed" ? "completed" : "failed";
+                  const content =
+                    typeof message.summary === "string" && message.summary.length > 0
+                      ? [{ type: "content" as const, content: { type: "text" as const, text: message.summary } }]
+                      : undefined;
+                  await this.client.sessionUpdate({
+                    sessionId: message.session_id,
+                    update: {
+                      sessionUpdate: "tool_call_update",
+                      toolCallId: message.tool_use_id,
+                      status,
+                      ...(content ? { content } : {}),
+                    },
+                  });
+                  session.backgroundToolCalls.delete(message.tool_use_id);
+                }
+                break;
+              }
               case "worker_shutting_down":
                 // A Remote Control worker announced a graceful teardown. This is a
                 // live-tail signal for remote clients to explain why a session went
@@ -2410,6 +2452,7 @@ export class ClaudeAcpAgent {
                 cwd: session.cwd,
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
+                backgroundToolCalls: session.backgroundToolCalls,
                 messageId: currentStreamMessageId,
               },
             )) {
@@ -2665,6 +2708,7 @@ export class ClaudeAcpAgent {
                 cwd: session.cwd,
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
+                backgroundToolCalls: session.backgroundToolCalls,
                 messageId: messageIdForGrouping(message),
               },
             )) {
@@ -4874,6 +4918,7 @@ export class ClaudeAcpAgent {
       subagentStats: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
     };
 
@@ -5919,6 +5964,59 @@ function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName);
 }
 
+/** The sub-agent-spawning tools. Their tool_use surfaces as a top-level
+ *  `tool_call` card in the client; when dispatched in the background (the SDK
+ *  default) the initial tool_result is a "running in the background"
+ *  placeholder, not the real outcome. */
+function isSubagentTool(toolName: string): boolean {
+  return toolName === "Agent" || toolName === "Task";
+}
+
+/** Flatten a tool_result's content to text so we can sniff the SDK's
+ *  "running in the background" placeholder. Handles the string form and the
+ *  array-of-blocks form; ignores non-text blocks. */
+function toolResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((c) =>
+        c && typeof c === "object" && "text" in c && typeof (c as { text: unknown }).text === "string"
+          ? (c as { text: string }).text
+          : "",
+      )
+      .join("\n");
+  }
+  return "";
+}
+
+const BACKGROUND_PLACEHOLDER_RE =
+  /running in (?:the )?background|(?:you'?ll|you will) be notified when|as a (?:separate )?task notification/i;
+
+/** Decide the settled status for a tool_result. A backgrounded sub-agent's
+ *  first tool_result is only a "running in the background" acknowledgement —
+ *  its real completion arrives later as a `task_notification` — so it must NOT
+ *  settle the card to `completed`. Detection uses two independent signals so a
+ *  wording change in the CLI can't silently break it: (1) the id was already
+ *  registered by a `task_started`, or (2) it's a sub-agent tool whose result
+ *  text matches the placeholder pattern. Either way we remember the id so the
+ *  later task_notification can settle it, and report `in_progress`. Errors and
+ *  every non-background result settle as before. */
+function resolveToolResultStatus(
+  chunk: { tool_use_id: string; is_error?: boolean; content?: unknown },
+  toolUse: { name: string },
+  backgroundToolCalls: Set<string> | undefined,
+): "completed" | "failed" | "in_progress" {
+  if ("is_error" in chunk && chunk.is_error) return "failed";
+  const registered = backgroundToolCalls?.has(chunk.tool_use_id) ?? false;
+  const looksBackgrounded =
+    isSubagentTool(toolUse.name) && BACKGROUND_PLACEHOLDER_RE.test(toolResultText(chunk.content));
+  if (registered || looksBackgrounded) {
+    backgroundToolCalls?.add(chunk.tool_use_id);
+    return "in_progress";
+  }
+  return "completed";
+}
+
 /** Build the `tool_call` (or, with `refine`, the `tool_call_update`)
  *  notification for a tool_use. Shared by every site that surfaces a tool call:
  *  the streamed tool_use path (first encounter → tool_call, later encounter →
@@ -5981,6 +6079,13 @@ export function toAcpNotifications(
     // tool_call/update decision falls back to `toolUseCache` presence (the
     // historical single-source behavior).
     emittedToolCalls?: Set<string>;
+    // Tracks sub-agent / background tool_use ids whose `tool_result` is only a
+    // "running in the background" placeholder — the real completion arrives
+    // later via a `task_notification`. Such a result must settle the card to
+    // `in_progress`, not `completed`, so the UI doesn't show a green check
+    // while the sub-agent is still running. Mutated in place: registered here
+    // (or by a `task_started`), cleared when the task_notification settles it.
+    backgroundToolCalls?: Set<string>;
     // Opaque id identifying the message these chunks belong to (ACP message ids
     // are opaque strings — no particular format is required). Attached to
     // user/agent message and thought chunks so clients can group streamed chunks
@@ -6236,7 +6341,7 @@ export function toAcpNotifications(
             } satisfies ToolUpdateMeta,
             toolCallId: chunk.tool_use_id,
             sessionUpdate: "tool_call_update",
-            status: "is_error" in chunk && chunk.is_error ? "failed" : "completed",
+            status: resolveToolResultStatus(chunk, toolUse, options?.backgroundToolCalls),
             rawOutput: chunk.content,
             ...toolUpdate,
           };
@@ -6296,6 +6401,7 @@ export function streamEventToAcpNotifications(
     cwd?: string;
     taskState?: TaskState;
     emittedToolCalls?: Set<string>;
+    backgroundToolCalls?: Set<string>;
     messageId?: string;
   },
 ): SessionNotification[] {
@@ -6315,6 +6421,7 @@ export function streamEventToAcpNotifications(
           cwd: options?.cwd,
           taskState: options?.taskState,
           emittedToolCalls: options?.emittedToolCalls,
+          backgroundToolCalls: options?.backgroundToolCalls,
           messageId: options?.messageId,
         },
       );
@@ -6332,6 +6439,7 @@ export function streamEventToAcpNotifications(
           cwd: options?.cwd,
           taskState: options?.taskState,
           emittedToolCalls: options?.emittedToolCalls,
+          backgroundToolCalls: options?.backgroundToolCalls,
           messageId: options?.messageId,
         },
       );
