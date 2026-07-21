@@ -88,6 +88,7 @@ export function mockSessionState(
     liveBackgroundTasks: new Map(),
     emittedAssistantText: false,
     owedTrailingIdles: 0,
+    backgroundToolCalls: new Set(),
     messageIdToUuid: new Map(),
     sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
     ...overrides,

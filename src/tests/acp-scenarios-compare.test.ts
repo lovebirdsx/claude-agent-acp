@@ -61,6 +61,44 @@ describe("compareWithBaseline", () => {
     ]);
   });
 
+  describe("task notification settle", () => {
+    const running = update({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "t",
+      status: "in_progress",
+    });
+    const held = [toolCall, running];
+    const settleFields = {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "t",
+      status: "completed",
+      content: [{ type: "content", content: { type: "text", text: "done" } }],
+    };
+    const settle = update(settleFields);
+
+    it("accepts a card that stays in_progress and is settled later", () => {
+      expect(compareWithBaseline(held, [toolCall, running, settle])).toEqual([]);
+    });
+
+    it("accepts the settle of a card whose placeholder already completed", () => {
+      expect(compareWithBaseline(baseline, [...baseline, settle])).toEqual([]);
+    });
+
+    it("reports a settle of a card that origin/main never reported", () => {
+      const unknown = update({ ...settleFields, toolCallId: "other" });
+      expect(compareWithBaseline(baseline, [...baseline, unknown])).toContainEqual(
+        expect.stringMatching(/^origin\/main did not send /u),
+      );
+    });
+
+    it("reports a settle without the summary of the notification", () => {
+      const bare = update({ sessionUpdate: "tool_call_update", toolCallId: "t", status: "completed" });
+      expect(compareWithBaseline(baseline, [...baseline, bare])).toContainEqual(
+        expect.stringMatching(/^origin\/main did not send /u),
+      );
+    });
+  });
+
   describe("available_commands_update", () => {
     const commands = (...names: string[]) =>
       update({

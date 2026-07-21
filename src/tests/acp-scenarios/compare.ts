@@ -29,6 +29,13 @@
  *   response to `session/load` is still on its way. The adapter reports the
  *   context window of the session it restored; origin/main reported it only
  *   from the next prompt on.
+ * - The spawning card of a sub-agent or background task stays `in_progress`
+ *   until the `task_notification` settles it (see {@link backgroundSettle}).
+ *   A `tool_call_update` that origin/main reported as `completed` therefore
+ *   goes out without the `status` while the client holds `in_progress` (or as
+ *   `in_progress`), and the settle arrives later as an additional
+ *   `tool_call_update` that carries the terminal status and the summary of the
+ *   notification.
  */
 import type { Recorded } from "./harness.js";
 
@@ -152,6 +159,31 @@ function adapterMetaOnly(update: Json): boolean {
   return metaKeys.length > 0 && metaKeys.every((key) => key.startsWith(ADAPTER_META_PREFIX));
 }
 
+/**
+ * Whether the update is the adapter's settle report of a spawning tool call:
+ * the terminal status of the `task_notification` and its summary text. The
+ * adapter keeps such a card `in_progress` until this report arrives (or, when
+ * the placeholder already reported it, replaces the placeholder text), so
+ * origin/main has no record of it.
+ */
+function backgroundSettle(update: Json): boolean {
+  if (update.sessionUpdate !== "tool_call_update") return false;
+  if (update.status !== "completed" && update.status !== "failed") return false;
+  const content = update.content as Json[] | undefined;
+  if (!Array.isArray(content) || content.length === 0) return false;
+  if (!content.every((block) => block.type === "content")) return false;
+  const meta = (update._meta ?? {}) as Json;
+  if (!Object.keys(meta).every((key) => key.startsWith(ADAPTER_META_PREFIX))) return false;
+  return Object.keys(update).every(
+    (key) =>
+      key === "sessionUpdate" ||
+      key === "toolCallId" ||
+      key === "status" ||
+      key === "content" ||
+      key === "_meta",
+  );
+}
+
 /** The key and the text of a subagent message or thought chunk. */
 function subagentChunk(update: Json | undefined): { key: string; text: string } | undefined {
   if (
@@ -223,6 +255,7 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
     const update = updateOf(record);
     if (!update) return false;
     if (adapterMetaOnly(update)) return true;
+    if (backgroundSettle(update) && state.has(update.toolCallId as string)) return true;
     return (
       update.sessionUpdate === "usage_update" &&
       update.used !== undefined &&
@@ -250,8 +283,21 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
     }
   };
 
+  /**
+   * Whether `current` settles the card of `toolCallId` after `at`: the
+   * `task_notification` of the task that the card spawned reported its
+   * terminal status and summary (see {@link backgroundSettle}).
+   */
+  const settlesLater = (toolCallId: unknown, at: number): boolean =>
+    current.slice(at + 1).some((later) => {
+      const update = updateOf(later);
+      return (
+        update !== undefined && backgroundSettle(update) && update.toolCallId === toolCallId
+      );
+    });
+
   /** Whether `actual` carries the information of `wanted` under the rule. */
-  const matches = (wanted: Recorded, actual: Recorded | undefined): boolean => {
+  const matches = (wanted: Recorded, actual: Recorded | undefined, at: number): boolean => {
     if (!actual || actual.kind !== wanted.kind) return false;
     if (canonical(actual) === canonical(wanted)) return true;
     const want = updateOf(wanted);
@@ -267,10 +313,35 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
       const held = state.get(want.toolCallId as string) ?? new Map<string, string>();
       const w = flatten(want);
       const g = flatten(got);
-      for (const [key, value] of g) if (w.get(key) !== value) return false;
+      for (const [key, value] of g) {
+        if (w.get(key) === value) continue;
+        // A card that stays `in_progress` until its `task_notification`
+        // reports `in_progress` where origin/main completed.
+        if (
+          key === "status" &&
+          value === canonical("in_progress") &&
+          w.get(key) === canonical("completed") &&
+          settlesLater(want.toolCallId, at)
+        ) {
+          continue;
+        }
+        return false;
+      }
       for (const [key, value] of w) {
         if (g.has(key)) continue;
-        if (isMeta(key) || held.get(key) !== value) return false;
+        if (isMeta(key) || held.get(key) !== value) {
+          // The card stays `in_progress` here: the terminal status goes out
+          // later, in the settle report of the `task_notification`.
+          if (
+            key === "status" &&
+            value === canonical("completed") &&
+            held.get(key) === canonical("in_progress") &&
+            settlesLater(want.toolCallId, at)
+          ) {
+            continue;
+          }
+          return false;
+        }
       }
       const other = (u: Json) =>
         canonical(
@@ -310,8 +381,8 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
   };
 
   for (const wanted of expected) {
-    while (additional(current[next], next) && !matches(wanted, current[next])) next++;
-    if (matches(wanted, current[next])) {
+    while (additional(current[next], next) && !matches(wanted, current[next], next)) next++;
+    if (matches(wanted, current[next], next)) {
       remember(updateOf(wanted));
       next++;
       continue;

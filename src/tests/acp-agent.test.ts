@@ -4031,6 +4031,7 @@ describe("permission request cancellation", () => {
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
+      backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
     } as any;
     return agent.sessions[sessionId]!;
@@ -5872,7 +5873,10 @@ describe("subagent permission attribution (issue #851)", () => {
 
     expect(updates.map(({ sessionId, update }) => [sessionId, update.sessionUpdate])).toEqual([
       // The sub-agent's assistant message folds its usage into the parent Task
-      // card's tally before the spawn flush (see `accumulateSubagentUsage`).
+      // card's tally before the spawn flush (see `accumulateSubagentUsage`)...
+      ["test-session", "tool_call_update"],
+      // ...and the task_notification then settles the card its placeholder
+      // result left at `in_progress`.
       ["test-session", "tool_call_update"],
       ["test-session", "subagent_spawned"],
       ["agent-42", "agent_message_chunk"],
@@ -6844,9 +6848,12 @@ describe("native subagent eager tool ownership", () => {
       "test-session",
       "test-session",
     ]);
+    // A task_started registered the id with `backgroundToolCalls`, so the
+    // tool_result only leaves the card at `in_progress` — the fork settles it
+    // when the task_notification arrives (this scenario sends none).
     expect(
       controlUpdates.map(({ update }) => ("status" in update ? update.status : undefined)),
-    ).toEqual(["pending", "completed"]);
+    ).toEqual(["pending", "in_progress"]);
   });
 
   it("keeps permission-visible Agent control lifecycle in its original session", async () => {
@@ -7259,6 +7266,78 @@ describe("stop reason propagation", () => {
     // usage_update), not folded into the user turn's response.
     expect(response.usage?.inputTokens).toBe(promptResult.usage.input_tokens);
     expect(response.usage?.outputTokens).toBe(promptResult.usage.output_tokens);
+  });
+
+  it("settles the background sub-agent card when its task_notification arrives", async () => {
+    const sessionUpdates: any[] = [];
+    const mockClient = {
+      sessionUpdate: async (u: any) => {
+        sessionUpdates.push(u);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      // A background sub-agent is dispatched, then settles later.
+      yield {
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-1",
+        tool_use_id: "toolu_agent",
+        description: "调研计划04",
+        session_id: "test-session",
+        uuid: randomUUID(),
+      };
+      yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      yield {
+        type: "system",
+        subtype: "task_notification",
+        task_id: "task-1",
+        tool_use_id: "toolu_agent",
+        status: "completed",
+        output_file: "/tmp/out.md",
+        summary: "调研完成：契约层无破坏性改动。",
+        session_id: "test-session",
+        uuid: randomUUID(),
+      };
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
+
+    // Drain the consumer so the post-resolution task_notification is processed.
+    await agent.sessions["test-session"]?.consumer;
+
+    // task_started registered the id as a background task.
+    expect(agent.sessions["test-session"]?.backgroundToolCalls.has("toolu_agent")).toBe(false);
+
+    const settle = sessionUpdates.find(
+      (u) =>
+        u.update?.sessionUpdate === "tool_call_update" && u.update?.toolCallId === "toolu_agent",
+    );
+    expect(settle).toBeDefined();
+    expect(settle.update.status).toBe("completed");
+    expect(settle.update.content?.[0]?.content?.text).toContain("调研完成");
   });
 
   it("only reconciles Fast mode from user-driven results, not task-notification followups", async () => {
@@ -10448,6 +10527,7 @@ describe("session/close", () => {
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
+      backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
     };
@@ -10543,6 +10623,7 @@ describe("session/delete", () => {
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
+      backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
     };
@@ -11192,6 +11273,7 @@ describe("getOrCreateSession param change detection", () => {
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
+      backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
     };
@@ -15593,6 +15675,7 @@ describe("post-error recovery", () => {
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
+      backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
     };
@@ -20996,6 +21079,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
+      backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
     };

@@ -1372,6 +1372,13 @@ export type Session = {
    *  just absorbs one future idle, and detection degrades to the status quo
    *  rather than misfiring. */
   owedTrailingIdles: number;
+  /** Sub-agent / background tool_use ids whose first `tool_result` is only a
+   *  "running in the background" placeholder. Registered when that placeholder
+   *  is seen (or eagerly by a `task_started`), so the placeholder settles the
+   *  card to `in_progress` rather than `completed`; cleared when the matching
+   *  `task_notification` settles it to its real terminal status. Per-session
+   *  (tool_use ids are only unique within a session). */
+  backgroundToolCalls: Set<string>;
   /** Maps the ACP `messageId` we expose to clients (see `messageIdForGrouping`)
    *  to the SDK message uuid that the Agent SDK's rewind/resume APIs key on
    *  (`Query.rewindFiles` takes a user-message uuid; `resumeSessionAt` takes an
@@ -5740,10 +5747,48 @@ export class ClaudeAcpAgent {
                   skip_transcript: message.skip_transcript,
                   tool_use_id: message.tool_use_id,
                 });
+
+                // Its spawning tool_call already landed a card; remember the id
+                // so that card's placeholder "running in the background"
+                // tool_result settles to `in_progress` rather than `completed`.
+                // (Ordering vs. the placeholder result is not guaranteed — the
+                // tool_result path adds the id too, so either arriving first
+                // works.)
+                if (message.tool_use_id) {
+                  session.backgroundToolCalls.add(message.tool_use_id);
+                }
                 break;
               case "task_notification":
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
+                //
+                // The spawning tool_call card was settled by a "running in the
+                // background" placeholder result; give it its real terminal
+                // status here, before the subagent state it belongs to. Only a
+                // registered placeholder card needs this, so a repeated
+                // notification settles nothing twice.
+                if (message.tool_use_id && session.backgroundToolCalls.has(message.tool_use_id)) {
+                  const status = message.status === "completed" ? "completed" : "failed";
+                  const content =
+                    typeof message.summary === "string" && message.summary.length > 0
+                      ? [
+                          {
+                            type: "content" as const,
+                            content: { type: "text" as const, text: message.summary },
+                          },
+                        ]
+                      : undefined;
+                  await sendUpdate({
+                    sessionId: message.session_id,
+                    update: {
+                      sessionUpdate: "tool_call_update",
+                      toolCallId: message.tool_use_id,
+                      status,
+                      ...(content ? { content } : {}),
+                    },
+                  });
+                  session.backgroundToolCalls.delete(message.tool_use_id);
+                }
                 await subagents.finishTask(
                   message.task_id,
                   message.status,
@@ -6837,6 +6882,7 @@ export class ClaudeAcpAgent {
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
                 toolCallFields: toolCallFieldsOf(session),
+                backgroundToolCalls: session.backgroundToolCalls,
                 messageId: currentStreamMessageId,
                 streamedToolInputs,
               },
@@ -7208,6 +7254,7 @@ export class ClaudeAcpAgent {
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
                 toolCallFields: toolCallFieldsOf(session),
+                backgroundToolCalls: session.backgroundToolCalls,
                 messageId: messageIdForGrouping(message),
                 toolUseResult: message.type === "user" ? message.tool_use_result : undefined,
                 // On the wire since CLI 2.1.216 but not in SDKUserMessage's
@@ -10682,6 +10729,7 @@ export class ClaudeAcpAgent {
         providerCacheKey,
         taskState,
         subagentStats: new Map(),
+        backgroundToolCalls: new Set(),
         toolUseCache: {},
         emittedToolCalls: new Set(),
         eagerToolCallSessions: new Map(),
@@ -11642,6 +11690,82 @@ function forgetForegroundToolCall(session: Session, toolCallId: string): void {
   for (const turn of session.turnQueue ?? []) turn.foregroundToolCallIds?.delete(toolCallId);
 }
 
+/** Build the Claude Code-specific metadata for a tool call. Bash descriptions
+ *  are kept out of ACP's standard `title`, which clients may use as the shell
+ *  command preview, while still giving clients access to Claude's concise
+ *  human-readable title. */
+function claudeCodeMetaFromToolUse(toolUse: {
+  name: string;
+  input?: unknown;
+}): NonNullable<ToolUpdateMeta["claudeCode"]> {
+  const description =
+    toolUse.name === "Bash" &&
+    toolUse.input !== null &&
+    typeof toolUse.input === "object" &&
+    "description" in toolUse.input &&
+    typeof toolUse.input.description === "string"
+      ? toolUse.input.description
+      : undefined;
+  return {
+    toolName: toolUse.name,
+    ...(description ? { title: description } : {}),
+    ...((toolUse.name === "Agent" || toolUse.name === "Task") && { subagent: true as const }),
+  };
+}
+
+/** The sub-agent-spawning tools. Their tool_use surfaces as a top-level
+ *  `tool_call` card in the client; when dispatched in the background (the SDK
+ *  default) the initial tool_result is a "running in the background"
+ *  placeholder, not the real outcome. */
+function isSubagentTool(toolName: string): boolean {
+  return toolName === "Agent" || toolName === "Task";
+}
+
+/** Flatten a tool_result's content to text so we can sniff the SDK's
+ *  "running in the background" placeholder. Handles the string form and the
+ *  array-of-blocks form; ignores non-text blocks. */
+function toolResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((c) =>
+        c && typeof c === "object" && "text" in c && typeof (c as { text: unknown }).text === "string"
+          ? (c as { text: string }).text
+          : "",
+      )
+      .join("\n");
+  }
+  return "";
+}
+
+const BACKGROUND_PLACEHOLDER_RE =
+  /running in (?:the )?background|(?:you'?ll|you will) be notified when|as a (?:separate )?task notification/i;
+
+/** Decide the settled status for a tool_result. A backgrounded sub-agent's
+ *  first tool_result is only a "running in the background" acknowledgement —
+ *  its real completion arrives later as a `task_notification` — so it must NOT
+ *  settle the card to `completed`. Detection uses two independent signals so a
+ *  wording change in the CLI can't silently break it: (1) the id was already
+ *  registered by a `task_started`, or (2) it's a sub-agent tool whose result
+ *  text matches the placeholder pattern. Either way we remember the id so the
+ *  later task_notification can settle it, and report `in_progress`. Errors and
+ *  every non-background result settle as before. */
+function resolveToolResultStatus(
+  chunk: { tool_use_id: string; is_error?: boolean; content?: unknown },
+  toolUse: { name: string },
+  backgroundToolCalls: Set<string> | undefined,
+): "completed" | "failed" | "in_progress" {
+  if ("is_error" in chunk && chunk.is_error) return "failed";
+  const registered = backgroundToolCalls?.has(chunk.tool_use_id) ?? false;
+  const looksBackgrounded =
+    isSubagentTool(toolUse.name) && BACKGROUND_PLACEHOLDER_RE.test(toolResultText(chunk.content));
+  if (registered || looksBackgrounded) {
+    backgroundToolCalls?.add(chunk.tool_use_id);
+    return "in_progress";
+  }
+  return "completed";
+}
+
 /** The tool-call field tracker of a session, created on first use. */
 function toolCallFieldsOf(session: {
   toolCallFields?: ToolCallFieldTracker;
@@ -11698,6 +11822,13 @@ export function toAcpNotifications(
     // tool_call_update carries only the fields that changed, and an update
     // with nothing new is dropped. Mutated in place.
     toolCallFields?: ToolCallFieldTracker;
+    // Tracks sub-agent / background tool_use ids whose `tool_result` is only a
+    // "running in the background" placeholder — the real completion arrives
+    // later via a `task_notification`. Such a result must settle the card to
+    // `in_progress`, not `completed`, so the UI doesn't show a green check
+    // while the sub-agent is still running. Mutated in place: registered here
+    // (or by a `task_started`), cleared when the task_notification settles it.
+    backgroundToolCalls?: Set<string>;
     // Opaque id identifying the message these chunks belong to (ACP message ids
     // are opaque strings — no particular format is required). Attached to
     // user/agent message and thought chunks so clients can group streamed chunks
@@ -12026,6 +12157,15 @@ export function toAcpNotifications(
             output.push({ sessionId, update: outputUpdate });
           }
           update = finalUpdate;
+          // A backgrounded sub-agent's first tool_result is only a
+          // "running in the background" acknowledgement; its real outcome
+          // arrives later as a `task_notification`. Keep the card
+          // `in_progress` instead of showing a completed check while the
+          // sub-agent still runs (see `resolveToolResultStatus`).
+          if (update?.sessionUpdate === "tool_call_update") {
+            const status = resolveToolResultStatus(chunk, toolUse, options?.backgroundToolCalls);
+            if (status !== update.status) update = { ...update, status };
+          }
         }
         // The tool_use is fully resolved now — drop it so a long session doesn't
         // retain every tool call. The PostToolUse hook (Edit/Write diffs) closes
@@ -12094,6 +12234,7 @@ export function streamEventToAcpNotifications(
     taskState?: TaskState;
     emittedToolCalls?: Set<string>;
     toolCallFields?: ToolCallFieldTracker;
+    backgroundToolCalls?: Set<string>;
     messageId?: string;
     streamedToolInputs?: StreamedToolInputCache;
   },
@@ -12109,6 +12250,7 @@ export function streamEventToAcpNotifications(
     taskState: options?.taskState,
     emittedToolCalls: options?.emittedToolCalls,
     toolCallFields: options?.toolCallFields,
+    backgroundToolCalls: options?.backgroundToolCalls,
     messageId: options?.messageId,
   };
   switch (event.type) {
