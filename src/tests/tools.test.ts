@@ -432,6 +432,137 @@ describe("rawOutput in tool call updates", () => {
   });
 });
 
+describe("background sub-agent tool_result", () => {
+  const mockClient = {} as AcpClient;
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  // A background sub-agent dispatch: the SDK returns a "running in the
+  // background" placeholder tool_result immediately (turn continues) and the
+  // real completion arrives later as a task_notification. The placeholder must
+  // NOT settle the card to `completed`, or the UI shows a green check while the
+  // sub-agent is still running.
+  const backgroundResultText =
+    'Agent dispatched. It is running in the background; ' +
+    'you will be notified when it completes.';
+
+  it("keeps a backgrounded Agent tool_call in_progress (not completed)", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_agent: {
+        type: "tool_use",
+        id: "toolu_agent",
+        name: "Agent",
+        input: { description: "调研计划04", prompt: "…", run_in_background: true },
+      },
+    };
+    const backgroundToolCalls = new Set<string>();
+
+    const notifications = toAcpNotifications(
+      [{ type: "tool_result", tool_use_id: "toolu_agent", content: backgroundResultText, is_error: false }],
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { backgroundToolCalls },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_agent",
+      status: "in_progress",
+    });
+    // The id is remembered so a later task_notification can settle it.
+    expect(backgroundToolCalls.has("toolu_agent")).toBe(true);
+  });
+
+  it("settles the card via a task_started that arrived before the placeholder", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_agent: {
+        type: "tool_use",
+        id: "toolu_agent",
+        name: "Task",
+        input: { description: "调研计划05", prompt: "…" },
+      },
+    };
+    // task_started registered the id first (ordering is not guaranteed).
+    const backgroundToolCalls = new Set<string>(["toolu_agent"]);
+
+    const notifications = toAcpNotifications(
+      // A result whose text does not obviously look backgrounded still counts
+      // because the id was registered by task_started.
+      [{ type: "tool_result", tool_use_id: "toolu_agent", content: "ok", is_error: false }],
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { backgroundToolCalls },
+    );
+
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_agent",
+      status: "in_progress",
+    });
+  });
+
+  it("still completes a synchronous (foreground) Agent tool_result", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_sync: {
+        type: "tool_use",
+        id: "toolu_sync",
+        name: "Agent",
+        input: { description: "sync work", prompt: "…", run_in_background: false },
+      },
+    };
+
+    const notifications = toAcpNotifications(
+      [{ type: "tool_result", tool_use_id: "toolu_sync", content: "Done. Result: 42", is_error: false }],
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { backgroundToolCalls: new Set<string>() },
+    );
+
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_sync",
+      status: "completed",
+    });
+  });
+
+  it("does not treat non-subagent tools as backgrounded on placeholder-like text", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_read: {
+        type: "tool_use",
+        id: "toolu_read",
+        name: "Read",
+        input: { file_path: "/notes.md" },
+      },
+    };
+
+    const notifications = toAcpNotifications(
+      // Prose that happens to mention background must not fool a Read result.
+      [{ type: "tool_result", tool_use_id: "toolu_read", content: "line about running in the background", is_error: false }],
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { backgroundToolCalls: new Set<string>() },
+    );
+
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_read",
+      status: "completed",
+    });
+  });
+});
+
 describe("Bash terminal output", () => {
   const mockClient = {} as AcpClient;
   const mockLogger: Logger = { log: () => {}, error: () => {} };
