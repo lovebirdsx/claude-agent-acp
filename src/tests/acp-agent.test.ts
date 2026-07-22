@@ -1397,8 +1397,10 @@ describe("stripLocalCommandMetadata", () => {
   // <command-name>/<command-args> envelope as a built-in like /model, but there
   // the <command-args> payload IS the user's real prompt. Stripping it whole
   // (as we do for built-ins) made the user's first message vanish on
-  // session/load. Keep the args prose for non-built-in commands.
-  it("keeps the <command-args> prose for a custom (non-built-in) command", () => {
+  // session/load, and keeping only the args dropped the command prefix the
+  // user typed. Rebuild the invocation as `/name args` for non-built-in
+  // commands.
+  it("rebuilds the invocation as `/name args` for a custom (non-built-in) command", () => {
     const custom =
       "<command-message>acp-session-subsystem-context</command-message>\n" +
       "<command-name>/acp-session-subsystem-context</command-name>\n" +
@@ -1408,10 +1410,12 @@ describe("stripLocalCommandMetadata", () => {
     expect(stripped as string).not.toContain("<command-args>");
     expect(stripped as string).not.toContain("<command-name>");
     expect(stripped as string).not.toContain("<command-message>");
-    expect(stripped as string).toContain("目前session的顶部会显示用户的消息，请你分析问题并修复。");
-    // No leading/trailing whitespace from the stripped sibling tags — otherwise
-    // the outline's first-line summary is blank and falls back to "user".
-    expect(stripped as string).toBe("目前session的顶部会显示用户的消息，请你分析问题并修复。");
+    // Exactly what the user typed — command prefix preserved, no leading/trailing
+    // whitespace from the stripped sibling tags (otherwise the outline's
+    // first-line summary is blank and falls back to "user").
+    expect(stripped as string).toBe(
+      "/acp-session-subsystem-context 目前session的顶部会显示用户的消息，请你分析问题并修复。",
+    );
   });
 
   // The built-in /model still strips whole — its args ("opus") are a command
@@ -1425,11 +1429,11 @@ describe("stripLocalCommandMetadata", () => {
   });
 
   // A custom command whose invocation is followed by trailing prose keeps both
-  // the args and the trailing text, separated by a single newline.
-  it("keeps both the args and trailing prose for a custom command", () => {
+  // the rebuilt invocation and the trailing text, separated by a single newline.
+  it("keeps both the rebuilt invocation and trailing prose for a custom command", () => {
     const custom =
       "<command-name>/my-skill</command-name>\n<command-args>do the thing</command-args>\nand also this";
-    expect(stripLocalCommandMetadata(custom)).toBe("do the thing\nand also this");
+    expect(stripLocalCommandMetadata(custom)).toBe("/my-skill do the thing\nand also this");
   });
 
   // Regression: in the original bug report the entire /model preamble and

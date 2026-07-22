@@ -747,17 +747,14 @@ function markerSetFor(text: string): typeof LOCAL_COMMAND_MARKERS {
 }
 
 // Peel the `<command-args>…</command-args>` wrapper off a custom command's
-// payload, keeping only the user's prose inside. Runs after the other marker
-// tags (command-name / command-message) have been stripped, so what remains is
-// just the args block (plus whitespace). No-op when there's no args wrapper.
-// Peel the `<command-args>…</command-args>` wrapper off a custom command's
-// payload, keeping only the user's prose inside. Runs after the other marker
-// tags (command-name / command-message) have been stripped, so `before`/`after`
-// are just the blank lines those tags left behind — the CLI's layout, not the
-// user's content. We drop that envelope residue and keep only the args prose,
-// so the outline's first-line summary isn't a leading blank line (which would
-// fall back to the bare role label "user"). No-op when there's no args wrapper.
-function unwrapCustomCommandArgs(text: string): string {
+// payload and rebuild the invocation as the user originally typed it:
+// `/name args`. Runs after the other marker tags (command-name /
+// command-message) have been stripped, so `before`/`after` are just the blank
+// lines those tags left behind — the CLI's layout, not the user's content. We
+// drop that envelope residue and keep only the rebuilt invocation, so the
+// outline's first-line summary isn't a leading blank line (which would fall
+// back to the bare role label "user"). No-op when there's no args wrapper.
+function unwrapCustomCommandArgs(text: string, commandName?: string): string {
   const open = "<command-args>";
   const close = "</command-args>";
   const start = text.indexOf(open);
@@ -767,18 +764,28 @@ function unwrapCustomCommandArgs(text: string): string {
   const before = text.slice(0, start);
   const inner = text.slice(start + open.length, end);
   const after = text.slice(end + close.length);
+  const invocation =
+    commandName !== undefined
+      ? inner.trim()
+        ? `${commandName} ${inner.trim()}`
+        : commandName
+      : inner.trim();
   // Keep any real prose that surrounded the invocation, but trim the whitespace
   // the stripped sibling tags left between it and the args block.
-  return `${before.trimEnd()}${before.trim() ? "\n" : ""}${inner.trim()}${
+  return `${before.trimEnd()}${before.trim() ? "\n" : ""}${invocation}${
     after.trim() ? `\n${after.trimStart()}` : ""
   }`;
 }
 
-// Strip local-command marker tags, then (for custom commands) unwrap the args
-// block so the user's prose survives. A built-in command's payload has no
-// surviving args wrapper to unwrap, so the second step is a no-op there.
+// Strip local-command marker tags, then (for custom commands) rebuild the
+// invocation as `/name args` from the stripped command-name + surviving args
+// block, so the replayed message matches what the user originally typed. A
+// built-in command's payload has no surviving args wrapper to unwrap, so the
+// second step is a no-op there.
 function stripCommandPayload(text: string): string {
-  return unwrapCustomCommandArgs(stripMarkerTags(text));
+  const match = COMMAND_NAME_RE.exec(text);
+  const commandName = match && !BUILT_IN_COMMANDS.has(match[1]!) ? match[1]! : undefined;
+  return unwrapCustomCommandArgs(stripMarkerTags(text), commandName);
 }
 
 /**
@@ -786,8 +793,8 @@ function stripCommandPayload(text: string): string {
  * `null` if nothing meaningful remains (caller should skip the message).
  * Preserves real prose that's mixed in alongside the markers — e.g. a
  * message like `<command-name>…</command-name>hi` becomes `hi`. For a custom
- * command / skill the `<command-args>` payload is the user's prompt, so it is
- * preserved (unwrapped) rather than dropped like a built-in's parameter.
+ * command / skill the invocation is rebuilt as `/name args` (the user's
+ * original prompt) rather than dropped like a built-in's parameter.
  */
 export function stripLocalCommandMetadata(content: unknown): unknown | null {
   if (typeof content === "string") {
