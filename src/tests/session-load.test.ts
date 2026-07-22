@@ -400,8 +400,10 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
       expect(chunk).not.toContain("<command-message>");
       expect(chunk).not.toContain("<command-args>");
     }
-    // The user's prompt survives the replay instead of being dropped whole.
+    // The user's prompt survives the replay instead of being dropped whole,
+    // rebuilt as the originally-typed `/name args` invocation.
     expect(recordedUserChunks.some((c) => c.includes(userPrompt))).toBe(true);
+    expect(recordedUserChunks).toContain(`/acp-session-subsystem-context ${userPrompt}`);
   }, 60000);
 
 

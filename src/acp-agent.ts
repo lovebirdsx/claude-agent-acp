@@ -2199,8 +2199,8 @@ function stripCommandPayload(text: string): string {
  * the message). Preserves real prose that's mixed in alongside the markers —
  * e.g. a message like `<command-name>…</command-name>hi` becomes `hi`, and
  * `hi<system-reminder>…</system-reminder>` becomes `hi`. For a custom command
- * or skill the `<command-args>` payload is the user's prompt, so it is kept
- * (unwrapped) rather than dropped like a built-in's parameter.
+ * or skill the invocation is rebuilt as `/name args` (the user's original
+ * prompt) rather than dropped like a built-in's parameter.
  */
 export function stripLocalCommandMetadata(content: unknown): unknown | null {
   if (typeof content === "string") {
@@ -3176,7 +3176,7 @@ export class ClaudeAcpAgent {
           // SDK's end-of-session git branch and the transcript JSONL path
           // through `_meta` so the editor can group sessions by worktree and
           // reveal the transcript file in the OS file manager.
-          const transcriptPath = await this.findTranscriptFile(session.sessionId, session.cwd);
+          const transcriptPath = await findTranscript(session.sessionId);
           const meta = {
             ...(session.gitBranch ? { gitBranch: session.gitBranch } : {}),
             ...(transcriptPath ? { transcriptPath } : {}),
