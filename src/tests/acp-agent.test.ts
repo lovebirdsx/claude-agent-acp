@@ -43,6 +43,9 @@ import {
   CLAUDE_CONFIG_DIR,
   COMPACTION_METHOD,
   rebuildTranscriptDisplayChain,
+  isQueuedCommandEntry,
+  mergeQueuedCommandAttachments,
+  queuedCommandPromptToContent,
   type RawTranscriptEntry,
   type AcpClient,
   type SDKMessageFilter,
@@ -8523,6 +8526,28 @@ describe("rebuildTranscriptDisplayChain (compaction-crossing history)", () => {
     expect(chain?.map((e) => e.uuid)).toEqual(["u1", "cb", "u2"]);
   });
 
+  it("keeps on-chain queued_command attachments (folded mid-turn prompts) in the result", () => {
+    const chain = rebuildTranscriptDisplayChain([
+      entry({ uuid: "u1", parentUuid: null, type: "user" }),
+      entry({ uuid: "a1", parentUuid: "u1", type: "assistant" }),
+      entry({
+        uuid: "q1",
+        parentUuid: "a1",
+        type: "attachment",
+        attachment: { type: "queued_command", prompt: [{ type: "text", text: "stop" }] },
+      }),
+      entry({
+        uuid: "cb",
+        parentUuid: null,
+        logicalParentUuid: "q1",
+        type: "system",
+        subtype: "compact_boundary",
+      }),
+      entry({ uuid: "u2", parentUuid: "cb", type: "user" }),
+    ]);
+    expect(chain?.map((e) => e.uuid)).toEqual(["u1", "a1", "q1", "cb", "u2"]);
+  });
+
   it("crosses multiple compactions in one session", () => {
     const chain = rebuildTranscriptDisplayChain([
       entry({ uuid: "u1", parentUuid: null, type: "user" }),
@@ -8733,5 +8758,344 @@ describe("replaySessionHistory across compaction (full transcript replay)", () =
 
     expect(getSessionMessages).toHaveBeenCalledWith(missingSessionId);
     expect(events).toEqual([]);
+  });
+});
+
+describe("replaySessionHistory: queued_command (mid-turn steering) attachments", () => {
+  type ReplayEvent =
+    | { kind: "user" | "agent"; text: string; messageId?: string }
+    | { kind: "compaction"; phase: unknown };
+
+  function createRecordingAgent() {
+    const events: ReplayEvent[] = [];
+    const client = {
+      sessionUpdate: async (notification: SessionNotification) => {
+        const update = notification.update;
+        if (
+          (update.sessionUpdate === "user_message_chunk" ||
+            update.sessionUpdate === "agent_message_chunk") &&
+          update.content.type === "text"
+        ) {
+          events.push({
+            kind: update.sessionUpdate === "user_message_chunk" ? "user" : "agent",
+            text: update.content.text,
+            ...("messageId" in update && typeof update.messageId === "string"
+              ? { messageId: update.messageId }
+              : {}),
+          });
+        }
+      },
+      extNotification: async (method: string, params: Record<string, unknown>) => {
+        if (method === COMPACTION_METHOD) events.push({ kind: "compaction", phase: params.phase });
+      },
+    } as unknown as AcpClient;
+    return { agent: new ClaudeAcpAgent(client, { log: () => {}, error: () => {} }), events };
+  }
+
+  let sessionId: string;
+  let projectDir: string;
+  let transcript: string;
+
+  beforeEach(async () => {
+    sessionId = randomUUID();
+    projectDir = nodePath.join(
+      CLAUDE_CONFIG_DIR,
+      "projects",
+      `__queued_replay_test_${randomUUID()}`,
+    );
+    await nodeFs.mkdir(projectDir, { recursive: true });
+    transcript = nodePath.join(projectDir, `${sessionId}.jsonl`);
+    vi.mocked(getSessionMessages).mockClear();
+  });
+
+  afterEach(async () => {
+    await nodeFs.rm(projectDir, { recursive: true, force: true });
+  });
+
+  const line = (obj: Record<string, unknown>): string => JSON.stringify(obj);
+
+  const queuedCommandLine = (overrides: Record<string, unknown>) =>
+    line({
+      type: "attachment",
+      uuid: "q1",
+      parentUuid: "a1",
+      isSidechain: false,
+      attachment: {
+        type: "queued_command",
+        prompt: [{ type: "text", text: "stop what you are doing" }],
+        source_uuid: "client-msg-1",
+        commandMode: "prompt",
+        timestamp: "2026-07-23T16:45:45.484Z",
+      },
+      timestamp: "2026-07-23T16:45:45.484Z",
+      ...overrides,
+    });
+
+  it("merges a mid-turn prompt into the effective chain right after its parent", async () => {
+    await nodeFs.writeFile(
+      transcript,
+      [
+        line({
+          type: "user",
+          uuid: "u1",
+          parentUuid: null,
+          message: { role: "user", content: "do the refactor" },
+        }),
+        line({
+          type: "assistant",
+          uuid: "a1",
+          parentUuid: "u1",
+          message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "working" }] },
+        }),
+        queuedCommandLine({}),
+        line({
+          type: "assistant",
+          uuid: "a2",
+          parentUuid: "q1",
+          message: { id: "msg_2", role: "assistant", content: [{ type: "text", text: "done" }] },
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    // The SDK's effective chain never carries the attachment row.
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "u1",
+        session_id: "s",
+        message: { role: "user", content: "do the refactor" },
+        parent_tool_use_id: null,
+      },
+      {
+        type: "assistant",
+        uuid: "a1",
+        session_id: "s",
+        message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "working" }] },
+        parent_tool_use_id: null,
+      },
+      {
+        type: "assistant",
+        uuid: "a2",
+        session_id: "s",
+        message: { id: "msg_2", role: "assistant", content: [{ type: "text", text: "done" }] },
+        parent_tool_use_id: null,
+      },
+    ] as any);
+    const { agent, events } = createRecordingAgent();
+
+    await (agent as any).replaySessionHistory(sessionId);
+
+    expect(events).toEqual([
+      { kind: "user", text: "do the refactor", messageId: "u1" },
+      { kind: "agent", text: "working", messageId: "msg_1" },
+      // The folded prompt replays as the user message it was, re-anchored on
+      // the client-supplied prompt id (source_uuid).
+      { kind: "user", text: "stop what you are doing", messageId: "client-msg-1" },
+      { kind: "agent", text: "done", messageId: "msg_2" },
+    ]);
+  });
+
+  it("drops an attachment whose parent fell off the effective chain (rewound branch)", async () => {
+    await nodeFs.writeFile(
+      transcript,
+      [
+        line({
+          type: "user",
+          uuid: "u1",
+          parentUuid: null,
+          message: { role: "user", content: "kept" },
+        }),
+        queuedCommandLine({ uuid: "q-orphan", parentUuid: "rewound-away" }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "u1",
+        session_id: "s",
+        message: { role: "user", content: "kept" },
+        parent_tool_use_id: null,
+      },
+    ] as any);
+    const { agent, events } = createRecordingAgent();
+
+    await (agent as any).replaySessionHistory(sessionId);
+
+    expect(events).toEqual([{ kind: "user", text: "kept", messageId: "u1" }]);
+  });
+
+  it("replays attachments on the rebuilt full chain across compaction", async () => {
+    await nodeFs.writeFile(
+      transcript,
+      [
+        line({
+          type: "user",
+          uuid: "u1",
+          parentUuid: null,
+          message: { role: "user", content: "first question" },
+        }),
+        line({
+          type: "assistant",
+          uuid: "a1",
+          parentUuid: "u1",
+          message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "first answer" }] },
+        }),
+        queuedCommandLine({}),
+        line({
+          type: "system",
+          subtype: "compact_boundary",
+          uuid: "cb",
+          parentUuid: null,
+          logicalParentUuid: "q1",
+          compactMetadata: { trigger: "auto", preTokens: 100000 },
+        }),
+        line({
+          type: "user",
+          uuid: "u2",
+          parentUuid: "cb",
+          message: { role: "user", content: "second question" },
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const { agent, events } = createRecordingAgent();
+
+    await (agent as any).replaySessionHistory(sessionId);
+
+    expect(events).toEqual([
+      { kind: "user", text: "first question", messageId: "u1" },
+      { kind: "agent", text: "first answer", messageId: "msg_1" },
+      { kind: "user", text: "stop what you are doing", messageId: "client-msg-1" },
+      { kind: "compaction", phase: "success" },
+      { kind: "user", text: "second question", messageId: "u2" },
+    ]);
+    // The full-chain path never consults the SDK's effective chain.
+    expect(getSessionMessages).not.toHaveBeenCalled();
+  });
+});
+
+describe("isQueuedCommandEntry", () => {
+  const entry = (e: Partial<RawTranscriptEntry> & { uuid: string }): RawTranscriptEntry =>
+    e as RawTranscriptEntry;
+
+  it("accepts on-chain queued_command attachment rows", () => {
+    expect(
+      isQueuedCommandEntry(
+        entry({
+          uuid: "q1",
+          type: "attachment",
+          isSidechain: false,
+          attachment: { type: "queued_command", prompt: [{ type: "text", text: "x" }] },
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects other attachment types, meta/sidechain rows, and plain messages", () => {
+    expect(
+      isQueuedCommandEntry(
+        entry({ uuid: "a", type: "attachment", attachment: { type: "skill_listing" } }),
+      ),
+    ).toBe(false);
+    expect(
+      isQueuedCommandEntry(
+        entry({
+          uuid: "b",
+          type: "attachment",
+          isMeta: true,
+          attachment: { type: "queued_command" },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isQueuedCommandEntry(
+        entry({
+          uuid: "c",
+          type: "attachment",
+          isSidechain: true,
+          attachment: { type: "queued_command" },
+        }),
+      ),
+    ).toBe(false);
+    expect(isQueuedCommandEntry(entry({ uuid: "d", type: "user" }))).toBe(false);
+  });
+});
+
+describe("mergeQueuedCommandAttachments", () => {
+  const entry = (e: Partial<RawTranscriptEntry> & { uuid: string }): RawTranscriptEntry =>
+    e as RawTranscriptEntry;
+  const queued = (uuid: string, parentUuid: string | null): RawTranscriptEntry =>
+    entry({
+      uuid,
+      parentUuid,
+      type: "attachment",
+      attachment: { type: "queued_command", prompt: [{ type: "text", text: uuid }] },
+    });
+
+  it("inserts each attachment right after its parent, keeping file order for siblings", () => {
+    const merged = mergeQueuedCommandAttachments(
+      [{ uuid: "u1" }, { uuid: "a1" }, { uuid: "a2" }],
+      [queued("q1", "a1"), queued("q2", "a1"), queued("q3", "u1")],
+    );
+    expect(merged.map((e) => e.uuid)).toEqual(["u1", "q3", "a1", "q1", "q2", "a2"]);
+  });
+
+  it("drops attachments whose parent is off-chain or missing", () => {
+    const merged = mergeQueuedCommandAttachments(
+      [{ uuid: "u1" }],
+      [queued("q1", "gone"), queued("q2", null)],
+    );
+    expect(merged.map((e) => e.uuid)).toEqual(["u1"]);
+  });
+
+  it("returns the input untouched when there is nothing to merge", () => {
+    const messages = [{ uuid: "u1" }];
+    expect(mergeQueuedCommandAttachments(messages, [])).toBe(messages);
+  });
+});
+
+describe("queuedCommandPromptToContent", () => {
+  it("passes text blocks through", () => {
+    expect(
+      queuedCommandPromptToContent([{ type: "text", text: "hello" }, { type: "text", text: "" }]),
+    ).toEqual([{ type: "text", text: "hello" }]);
+  });
+
+  it("accepts the bare-string form", () => {
+    expect(queuedCommandPromptToContent("plain")).toEqual([{ type: "text", text: "plain" }]);
+    expect(queuedCommandPromptToContent("")).toEqual([]);
+  });
+
+  it("maps ACP-shaped images like promptToClaude and keeps SDK-shaped ones", () => {
+    expect(
+      queuedCommandPromptToContent([
+        { type: "image", data: "AAAA", mimeType: "image/png" },
+        { type: "image", uri: "https://example.com/x.png" },
+        { type: "image", source: { type: "base64", data: "BB", media_type: "image/png" } },
+        { type: "image", uri: "file:///not/remote.png" },
+      ]),
+    ).toEqual([
+      { type: "image", source: { type: "base64", data: "AAAA", media_type: "image/png" } },
+      { type: "image", source: { type: "url", url: "https://example.com/x.png" } },
+      { type: "image", source: { type: "base64", data: "BB", media_type: "image/png" } },
+    ]);
+  });
+
+  it("renders resource_link mentions as [@name](uri) text like promptToClaude", () => {
+    expect(
+      queuedCommandPromptToContent([{ type: "resource_link", uri: "file:///f:/test/game.js" }]),
+    ).toEqual([{ type: "text", text: "[@game.js](file:///f:/test/game.js)" }]);
+  });
+
+  it("skips unsupported and malformed blocks", () => {
+    expect(
+      queuedCommandPromptToContent([
+        { type: "audio", data: "x" },
+        null,
+        "stray",
+        { text: "no type" },
+      ]),
+    ).toEqual([]);
   });
 });

@@ -1,8 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
 import { randomUUID } from "crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { RequestError, SessionNotification } from "@agentclientprotocol/sdk";
 import { query, getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
-import { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
+import { AcpClient, ClaudeAcpAgent, CLAUDE_CONFIG_DIR } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
@@ -466,5 +468,85 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
     } finally {
       await agent.dispose();
     }
+  }, 120000);
+
+  // Regression: a prompt sent while a turn is running is folded into the
+  // running generation by the CLI and persisted as an
+  // `attachment/queued_command` row on the parent chain — NOT as a `user`
+  // message. Both replay sources used to drop attachment rows
+  // (getSessionMessages filters them; the display-chain rebuild only walks
+  // user/assistant entries), so reloading the session lost the steering
+  // prompt entirely. Replay must surface it as the user message it was.
+  it("ACP: loadSession replays a mid-turn prompt persisted as a queued_command attachment", async () => {
+    const cwd = process.cwd();
+
+    // Step 1: run one real turn so the transcript has a live chain.
+    const agentA = new ClaudeAcpAgent(createMockClient());
+    const { sessionId } = await agentA.newSession({ cwd, mcpServers: [] });
+    await agentA.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "Reply with only the word OK" }],
+    });
+    await agentA.dispose();
+
+    // Step 2: persist what the CLI writes for a mid-turn (steering) prompt:
+    // an attachment/queued_command row whose parentUuid keeps it on the
+    // chain, instead of a user message.
+    const messages = await getSessionMessages(sessionId);
+    const lastUuid = messages[messages.length - 1]?.uuid;
+    expect(lastUuid).toBeDefined();
+    const transcript = path.join(
+      CLAUDE_CONFIG_DIR,
+      "projects",
+      cwd.replace(/[^a-zA-Z0-9]/g, "-"),
+      `${sessionId}.jsonl`,
+    );
+    const steeringText = "STEERING_PROMPT_SURVIVES_RELOAD";
+    await fs.appendFile(
+      transcript,
+      JSON.stringify({
+        parentUuid: lastUuid,
+        isSidechain: false,
+        attachment: {
+          type: "queued_command",
+          prompt: [{ type: "text", text: steeringText }],
+          source_uuid: randomUUID(),
+          commandMode: "prompt",
+          timestamp: new Date().toISOString(),
+        },
+        type: "attachment",
+        uuid: randomUUID(),
+        timestamp: new Date().toISOString(),
+        userType: "external",
+        entrypoint: "sdk-ts",
+        cwd,
+        sessionId,
+        version: "test",
+      }) + "\n",
+    );
+
+    // Sanity: the SDK's effective chain really does hide the attachment.
+    const effectiveTexts = (await getSessionMessages(sessionId))
+      .map((m) => JSON.stringify(m))
+      .join("\n");
+    expect(effectiveTexts).not.toContain(steeringText);
+
+    // Step 3: a fresh agent loads the session — the steering prompt must
+    // replay as a user message.
+    const recordedUserChunks: string[] = [];
+    const agentB = new ClaudeAcpAgent(
+      createMockClient(async (notification) => {
+        if (notification.update.sessionUpdate === "user_message_chunk") {
+          const content = notification.update.content;
+          if (content.type === "text") recordedUserChunks.push(content.text);
+        }
+      }),
+    );
+    try {
+      await agentB.loadSession({ sessionId, cwd, mcpServers: [] });
+    } finally {
+      await agentB.dispose();
+    }
+    expect(recordedUserChunks.join("\n")).toContain(steeringText);
   }, 120000);
 });

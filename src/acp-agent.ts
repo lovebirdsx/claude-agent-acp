@@ -215,6 +215,16 @@ export interface RawTranscriptEntry {
   /** The generated summary user message written right after a compaction. */
   isCompactSummary?: boolean;
   message?: unknown;
+  /** On `type: "attachment"` rows: the attachment payload. Only
+   *  `queued_command` (a mid-turn prompt the CLI folded into the running
+   *  turn) is read — see {@link isQueuedCommandEntry}. */
+  attachment?: {
+    type?: unknown;
+    prompt?: unknown;
+    /** The client-supplied prompt uuid (ACP `messageId`) of the queued
+     *  prompt, preserved so replay can re-anchor the user turn on it. */
+    source_uuid?: unknown;
+  };
 }
 
 export function isCompactBoundaryEntry(entry: RawTranscriptEntry): boolean {
@@ -231,6 +241,56 @@ function isDisplayMessageEntry(entry: RawTranscriptEntry): boolean {
     entry.isMeta !== true &&
     !entry.teamName
   );
+}
+
+/** A prompt sent while a turn is running is folded into the running
+ *  generation by the CLI ("steering") and persisted as an
+ *  `attachment/queued_command` row ON the parent chain — not as a `user`
+ *  message. Both replay sources silently drop such rows
+ *  (`getSessionMessages` filters attachments out; the display-chain walk only
+ *  keeps user/assistant entries), so a reloaded session lost the steering
+ *  prompt entirely. Detect them so replay can surface them as the user
+ *  messages they were. */
+export function isQueuedCommandEntry(entry: RawTranscriptEntry): boolean {
+  return (
+    entry.type === "attachment" &&
+    entry.isSidechain !== true &&
+    entry.isMeta !== true &&
+    !entry.teamName &&
+    entry.attachment?.type === "queued_command"
+  );
+}
+
+/** Insert each on-chain `queued_command` attachment into the replay sequence
+ *  right after its parent, so a folded mid-turn prompt replays at the exact
+ *  spot it was absorbed into the running turn. Attachments whose parent is
+ *  not on the effective chain (e.g. a rewound branch) are dropped along with
+ *  it. */
+export function mergeQueuedCommandAttachments<T extends { uuid?: string | null }>(
+  messages: T[],
+  rawEntries: RawTranscriptEntry[],
+): Array<T | RawTranscriptEntry> {
+  const chainUuids = new Set(messages.map((m) => m.uuid));
+  const byParent = new Map<string, RawTranscriptEntry[]>();
+  for (const entry of rawEntries) {
+    if (!isQueuedCommandEntry(entry)) continue;
+    const parent = entry.parentUuid;
+    if (parent == null || !chainUuids.has(parent)) continue;
+    const siblings = byParent.get(parent);
+    if (siblings) {
+      siblings.push(entry);
+    } else {
+      byParent.set(parent, [entry]);
+    }
+  }
+  if (byParent.size === 0) return messages;
+  const merged: Array<T | RawTranscriptEntry> = [];
+  for (const message of messages) {
+    merged.push(message);
+    const attached = byParent.get(message.uuid ?? "");
+    if (attached) merged.push(...attached);
+  }
+  return merged;
 }
 
 /**
@@ -283,7 +343,10 @@ export function rebuildTranscriptDisplayChain(
   }
   chain.reverse();
 
-  return chain.filter((entry) => isCompactBoundaryEntry(entry) || isDisplayMessageEntry(entry));
+  return chain.filter(
+    (entry) =>
+      isCompactBoundaryEntry(entry) || isDisplayMessageEntry(entry) || isQueuedCommandEntry(entry),
+  );
 }
 
 function sanitizeTitle(text: string): string {
@@ -3657,13 +3720,13 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * Read the raw on-disk transcript and rebuild the full display chain across
-   * compaction boundaries (see {@link rebuildTranscriptDisplayChain}). Returns
-   * undefined — sending the caller to `getSessionMessages` — when the file
-   * can't be located/parsed or contains no boundary, so only compacted
-   * sessions take this path.
+   * Read the raw on-disk transcript entries (uuid-bearing lines only).
+   * Returns undefined when the file can't be located/parsed. Callers rebuild
+   * the compaction-spanning display chain from these (see
+   * {@link rebuildTranscriptDisplayChain}) and recover `queued_command`
+   * attachment rows that `getSessionMessages` filters out.
    */
-  private async readTranscriptDisplayChain(
+  private async readTranscriptEntries(
     sessionId: string,
     dir?: string,
   ): Promise<RawTranscriptEntry[] | undefined> {
@@ -3687,15 +3750,7 @@ export class ClaudeAcpAgent {
           // Non-JSON / blank line — skip.
         }
       }
-      const chain = rebuildTranscriptDisplayChain(entries);
-      if (chain !== undefined) {
-        this.logger.log(
-          `replay: rebuilt full display chain for ${sessionId}: ${chain.length} entries ` +
-            `(${chain.filter(isCompactBoundaryEntry).length} compaction boundaries, ` +
-            `${entries.length} raw transcript entries)`,
-        );
-      }
-      return chain;
+      return entries;
     } catch (error) {
       this.logger.error(
         `replay: failed to read transcript for ${sessionId}, falling back to the effective chain: ${error}`,
@@ -3713,12 +3768,26 @@ export class ClaudeAcpAgent {
     // the summary — the pre-compaction history is unreachable there. Replay
     // the full display chain from the raw transcript instead, so reloading a
     // compacted session restores everything the user saw live.
-    const fullChain = await this.readTranscriptDisplayChain(
+    const rawEntries = await this.readTranscriptEntries(
       sessionId,
       this.sessions[sessionId]?.cwd,
     );
+    const fullChain = rawEntries ? rebuildTranscriptDisplayChain(rawEntries) : undefined;
+    if (fullChain !== undefined && rawEntries) {
+      this.logger.log(
+        `replay: rebuilt full display chain for ${sessionId}: ${fullChain.length} entries ` +
+          `(${fullChain.filter(isCompactBoundaryEntry).length} compaction boundaries, ` +
+          `${rawEntries.length} raw transcript entries)`,
+      );
+    }
+    // Mid-turn (steering) prompts live in the transcript as
+    // `attachment/queued_command` rows on the parent chain, which
+    // `getSessionMessages` filters out — merge them back into the effective
+    // chain so a reloaded session doesn't lose them. The rebuilt full chain
+    // already carries them (see rebuildTranscriptDisplayChain's filter).
     const messages: Array<RawTranscriptEntry | SessionMessageLike> =
-      fullChain ?? (await getSessionMessages(sessionId));
+      fullChain ??
+      mergeQueuedCommandAttachments(await getSessionMessages(sessionId), rawEntries ?? []);
 
     for (const message of messages) {
       // Rewind (回退) truncates the conversation to *before* the anchored user
@@ -3729,6 +3798,8 @@ export class ClaudeAcpAgent {
       if (options.stopBeforeUuid !== undefined && message.uuid === options.stopBeforeUuid) {
         break;
       }
+
+      const replaySession = this.sessions[sessionId];
 
       if (fullChain !== undefined) {
         // Surface each boundary as the same compaction card the live stream
@@ -3746,12 +3817,42 @@ export class ClaudeAcpAgent {
         if ((message as RawTranscriptEntry).isCompactSummary === true) continue;
       }
 
+      // A folded mid-turn prompt: replay it as the user message it was. The
+      // persisted `source_uuid` is the client-supplied prompt id, so the
+      // replayed turn re-anchors on the same messageId the live view used.
+      if (isQueuedCommandEntry(message as RawTranscriptEntry)) {
+        const entry = message as RawTranscriptEntry;
+        const sourceUuid = entry.attachment?.source_uuid;
+        const queuedMessageId =
+          typeof sourceUuid === "string" && sourceUuid.length > 0 ? sourceUuid : entry.uuid;
+        if (replaySession && queuedMessageId && entry.uuid) {
+          replaySession.messageIdToUuid.set(queuedMessageId, entry.uuid);
+        }
+        for (const notification of toAcpNotifications(
+          queuedCommandPromptToContent(entry.attachment?.prompt),
+          "user",
+          sessionId,
+          toolUseCache,
+          this.client,
+          this.logger,
+          {
+            registerHooks: false,
+            clientCapabilities: this.clientCapabilities,
+            cwd: replaySession?.cwd,
+            taskState: replaySession?.taskState,
+            messageId: queuedMessageId,
+          },
+        )) {
+          await this.client.sessionUpdate(notification);
+        }
+        continue;
+      }
+
       // Backfill the ACP messageId -> SDK uuid mapping for messages we didn't
       // observe live (resumed/loaded sessions), so rewind/resume can translate
       // a client-supplied id without an extra getSessionMessages read. Not read
       // yet (see Session.messageIdToUuid).
       const replayMessageId = messageIdForGrouping(message);
-      const replaySession = this.sessions[sessionId];
       if (replaySession && replayMessageId && message.uuid) {
         replaySession.messageIdToUuid.set(replayMessageId, message.uuid);
       }
@@ -6051,6 +6152,67 @@ function formatUriAsLink(uri: string): string {
   } catch {
     return uri;
   }
+}
+
+/** Convert a persisted `queued_command` attachment's `prompt` payload into
+ *  SDK user-message content blocks for replay. The payload is the prompt the
+ *  client sent (ACP-shaped text/image/resource_link blocks), so this mirrors
+ *  the block mapping of {@link promptToClaude}; SDK-shaped image blocks and
+ *  unrecognized entries pass through / are skipped, so either wire shape
+ *  replays. Unlike promptToClaude there is no context expansion: replay is
+ *  display-only, and a live view of the same turn never showed the expanded
+ *  selection context as a user message either. */
+export function queuedCommandPromptToContent(prompt: unknown): ContentBlockParam[] {
+  if (typeof prompt === "string") {
+    return prompt.length > 0 ? [{ type: "text", text: prompt }] : [];
+  }
+  if (!Array.isArray(prompt)) return [];
+  const content: ContentBlockParam[] = [];
+  for (const chunk of prompt) {
+    if (chunk === null || typeof chunk !== "object") continue;
+    const block = chunk as {
+      type?: unknown;
+      text?: unknown;
+      uri?: unknown;
+      data?: unknown;
+      mimeType?: unknown;
+      source?: unknown;
+      resource?: unknown;
+    };
+    switch (block.type) {
+      case "text":
+        if (typeof block.text === "string" && block.text.length > 0) {
+          content.push({ type: "text", text: block.text });
+        }
+        break;
+      case "resource_link":
+        if (typeof block.uri === "string") {
+          content.push({ type: "text", text: formatUriAsLink(block.uri) });
+        }
+        break;
+      case "image": {
+        // SDK shape ({source: …}) is already replay-ready; the ACP shape
+        // ({data, mimeType} | {uri}) maps exactly like promptToClaude does.
+        if (block.source !== undefined) {
+          content.push(block as unknown as ContentBlockParam);
+        } else if (typeof block.data === "string" && typeof block.mimeType === "string") {
+          content.push({
+            type: "image",
+            source: { type: "base64", data: block.data, media_type: block.mimeType },
+          } as ContentBlockParam);
+        } else if (typeof block.uri === "string" && block.uri.startsWith("http")) {
+          content.push({
+            type: "image",
+            source: { type: "url", url: block.uri },
+          } as ContentBlockParam);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  return content;
 }
 
 export function promptToClaude(prompt: PromptRequest): SDKUserMessage {
