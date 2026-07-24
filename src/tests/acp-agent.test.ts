@@ -42,6 +42,7 @@ import {
   runPromptWithCancellation,
   CLAUDE_CONFIG_DIR,
   COMPACTION_METHOD,
+  RESURRECTION_METHOD,
   rebuildTranscriptDisplayChain,
   isQueuedCommandEntry,
   mergeQueuedCommandAttachments,
@@ -7560,9 +7561,10 @@ describe("post-error recovery", () => {
 });
 
 describe("session/cancel wedge recovery (issue #680)", () => {
-  function createMockAgent() {
+  function createMockAgent(clientOverrides: Record<string, unknown> = {}) {
     const mockClient = {
       sessionUpdate: async () => {},
+      ...clientOverrides,
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -7637,7 +7639,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
     };
-    return { interrupt };
+    return { interrupt, close };
   }
 
   it("resolves the pending prompt with cancelled when the SDK never yields after interrupt", async () => {
@@ -7745,6 +7747,138 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       usage: cancelledTurnUsage,
     });
     expect(agent.sessions["test-session"]).toBeUndefined();
+  });
+
+  /** A healthy stand-in for the resurrected query: echoes each pushed prompt,
+   *  emits a successful result, then goes idle. */
+  function installHealthySession(agent: ClaudeAcpAgent) {
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        while (true) {
+          const next = await iter.next();
+          if (next.done) return;
+          yield userEcho(next.value);
+          yield {
+            type: "result",
+            subtype: "success",
+            stop_reason: "end_turn",
+            is_error: false,
+            result: "ok",
+            errors: [],
+            duration_ms: 1,
+            duration_api_ms: 1,
+            num_turns: 1,
+            total_cost_usd: 0,
+            usage: {
+              input_tokens: 1,
+              output_tokens: 1,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+            modelUsage: {},
+            permission_denials: [],
+            uuid: randomUUID(),
+            session_id: "test-session",
+          };
+          yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        }
+      }
+      return messageGenerator();
+    });
+  }
+
+  it("replays a prompt queued behind a force-cancelled wedge onto the resurrected session", async () => {
+    const extNotification = vi.fn(async () => {});
+    const agent = createMockAgent({ extNotification });
+    agent.forceCancelGraceMs = 20;
+    const { interrupt, close } = injectWedgedSession(agent);
+
+    const stuck = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "stuck grep" }],
+    });
+    await new Promise((r) => setTimeout(r, 5));
+    await agent.cancel({ sessionId: "test-session" });
+
+    // The follow-up lands BETWEEN the cancel and the force-cancel floor: its
+    // user message goes into the wedged query's input buffer, which the wedged
+    // SDK never consumes. Before the resurrection this prompt hung forever.
+    const followUp = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "are you stuck?" }],
+    });
+    await new Promise((r) => setTimeout(r, 5));
+
+    // The resurrection swaps in a healthy query via createSession({ resume }).
+    const createSessionSpy = vi.spyOn(agent as any, "createSession").mockImplementation(async () => {
+      installHealthySession(agent);
+      return { sessionId: "test-session", modes: {}, configOptions: [] } as any;
+    });
+
+    await expect(stuck).resolves.toMatchObject({ stopReason: "cancelled" });
+    await expect(followUp).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(interrupt).toHaveBeenCalled();
+    expect(close).toHaveBeenCalled();
+    expect(createSessionSpy).toHaveBeenCalledWith(expect.anything(), { resume: "test-session" });
+    // The client is told the resurrection is running (with the replay count),
+    // then that it settled — same id across both so the card replaces in place.
+    expect(extNotification).toHaveBeenCalledWith(
+      RESURRECTION_METHOD,
+      expect.objectContaining({ sessionId: "test-session", phase: "start", replayCount: 1 }),
+    );
+    expect(extNotification).toHaveBeenCalledWith(
+      RESURRECTION_METHOD,
+      expect.objectContaining({ sessionId: "test-session", phase: "success" }),
+    );
+    const [startCall] = extNotification.mock.calls.filter(
+      ([, p]: any[]) => p.phase === "start",
+    );
+    const [successCall] = extNotification.mock.calls.filter(
+      ([, p]: any[]) => p.phase === "success",
+    );
+    expect(successCall[1].id).toBe(startCall[1].id);
+  });
+
+  it("lazily resurrects the wedged session when the next prompt arrives after the force-cancel", async () => {
+    const extNotification = vi.fn(async () => {});
+    const agent = createMockAgent({ extNotification });
+    agent.forceCancelGraceMs = 20;
+    const { close } = injectWedgedSession(agent);
+
+    const stuck = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "stuck grep" }],
+    });
+    await new Promise((r) => setTimeout(r, 5));
+    await agent.cancel({ sessionId: "test-session" });
+    await expect(stuck).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    // Past the floor: the wedged query was killed and the session marked for
+    // resurrection, but nothing was queued behind it, so no eager resume ran.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(close).toHaveBeenCalled();
+    expect(agent.sessions["test-session"].queryWedged).toBe(true);
+
+    const createSessionSpy = vi.spyOn(agent as any, "createSession").mockImplementation(async () => {
+      installHealthySession(agent);
+      return { sessionId: "test-session", modes: {}, configOptions: [] } as any;
+    });
+
+    const followUp = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "next question" }],
+    });
+    await expect(followUp).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(createSessionSpy).toHaveBeenCalledWith(expect.anything(), { resume: "test-session" });
+    expect(extNotification).toHaveBeenCalledWith(
+      RESURRECTION_METHOD,
+      expect.objectContaining({ sessionId: "test-session", phase: "start", replayCount: 0 }),
+    );
+    expect(extNotification).toHaveBeenCalledWith(
+      RESURRECTION_METHOD,
+      expect.objectContaining({ sessionId: "test-session", phase: "success" }),
+    );
   });
 });
 
@@ -7921,59 +8055,6 @@ describe("turn abandoned by the SDK (issue #825)", () => {
     });
     expect(third.stopReason).toBe("end_turn");
     expect(third.usage?.inputTokens).toBe(10);
-  });
-
-  it("skips a force-cancelled turn's late result and absorbs its trailer after recovery", async () => {
-    // A wedged turn is settled "cancelled" by the force-cancel backstop; the
-    // SDK later recovers from the wedge and still emits that turn's result
-    // and trailing idle. The late result must be skipped as an orphan — not
-    // promoted onto the next queued prompt (which would settle it with the
-    // stale turn's stop reason and usage) — and its trailer absorbed, not
-    // read as the next turn being abandoned.
-    const agent = createMockAgent();
-    agent.forceCancelGraceMs = 10;
-    let releaseRecovery!: () => void;
-    const recovery = new Promise<void>((resolve) => (releaseRecovery = resolve));
-    const staleResult = createResultMessage();
-    staleResult.usage.input_tokens = 999;
-    injectGeneratorSession(agent, (input) => {
-      async function* messageGenerator() {
-        const iter = input[Symbol.asyncIterator]();
-        const u1 = await iter.next();
-        yield userEcho(u1.value); // turn 1 active
-        await recovery; // wedged: interrupt is a no-op; the backstop settles turn 1
-        yield staleResult; // turn 1's late result — orphan-skipped; trailer now owed
-        const u2 = await iter.next();
-        yield userEcho(u2.value); // turn 2 activates (clears cancelled)
-        yield { type: "system", subtype: "session_state_changed", state: "idle" }; // turn 1's lagged trailer — absorbed
-        yield createResultMessage();
-        yield { type: "system", subtype: "session_state_changed", state: "idle" };
-      }
-      return messageGenerator();
-    });
-
-    const first = agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "first" }],
-    });
-    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
-    await agent.cancel({ sessionId: "test-session" }); // backstop (10ms) settles turn 1
-    await expect(first).resolves.toEqual({
-      stopReason: "cancelled",
-      usage: cancelledTurnUsage,
-    });
-
-    // Queue turn 2 BEFORE the SDK recovers, so the stale result races it.
-    const second = agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "second" }],
-    });
-    releaseRecovery();
-
-    const secondResult = await second;
-    expect(secondResult.stopReason).toBe("end_turn");
-    // Turn 2 settles with its OWN result's usage — not the stale 999.
-    expect(secondResult.usage?.inputTokens).toBe(10);
   });
 
   it("does not leak the owed idle when a cancel lands between a result and its trailer", async () => {

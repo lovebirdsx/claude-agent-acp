@@ -194,6 +194,28 @@ interface CompactionNotification {
 }
 
 /**
+ * Extension notification emitted around a wedged-session resurrection (see
+ * `resurrectWedgedSession`). Shared verbatim with the editor's
+ * `acpExtMethods.ts` — keep both in sync.
+ *
+ * `phase` is `start` when the resume begins, `success`/`failed` when it
+ * settles. `id` is unique per resurrection (a session can be wedged and
+ * resurrected more than once) so the editor can replace the in-progress card
+ * in place with its outcome; `replayCount` tells how many queued prompts are
+ * being replayed onto the fresh query; `reason` carries the failure detail on
+ * `phase: 'failed'`.
+ */
+export const RESURRECTION_METHOD = "_universe/sessionResurrection";
+
+interface SessionResurrectionNotification {
+  sessionId: string;
+  id: string;
+  phase: "start" | "success" | "failed";
+  replayCount?: number;
+  reason?: string;
+}
+
+/**
  * A raw line of the on-disk session transcript
  * (`<CLAUDE_CONFIG_DIR>/projects/<encoded-cwd>/<sessionId>.jsonl`). Only the
  * fields the display-chain rebuild reads are declared; `message` stays
@@ -398,9 +420,11 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
  *  usual path — so this timer is armed and cleared, never fired, on healthy
  *  cancels. It only trips when the SDK is genuinely wedged (e.g. a
  *  `TaskOutput { block: true }` poll against a hung background task — issue
- *  #680) and never yields. The value is deliberately loose: it's an
- *  "obviously stuck" ceiling, not a guess at interrupt latency, so it can't
- *  pre-empt a slow-but-healthy interrupt. */
+ *  #680) and never yields. Tripping kills the wedged query and resurrects the
+ *  session from its on-disk transcript (see cancel()), because a query that
+ *  ignored interrupt() would also swallow every follow-up prompt. The value is
+ *  deliberately loose: it's an "obviously stuck" ceiling, not a guess at
+ *  interrupt latency, so it can't pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
 
 /** Grace window after the SDK goes idle before a queued-but-never-echoed turn is
@@ -443,6 +467,10 @@ type Turn = {
    *  client-supplied ACP `messageId` when one was provided, so rewind/fork can
    *  target this exact turn. */
   promptUuid: string;
+  /** The message pushed onto the SDK input for this turn. Retained so a
+   *  resurrection can re-push turns whose message was swallowed by the wedged
+   *  (never consuming) input of the prior query. */
+  userMessage: SDKUserMessage;
   /** Local-only slash commands (e.g. `/clear`) return a result without an echo,
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
@@ -526,6 +554,18 @@ type Session = {
    *  active turn settles normally so the backstop never fires after a clean
    *  cancel. */
   forceCancelTimer?: ReturnType<typeof setTimeout>;
+  /** Set when the force-cancel floor elapsed with the SDK still wedged: the
+   *  query was killed (see `closeQueryStream`) and the session awaits
+   *  resurrection from its on-disk transcript. The next `prompt()` triggers
+   *  the resume (or shares one already in flight), so a follow-up message
+   *  lands on a fresh query instead of hanging on the dead stream. */
+  queryWedged?: boolean;
+  /** Turns whose user messages were pushed to the wedged query but never
+   *  consumed by it (the SDK was stuck mid-turn), parked when the force-cancel
+   *  floor tripped. Replayed onto the resurrected query so their `prompt()`
+   *  calls complete instead of hanging; their deferreds are still awaited by
+   *  the original callers. */
+  wedgedPendingTurns?: Turn[];
   /** Pending grace-period timer armed at idle when the queue holds a turn the
    *  SDK never echoed. If it fires, that turn is presumed folded into the just-
    *  finished generation (a "steering" prompt the CLI merged) and is settled
@@ -1460,9 +1500,25 @@ export class ClaudeAcpAgent {
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
-    const session = this.sessions[params.sessionId];
+    // A force-cancel that found the SDK wedged kills the query and resurrects
+    // the session from its transcript (see cancel()). Share an in-flight
+    // resurrection — or trigger it lazily when the wedge left nothing queued
+    // behind it — so this prompt lands on the fresh query instead of hanging
+    // on the dead stream or erroring against the husk.
+    const resurrection = this.sessionResurrections.get(params.sessionId);
+    if (resurrection) {
+      await resurrection;
+    }
+    let session = this.sessions[params.sessionId];
     if (!session) {
       throw new Error("Session not found");
+    }
+    if (session.queryWedged) {
+      await this.resurrectWedgedSession(params.sessionId);
+      session = this.sessions[params.sessionId];
+      if (!session) {
+        throw new Error("Session not found");
+      }
     }
     // The SDK query stream already terminated (see `queryClosed`); its iterator
     // can't be revived, so enqueueing here would hang on a deferred that never
@@ -1507,6 +1563,7 @@ export class ClaudeAcpAgent {
     const turn: Turn = {
       promptUuid,
       isLocalOnlyCommand,
+      userMessage,
       settled: false,
       resolve: () => {},
       reject: () => {},
@@ -1767,22 +1824,25 @@ export class ClaudeAcpAgent {
         if (raced === "abort") {
           // cancel()/teardown woke us: settle the active turn "cancelled" per
           // the ACP contract. The SDK never acknowledged this turn (that's why
-          // the force-cancel backstop fired), so if it later recovers from the
-          // wedge it will still emit the turn's result — with no live turn to
-          // match — followed by its trailing idle. Pre-count it as an orphan
-          // so that late result is skipped (not promoted onto the next queued
-          // prompt) and its trailer is recorded as owed, not read as the next
-          // turn being abandoned. Stale counts self-heal: activation resets
-          // them (see activateTurn).
+          // the force-cancel backstop fired), so if it somehow still emits the
+          // turn's late result — the force-cancel path closes the query right
+          // after aborting, so this is purely defensive — it arrives with no
+          // live turn to match, followed by its trailing idle. Pre-count it as
+          // an orphan so that late result is skipped (not promoted onto the
+          // next queued prompt) and its trailer is recorded as owed, not read
+          // as the next turn being abandoned. Stale counts self-heal:
+          // activation resets them (see activateTurn).
           if (session.activeTurn && !session.activeTurn.settled) {
             session.pendingOrphanResults = (session.pendingOrphanResults ?? 0) + 1;
           }
           settleActive({ stopReason: "cancelled", usage: sessionUsage(session) });
-          // If the session is being torn down, abandon the in-flight next()
-          // (swallowing any later rejection so it can't surface as unhandled)
-          // and stop; otherwise re-arm and keep consuming — `pendingNext`
-          // stays in flight so its eventual message is processed, not dropped.
-          if (!this.sessions[params.sessionId]) {
+          // If the session is being torn down — or the force-cancel backstop
+          // killed the wedged query (queryClosed) so a resurrection can replace
+          // it — abandon the in-flight next() (swallowing any later rejection
+          // so it can't surface as unhandled) and stop; otherwise re-arm and
+          // keep consuming — `pendingNext` stays in flight so its eventual
+          // message is processed, not dropped.
+          if (!this.sessions[params.sessionId] || session.queryClosed) {
             void nextMessage.catch(() => {});
             return;
           }
@@ -3077,9 +3137,27 @@ export class ClaudeAcpAgent {
       const cancelController = session.cancelController;
       session.forceCancelTimer = setTimeout(() => {
         this.logger.error(
-          `Session ${params.sessionId}: cancel floor elapsed without the SDK yielding; forcing "cancelled". The underlying query may still be wedged — a new session may be required.`,
+          `Session ${params.sessionId}: cancel floor elapsed without the SDK yielding; forcing "cancelled", killing the wedged query, and resurrecting the session from its transcript.`,
+        );
+        // The query is genuinely wedged: interrupt() could not unwind it, so
+        // it will never yield again. Settling the active turn is not enough —
+        // the dead stream would swallow every follow-up prompt (its input
+        // buffer queues them for a consumer that never wakes). Park the turns
+        // the wedge never consumed, kill the query (terminating the wedged
+        // subprocess), and resurrect the session from its on-disk transcript.
+        session.queryWedged = true;
+        session.wedgedPendingTurns = (session.turnQueue ?? []).filter(
+          (turn) => turn !== session.activeTurn && !turn.settled,
         );
         cancelController.abort();
+        this.closeQueryStream(session);
+        if (session.wedgedPendingTurns.length > 0) {
+          void this.resurrectWedgedSession(params.sessionId).catch((error) => {
+            this.logger.error(
+              `Session ${params.sessionId}: resurrection after wedge failed: ${String(error)}`,
+            );
+          });
+        }
       }, this.forceCancelGraceMs);
     }
 
@@ -3189,6 +3267,103 @@ export class ClaudeAcpAgent {
     session.settingsManager.dispose();
     session.input.end();
     session.query.close();
+  }
+
+  /** Wedged-session resurrections in flight, keyed by session id. The
+   *  force-cancel path (eager replay) and concurrent `prompt()` calls share
+   *  the one resume instead of racing duplicate recreations. */
+  private sessionResurrections = new Map<string, Promise<void>>();
+
+  /** Resurrect a session whose query was killed after a force-cancel found the
+   *  SDK wedged (see cancel()). Idempotent per session: concurrent callers
+   *  share the in-flight resume. */
+  private resurrectWedgedSession(sessionId: string): Promise<void> {
+    let pending = this.sessionResurrections.get(sessionId);
+    if (!pending) {
+      pending = this.doResurrectWedgedSession(sessionId).finally(() => {
+        this.sessionResurrections.delete(sessionId);
+      });
+      this.sessionResurrections.set(sessionId, pending);
+    }
+    return pending;
+  }
+
+  private async doResurrectWedgedSession(sessionId: string): Promise<void> {
+    const wedged = this.sessions[sessionId];
+    if (!wedged?.queryWedged) {
+      // Already resurrected by a concurrent caller, or the session went away.
+      return;
+    }
+    const parkedTurns = wedged.wedgedPendingTurns ?? [];
+    const configSnapshot = this.snapshotRuntimeConfig(wedged);
+    const recreateParams = wedged.newSessionParams ?? { cwd: wedged.cwd, mcpServers: [] };
+    this.logger.error(
+      `Session ${sessionId}: resurrecting from the on-disk transcript (resume) after a wedged query` +
+        (parkedTurns.length > 0 ? `; replaying ${parkedTurns.length} parked prompt(s).` : "."),
+    );
+    const notificationId = randomUUID();
+    await this.notifyResurrection({
+      sessionId,
+      id: notificationId,
+      phase: "start",
+      replayCount: parkedTurns.length,
+    });
+    // The husk's heavy resources were already released by closeQueryStream
+    // when the wedge was detected. Deliberately NOT aborting
+    // `wedged.abortController`: it may be client-supplied
+    // (`_meta.claudeCode.options.abortController`) and is passed through to the
+    // recreated session, so aborting it would birth the fresh query with an
+    // already-aborted signal. The wedged subprocess is gone, so the signal has
+    // nothing left to cancel.
+    delete this.sessions[sessionId];
+    try {
+      await this.createSession(recreateParams, { resume: sessionId });
+    } catch (error) {
+      // Resuming failed (e.g. a corrupt transcript): don't leave the parked
+      // prompts hanging — reject them with the cause and let the error surface
+      // to the triggering prompt() too.
+      for (const turn of parkedTurns) {
+        if (!turn.settled) {
+          turn.settled = true;
+          turn.reject(error);
+        }
+      }
+      await this.notifyResurrection({
+        sessionId,
+        id: notificationId,
+        phase: "failed",
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+    await this.reapplyRuntimeConfig(sessionId, configSnapshot);
+    // Replay the prompts the wedge swallowed: their user messages sat in the
+    // dead query's input buffer and never reached the model, so push them onto
+    // the fresh query in order. The turns' deferreds are still awaited by
+    // their original prompt() calls.
+    const session = this.sessions[sessionId];
+    if (session && parkedTurns.length > 0) {
+      for (const turn of parkedTurns) {
+        if (turn.settled) {
+          continue;
+        }
+        session.messageIdToUuid.set(turn.promptUuid, turn.promptUuid);
+        (session.turnQueue ??= []).push(turn);
+        session.input.push(turn.userMessage);
+      }
+      this.ensureConsumer(session, sessionId);
+    }
+    await this.notifyResurrection({ sessionId, id: notificationId, phase: "success" });
+  }
+
+  /** Best-effort resurrection lifecycle card for the editor's timeline: a
+   *  delivery failure must never break the resume itself. */
+  private async notifyResurrection(params: SessionResurrectionNotification): Promise<void> {
+    try {
+      await this.client.extNotification(RESURRECTION_METHOD, params);
+    } catch (error) {
+      this.logger.error(`Failed to send resurrection notification: ${String(error)}`);
+    }
   }
 
   /** Cleanly tear down a session: cancel in-flight work, release stream
