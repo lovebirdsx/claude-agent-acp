@@ -9,6 +9,7 @@ export default defineConfig({
     watch: false,
     globals: true,
     environment: "node",
+    setupFiles: ["src/tests/setup.ts"],
     // The agent runs `claude auth status` in the background on every
     // initialize and prompt. Pointing it at a CLI that exits at once keeps
     // tests off the machine's real CLI and Claude config, and stops a run
