@@ -100,6 +100,7 @@ import {
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { SettingsManager } from "./settings.js";
+import { resolveSubagentModelEnv } from "./subagent-model.js";
 import {
   accumulateSubagentUsage,
   applyTaskCreate,
@@ -5067,6 +5068,12 @@ export class ClaudeAcpAgent {
         ...process.env,
         ...userProvidedOptions?.env,
         ...createEnvForGateway(this.gatewayAuthRequest),
+        // Fork patch: pin every sub-agent to the session model so the CLI's
+        // first-party-family rewrite can't switch the built-in Explore agent
+        // to "opus" (see subagent-model.ts). Only injected when a session
+        // model resolves and neither the host env nor the caller's env
+        // already sets the var — an explicit setting always wins.
+        ...(resolveSubagentModelEnv(settingsManager, userProvidedOptions?.env) || {}),
         // Opt-in to session state events like when the agent is idle
         CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
       },

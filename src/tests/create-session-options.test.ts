@@ -46,6 +46,7 @@ vi.mock("../tools.js", async () => {
 describe("createSession options merging", () => {
   let agent: ClaudeAcpAgentType;
   let ClaudeAcpAgent: typeof ClaudeAcpAgentType;
+  let emptyConfigDir: string;
 
   function createMockClient(): AcpClient {
     return {
@@ -59,11 +60,21 @@ describe("createSession options merging", () => {
   beforeEach(async () => {
     capturedOptions = undefined;
 
+    // CLAUDE_CONFIG_DIR is read once at module import; point it at an empty
+    // dir by default so a developer's own ~/.claude/settings.json (which may
+    // pin `model`) never leaks into option assertions.
+    emptyConfigDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "acp-cfg-"));
+    vi.stubEnv("CLAUDE_CONFIG_DIR", emptyConfigDir);
+
     vi.resetModules();
     const acpAgent = await import("../acp-agent.js");
     ClaudeAcpAgent = acpAgent.ClaudeAcpAgent;
 
     agent = new ClaudeAcpAgent(createMockClient());
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   it("forwards user-provided disallowedTools without re-adding AskUserQuestion", async () => {
@@ -167,10 +178,53 @@ describe("createSession options merging", () => {
       },
     });
 
-    // User's PreToolUse hooks should be preserved
-    expect(capturedOptions!.hooks?.PreToolUse).toEqual([userPreToolUseHook]);
+    // User's PreToolUse hooks are preserved
+    expect(capturedOptions!.hooks?.PreToolUse).toHaveLength(1);
+    expect(capturedOptions!.hooks?.PreToolUse?.[0]).toEqual(userPreToolUseHook);
     // PostToolUse should contain both user and ACP hooks
     expect(capturedOptions!.hooks?.PostToolUse).toHaveLength(2);
+  });
+
+  it("injects CLAUDE_CODE_SUBAGENT_MODEL pinned to the session model", async () => {
+    vi.stubEnv("ANTHROPIC_MODEL", "kimi-k3[1m]");
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect(capturedOptions!.env?.CLAUDE_CODE_SUBAGENT_MODEL).toBe("kimi-k3[1m]");
+  });
+
+  it("does not override a caller-provided CLAUDE_CODE_SUBAGENT_MODEL", async () => {
+    vi.stubEnv("ANTHROPIC_MODEL", "kimi-k3[1m]");
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            env: {
+              CLAUDE_CODE_SUBAGENT_MODEL: "claude-sonnet-4-6",
+            },
+          },
+        },
+      },
+    });
+
+    expect(capturedOptions!.env?.CLAUDE_CODE_SUBAGENT_MODEL).toBe("claude-sonnet-4-6");
+  });
+
+  it("does not override a host-provided CLAUDE_CODE_SUBAGENT_MODEL", async () => {
+    vi.stubEnv("ANTHROPIC_MODEL", "kimi-k3[1m]");
+    vi.stubEnv("CLAUDE_CODE_SUBAGENT_MODEL", "claude-sonnet-4-6");
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect(capturedOptions!.env?.CLAUDE_CODE_SUBAGENT_MODEL).toBe("claude-sonnet-4-6");
+  });
+
+  it("omits CLAUDE_CODE_SUBAGENT_MODEL when no session model can be resolved", async () => {
+    vi.stubEnv("ANTHROPIC_MODEL", "");
+    const emptyCwd = await fs.promises.mkdtemp(path.join(os.tmpdir(), "acp-nomodel-"));
+    await agent.newSession({ cwd: emptyCwd, mcpServers: [] });
+
+    expect(capturedOptions!.env?.CLAUDE_CODE_SUBAGENT_MODEL).toBeUndefined();
   });
 
   it("inherits HOME and PATH from process.env when no env is provided", async () => {
