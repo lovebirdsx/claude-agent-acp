@@ -11,6 +11,7 @@ import {
   AgentInput,
   AgentOutput,
   AskUserQuestionInput,
+  AskUserQuestionOutput,
   BashInput,
   BashOutput,
   FileEditInput,
@@ -903,6 +904,25 @@ export function toolUpdateFromToolResult(
       return { title: "Exited Plan Mode" };
     }
 
+    case "AskUserQuestion": {
+      // The raw tool_result text is one model-directed blob: every question
+      // and its answer flattened into a single line, plus a trailer meant
+      // only for the model. Rebuild a readable per-question view: prefer the
+      // structured AskUserQuestionOutput; on replayed sessions
+      // tool_use_result is absent, so fall back to re-slicing the raw blob
+      // using the structured questions from the cached tool_use as anchors.
+      const text =
+        formatAskUserQuestionResult(structuredResult<AskUserQuestionOutput>(toolUseResult)) ??
+        parseRawAskUserQuestionResult(
+          flattenRawText(toolResult.content),
+          (toolUse?.input as Partial<AskUserQuestionInput> | undefined)?.questions,
+        );
+      if (text !== undefined) {
+        return { content: [{ type: "content", content: { type: "text", text } }] };
+      }
+      return rawContentUpdate();
+    }
+
     case "WebSearch": {
       // The raw tool_result text is a model-directed dump ("Web search
       // results for query: …\n\nLinks: [{…json…}]"). The structured
@@ -949,6 +969,160 @@ export function toolUpdateFromToolResult(
  *  the two paths can't drift. */
 function formatWebSearchHit(hit: { title: string; url: string }): string {
   return `${hit.title} (${hit.url})`;
+}
+
+interface AskAnswerEntry {
+  readonly question: string;
+  /** Absent/empty means the user skipped the question. */
+  readonly answer?: string;
+  readonly notes?: string;
+}
+
+/** One display section per question: quoted question, then the bold answer.
+ *  Answers/questions are natural language — embedded markdown (inline code
+ *  etc.) renders fine in the client's chat view, so pass it through. */
+function renderAskSections(entries: readonly AskAnswerEntry[]): string {
+  return entries
+    .map((entry) => {
+      const lines = [quoteLines(entry.question)];
+      lines.push(
+        `**答案**：${
+          entry.answer !== undefined && entry.answer.length > 0 ? entry.answer : "（跳过）"
+        }`,
+      );
+      if (entry.notes !== undefined && entry.notes.length > 0) {
+        lines.push(`**补充**：${entry.notes}`);
+      }
+      return lines.join("\n");
+    })
+    .join("\n\n");
+}
+
+/**
+ * Rebuild the AskUserQuestion tool_result from its structured output. Returns
+ * undefined when the structured output is missing or off-shape (replayed
+ * sessions don't carry tool_use_result), so the caller falls back to
+ * {@link parseRawAskUserQuestionResult}. `annotations[question].notes`
+ * carries a free-text note the user attached to their pick; `response` is a
+ * whole-form free-text reply — both surface when present.
+ */
+function formatAskUserQuestionResult(
+  output: AskUserQuestionOutput | undefined,
+): string | undefined {
+  if (
+    output === undefined ||
+    !Array.isArray(output.questions) ||
+    output.questions.length === 0 ||
+    output.answers === null ||
+    typeof output.answers !== "object"
+  ) {
+    return undefined;
+  }
+  const entries: AskAnswerEntry[] = [];
+  for (const question of output.questions) {
+    if (typeof question?.question !== "string") {
+      continue;
+    }
+    const answer = output.answers[question.question];
+    const notes = output.annotations?.[question.question]?.notes;
+    entries.push({
+      question: question.question,
+      ...(typeof answer === "string" ? { answer } : {}),
+      ...(typeof notes === "string" && notes.length > 0 ? { notes } : {}),
+    });
+  }
+  if (entries.length === 0) {
+    return undefined;
+  }
+  const body = renderAskSections(entries);
+  const response = output.response;
+  return typeof response === "string" && response.length > 0
+    ? `${body}\n\n**回答**：${response}`
+    : body;
+}
+
+/**
+ * Replay fallback for {@link formatAskUserQuestionResult}: re-slice the raw
+ * model-facing blob (`… answered: "Q"="A", "Q"="A". <trailer>`) using the
+ * structured question list from the cached tool_use as anchors. The blob's
+ * prefix/trailer prose varies across CLI versions, so the parse keys only on
+ * the `"Q"="A"` quoting structure: each answer runs from its question's
+ * anchor to the next question's anchor — or, for the last one, to the blob's
+ * closing quote (the known trailers carry no `"`). Any mismatch (question
+ * edited/escaped in the blob, unexpected shape) discards the whole parse and
+ * the caller renders the raw blob, no worse than before.
+ */
+function parseRawAskUserQuestionResult(
+  rawText: string | undefined,
+  questions: ReadonlyArray<{ question?: unknown }> | undefined,
+): string | undefined {
+  if (rawText === undefined || !Array.isArray(questions) || questions.length === 0) {
+    return undefined;
+  }
+  const entries: AskAnswerEntry[] = [];
+  let from = 0;
+  for (let i = 0; i < questions.length; i++) {
+    const question = questions[i]?.question;
+    if (typeof question !== "string" || question.length === 0) {
+      return undefined;
+    }
+    const anchor = `"${question}"="`;
+    const at = rawText.indexOf(anchor, from);
+    if (at === -1) {
+      return undefined;
+    }
+    const answerStart = at + anchor.length;
+    let answerEnd: number;
+    if (i + 1 < questions.length) {
+      const nextQuestion = questions[i + 1]?.question;
+      if (typeof nextQuestion !== "string" || nextQuestion.length === 0) {
+        return undefined;
+      }
+      const next = rawText.indexOf(`", "${nextQuestion}"="`, answerStart);
+      if (next === -1) {
+        return undefined;
+      }
+      answerEnd = next;
+      from = next + 3;
+    } else {
+      answerEnd = rawText.lastIndexOf('"');
+      if (answerEnd < answerStart) {
+        return undefined;
+      }
+    }
+    entries.push({ question, answer: rawText.slice(answerStart, answerEnd) });
+  }
+  return entries.length > 0 ? renderAskSections(entries) : undefined;
+}
+
+/** Flatten a tool_result's content (plain string or block array) to text. */
+function flattenRawText(content: unknown): string | undefined {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+  const texts: string[] = [];
+  for (const block of content) {
+    if (
+      typeof block === "object" &&
+      block !== null &&
+      (block as { type?: unknown }).type === "text" &&
+      typeof (block as { text?: unknown }).text === "string"
+    ) {
+      texts.push((block as { text: string }).text);
+    }
+  }
+  return texts.length > 0 ? texts.join("\n") : undefined;
+}
+
+/** Prefix every line with `> ` so a multi-line text stays a single quote block. */
+function quoteLines(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n");
 }
 
 function toAcpContentUpdate(

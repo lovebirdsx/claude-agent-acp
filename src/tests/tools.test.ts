@@ -3316,3 +3316,257 @@ describe("accumulateSubagentUsage", () => {
     });
   });
 });
+
+describe("AskUserQuestion tool_result rendering from tool_use_result", () => {
+  const askToolUse = {
+    type: "tool_use" as const,
+    id: "toolu_ask",
+    name: "AskUserQuestion",
+    input: {
+      questions: [
+        {
+          question: "Which approach should we take?",
+          header: "Approach",
+          options: [
+            { label: "Option A", description: "The safe one" },
+            { label: "Option B", description: "The fast one" },
+          ],
+        },
+      ],
+    },
+  };
+
+  // The raw result is a single model-directed blob: questions and answers
+  // flattened into one line plus a trailer meant only for the model.
+  const rawAskResult: ToolResultBlockParam = {
+    type: "tool_result",
+    tool_use_id: "toolu_ask",
+    content:
+      'The user answered: "Which approach should we take?"="Option A". Read the answers ' +
+      "carefully — they may request clarification, changes, or that you not proceed — and " +
+      "follow what they actually say.",
+  };
+
+  const askStructured = {
+    questions: [
+      {
+        question: "Which approach should we take?",
+        header: "Approach",
+        options: [
+          { label: "Option A", description: "The safe one" },
+          { label: "Option B", description: "The fast one" },
+        ],
+        multiSelect: false,
+      },
+    ],
+    answers: { "Which approach should we take?": "Option A" },
+  };
+
+  it("renders the quoted question followed by the answer in bold", () => {
+    const update = toolUpdateFromToolResult(rawAskResult, askToolUse, false, askStructured);
+
+    expect(update).toEqual({
+      content: [
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text: "> Which approach should we take?\n**答案**：Option A",
+          },
+        },
+      ],
+    });
+  });
+
+  it("separates multiple questions with a blank line and marks skipped answers", () => {
+    const update = toolUpdateFromToolResult(rawAskResult, askToolUse, false, {
+      questions: [
+        { ...askStructured.questions[0] },
+        { ...askStructured.questions[0], question: "Which deadline works?" },
+      ],
+      answers: { "Which approach should we take?": "Option A" },
+    });
+
+    expect(update).toEqual({
+      content: [
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text:
+              "> Which approach should we take?\n**答案**：Option A\n\n" +
+              "> Which deadline works?\n**答案**：（跳过）",
+          },
+        },
+      ],
+    });
+  });
+
+  it("surfaces per-question notes and a whole-form free-text response", () => {
+    const update = toolUpdateFromToolResult(rawAskResult, askToolUse, false, {
+      ...askStructured,
+      annotations: { "Which approach should we take?": { notes: "A 的风险更可控" } },
+      response: "两者结合，先 A 后 B",
+    });
+
+    expect(update).toEqual({
+      content: [
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text:
+              "> Which approach should we take?\n**答案**：Option A\n**补充**：A 的风险更可控\n\n" +
+              "**回答**：两者结合，先 A 后 B",
+          },
+        },
+      ],
+    });
+  });
+
+  it("keeps multi-line questions inside a single quote block", () => {
+    const update = toolUpdateFromToolResult(rawAskResult, askToolUse, false, {
+      questions: [{ ...askStructured.questions[0], question: "First line?\nSecond line?" }],
+      answers: { "First line?\nSecond line?": "Option A" },
+    });
+
+    expect(update).toEqual({
+      content: [
+        {
+          type: "content",
+          content: { type: "text", text: "> First line?\n> Second line?\n**答案**：Option A" },
+        },
+      ],
+    });
+  });
+
+  it("passes embedded markdown through in answers and questions", () => {
+    const update = toolUpdateFromToolResult(rawAskResult, askToolUse, false, {
+      questions: [{ ...askStructured.questions[0], question: "Pick **one**?" }],
+      answers: { "Pick **one**?": "Use `a*b` [link](x)" },
+    });
+
+    expect(update).toEqual({
+      content: [
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text: "> Pick **one**?\n**答案**：Use `a*b` [link](x)",
+          },
+        },
+      ],
+    });
+  });
+
+  it("rebuilds sections from the raw blob when tool_use_result is absent (replay)", () => {
+    // Replayed sessions carry no structured output; the cached tool_use's
+    // questions anchor a re-slice of the model-facing blob.
+    const update = toolUpdateFromToolResult(rawAskResult, askToolUse, false);
+
+    expect(update).toEqual({
+      content: [
+        {
+          type: "content",
+          content: { type: "text", text: "> Which approach should we take?\n**答案**：Option A" },
+        },
+      ],
+    });
+  });
+
+  it("rebuilds sections from the raw blob when the structured output is off-shape", () => {
+    const update = toolUpdateFromToolResult(rawAskResult, askToolUse, false, {
+      answers: { "Which approach should we take?": "Option A" },
+    });
+
+    expect(update).toEqual({
+      content: [
+        {
+          type: "content",
+          content: { type: "text", text: "> Which approach should we take?\n**答案**：Option A" },
+        },
+      ],
+    });
+  });
+
+  it("rebuilds multi-question sections from the raw blob (current CLI wording)", () => {
+    // A comma-joined multi-select answer stays inside its own quotes — only
+    // the `", "` between entries separates questions.
+    const multiToolUse = {
+      ...askToolUse,
+      input: {
+        questions: [
+          { ...askStructured.questions[0], question: "你最喜欢的编程语言是什么？" },
+          { ...askStructured.questions[0], question: "你在代码审查中最关注什么？" },
+        ],
+      },
+    };
+    const blob =
+      'Your questions have been answered: "你最喜欢的编程语言是什么？"="JavaScript", ' +
+      '"你在代码审查中最关注什么？"="代码功能正确性, 代码可读性和维护性, 安全性". ' +
+      "You can now continue with these answers in mind.";
+    const update = toolUpdateFromToolResult(
+      { type: "tool_result", tool_use_id: "toolu_ask", content: blob },
+      multiToolUse,
+      false,
+    );
+
+    expect(update).toEqual({
+      content: [
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text:
+              "> 你最喜欢的编程语言是什么？\n**答案**：JavaScript\n\n" +
+              "> 你在代码审查中最关注什么？\n**答案**：代码功能正确性, 代码可读性和维护性, 安全性",
+          },
+        },
+      ],
+    });
+  });
+
+  it("rebuilds sections from block-array content on replay", () => {
+    const update = toolUpdateFromToolResult(
+      {
+        type: "tool_result",
+        tool_use_id: "toolu_ask",
+        content: [{ type: "text", text: rawAskResult.content as string }],
+      },
+      askToolUse,
+      false,
+    );
+
+    expect(update).toEqual({
+      content: [
+        {
+          type: "content",
+          content: { type: "text", text: "> Which approach should we take?\n**答案**：Option A" },
+        },
+      ],
+    });
+  });
+
+  it("renders the raw blob when the questions don't anchor it", () => {
+    const skipped: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_ask",
+      content: "The user skipped all questions.",
+    };
+    const update = toolUpdateFromToolResult(skipped, askToolUse, false);
+
+    expect(update).toEqual({
+      content: [
+        { type: "content", content: { type: "text", text: "The user skipped all questions." } },
+      ],
+    });
+  });
+
+  it("renders the raw blob when the cached tool_use carries no questions", () => {
+    const update = toolUpdateFromToolResult(rawAskResult, { ...askToolUse, input: {} }, false);
+
+    expect(update).toEqual({
+      content: [{ type: "content", content: { type: "text", text: rawAskResult.content } }],
+    });
+  });
+});
