@@ -99,6 +99,53 @@ describe("compareWithBaseline", () => {
     });
   });
 
+  describe("AskUserQuestion result", () => {
+    const askCall = update({
+      sessionUpdate: "tool_call",
+      toolCallId: "t",
+      title: "Asking for your input",
+      status: "pending",
+      _meta: { claudeCode: { toolName: "AskUserQuestion" } },
+    });
+    const questionText = 'User has answered your questions: "Which database?"="Postgres".';
+    const rawResult = update({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "t",
+      status: "completed",
+      content: [{ type: "content", content: { type: "text", text: questionText } }],
+    });
+    const renderedResult = update({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "t",
+      status: "completed",
+      content: [{ type: "content", content: { type: "text", text: "> Which database?\n**答案**：Postgres" } }],
+    });
+
+    it("accepts the readable rewrite of the answers", () => {
+      expect(compareWithBaseline([askCall, rawResult], [askCall, renderedResult])).toEqual([]);
+    });
+
+    it("still reports a change outside the content", () => {
+      const changed = update({ ...renderedResult, rawOutput: "other" });
+      expect(compareWithBaseline([askCall, rawResult], [askCall, changed])).toContainEqual(
+        expect.stringMatching(/but the adapter sent .*"rawOutput":"other"/u),
+      );
+    });
+
+    it("reports the rewrite of a tool that is not AskUserQuestion", () => {
+      const readCall = update({
+        sessionUpdate: "tool_call",
+        toolCallId: "t",
+        title: "Read",
+        status: "pending",
+        _meta: { claudeCode: { toolName: "Read" } },
+      });
+      expect(compareWithBaseline([readCall, rawResult], [readCall, renderedResult])).toContainEqual(
+        expect.stringMatching(/^origin\/main sent .*but the adapter sent /u),
+      );
+    });
+  });
+
   describe("available_commands_update", () => {
     const commands = (...names: string[]) =>
       update({

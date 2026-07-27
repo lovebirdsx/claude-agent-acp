@@ -31,6 +31,9 @@
  *   response to `session/load` is still on its way. The adapter reports the
  *   context window of the session it restored; origin/main reported it only
  *   from the next prompt on.
+ * - The result of an `AskUserQuestion` carries the adapter's readable
+ *   per-question view (see {@link askUserQuestionResult}) instead of the
+ *   model-directed raw text origin/main showed. The answers are the same.
  * - The spawning card of a sub-agent or background task stays `in_progress`
  *   until the `task_notification` settles it (see {@link backgroundSettle}).
  *   A `tool_call_update` that origin/main reported as `completed` therefore
@@ -192,6 +195,17 @@ function backgroundSettle(update: Json): boolean {
   );
 }
 
+/**
+ * Whether the update is the adapter's readable rewrite of an
+ * `AskUserQuestion` result: one quoted question per line with the picked
+ * answer, instead of the model-directed blob origin/main showed. The rewrite
+ * carries the same answers, so the `content` of such an update may differ.
+ */
+function askUserQuestionResult(update: Json): boolean {
+  const claudeCode = ((update._meta ?? {}) as Json).claudeCode as Json | undefined;
+  return update.sessionUpdate === "tool_call_update" && claudeCode?.toolName === "AskUserQuestion";
+}
+
 /** The key and the text of a subagent message or thought chunk. */
 function subagentChunk(update: Json | undefined): { key: string; text: string } | undefined {
   if (
@@ -330,8 +344,15 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
       const held = state.get(want.toolCallId as string) ?? new Map<string, string>();
       const w = flatten(want);
       const g = flatten(got);
+      // The adapter renders the AskUserQuestion result itself (see
+      // {@link askUserQuestionResult}); the tool name sits in the card state.
+      const askResult =
+        askUserQuestionResult(want) ||
+        askUserQuestionResult(got) ||
+        held.get("_meta.claudeCode.toolName") === canonical("AskUserQuestion");
       for (const [key, value] of g) {
         if (w.get(key) === value) continue;
+        if (key === "content" && askResult) continue;
         // A card that stays `in_progress` until its `task_notification`
         // reports `in_progress` where origin/main completed.
         if (
@@ -346,6 +367,7 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
       }
       for (const [key, value] of w) {
         if (g.has(key)) continue;
+        if (key === "content" && askResult) continue;
         if (isMeta(key) || held.get(key) !== value) {
           // The card stays `in_progress` here: the terminal status goes out
           // later, in the settle report of the `task_notification`.
@@ -391,7 +413,9 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
     if (want?.sessionUpdate !== "tool_call_update") return false;
     const held = state.get(want.toolCallId as string);
     if (!held) return false;
+    const askResult = held.get("_meta.claudeCode.toolName") === canonical("AskUserQuestion");
     for (const [key, value] of flatten(want)) {
+      if (key === "content" && askResult) continue;
       if (isMeta(key) || held.get(key) !== value) return false;
     }
     return true;
