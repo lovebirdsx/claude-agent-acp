@@ -1357,5 +1357,47 @@ describe("session config options", () => {
       const optionIds = capturedPermissionRequest.options.map((o: any) => o.optionId);
       expect(optionIds).toContain("auto");
     });
+
+    // Regression: `updatedPermissions: suggestions ?? [setMode]` silently dropped
+    // the user's chosen mode whenever the SDK passed suggestions — an empty
+    // array is truthy so `??` never fell back, leaving the session in default
+    // mode and writes prompting right after plan exit.
+    const MODE_SWITCH_CASES: Array<{ label: string; suggestions: any[] }> = [
+      { label: "an empty suggestions array", suggestions: [] },
+      {
+        label: "a conflicting CLI-suggested setMode",
+        suggestions: [{ type: "setMode", mode: "acceptEdits", destination: "session" }],
+      },
+    ];
+    for (const { label, suggestions } of MODE_SWITCH_CASES) {
+      it(`applies the user's selected mode despite ${label}`, async () => {
+        const session = (agent as unknown as { sessions: Record<string, any> }).sessions[
+          SESSION_ID
+        ];
+        session.modes = {
+          currentModeId: "plan",
+          availableModes: [
+            { id: "default", name: "Default", description: "Standard" },
+            { id: "acceptEdits", name: "Accept Edits", description: "Auto-accept edits" },
+            { id: "bypassPermissions", name: "Bypass", description: "Bypass permissions" },
+            { id: "plan", name: "Plan Mode", description: "Planning mode" },
+          ],
+        };
+        permissionResponse = { outcome: { outcome: "selected", optionId: "bypassPermissions" } };
+        session.emittedToolCalls.add("toolu_mode");
+
+        const canUseTool = (agent as any).canUseTool(SESSION_ID);
+        const result = await canUseTool(
+          "ExitPlanMode",
+          { plan: "do stuff" },
+          { signal: new AbortController().signal, suggestions, toolUseID: "toolu_mode" },
+        );
+
+        expect(result.behavior).toBe("allow");
+        expect(result.updatedPermissions).toEqual([
+          { type: "setMode", mode: "bypassPermissions", destination: "session" },
+        ]);
+      });
+    }
   });
 });

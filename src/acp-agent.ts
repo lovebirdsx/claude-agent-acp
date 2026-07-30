@@ -6006,9 +6006,13 @@ export class ClaudeAcpAgent {
           return {
             behavior: "allow",
             updatedInput: toolInput,
-            updatedPermissions: suggestions ?? [
-              { type: "setMode", mode: selectedMode, destination: "session" },
-            ],
+            // The user's chosen mode is the whole point of this branch — never
+            // defer to `suggestions` here. An empty array is truthy (so
+            // `suggestions ?? fallback` would NOT fall back), and the CLI's own
+            // suggested setMode is its default, not the user's pick: either way
+            // a bypassPermissions choice would be silently dropped, leaving the
+            // session in default mode and writes prompting right after plan exit.
+            updatedPermissions: [{ type: "setMode", mode: selectedMode, destination: "session" }],
           };
         } else {
           return {
