@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { SessionNotification } from "@agentclientprotocol/sdk";
+import type { RequestPermissionResponse } from "@agentclientprotocol/sdk";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import { makeMockQuery } from "./helpers.js";
+import { PERMISSION_OPTION_ID } from "../permissions/options.js";
 
 const { registerHookCallbackSpy } = vi.hoisted(() => ({
   registerHookCallbackSpy: vi.fn(),
@@ -80,6 +82,7 @@ describe("session config options", () => {
   let agent: ClaudeAcpAgentType;
   let ClaudeAcpAgent: typeof ClaudeAcpAgentType;
   let sessionUpdates: SessionNotification[];
+  let permissionResponse: RequestPermissionResponse;
   let createSessionSpy: ReturnType<typeof vi.fn>;
   let setPermissionModeSpy: ReturnType<typeof vi.fn>;
   let setModelSpy: ReturnType<typeof vi.fn>;
@@ -90,7 +93,7 @@ describe("session config options", () => {
       sessionUpdate: async (notification: SessionNotification) => {
         sessionUpdates.push(notification);
       },
-      requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
+      requestPermission: async () => permissionResponse,
       readTextFile: async () => ({ content: "" }),
       writeTextFile: async () => ({}),
     } as unknown as AcpClient;
@@ -129,6 +132,7 @@ describe("session config options", () => {
 
   beforeEach(async () => {
     sessionUpdates = [];
+    permissionResponse = { outcome: { outcome: "cancelled" } };
     registerHookCallbackSpy.mockClear();
 
     vi.resetModules();
@@ -1452,5 +1456,49 @@ describe("session config options", () => {
         ),
       ).toHaveLength(1);
     });
+
+    // Regression: `updatedPermissions: suggestions ?? [setMode]` silently dropped
+    // the user's chosen mode whenever the SDK passed suggestions — an empty
+    // array is truthy so `??` never fell back, leaving the session in default
+    // mode and writes prompting right after plan exit.
+    const MODE_SWITCH_CASES: Array<{ label: string; suggestions: any[] }> = [
+      { label: "an empty suggestions array", suggestions: [] },
+      {
+        label: "a conflicting CLI-suggested setMode",
+        suggestions: [{ type: "setMode", mode: "acceptEdits", destination: "session" }],
+      },
+    ];
+    for (const { label, suggestions } of MODE_SWITCH_CASES) {
+      it(`applies the user's selected mode despite ${label}`, async () => {
+        const session = (agent as unknown as { sessions: Record<string, any> }).sessions[
+          SESSION_ID
+        ];
+        session.modes = {
+          currentModeId: "plan",
+          availableModes: [
+            { id: "default", name: "Default", description: "Standard" },
+            { id: "acceptEdits", name: "Accept Edits", description: "Auto-accept edits" },
+            { id: "bypassPermissions", name: "Bypass", description: "Bypass permissions" },
+            { id: "plan", name: "Plan Mode", description: "Planning mode" },
+          ],
+        };
+        permissionResponse = {
+          outcome: { outcome: "selected", optionId: PERMISSION_OPTION_ID.exitPlanBypass },
+        };
+        session.emittedToolCalls.add("toolu_mode");
+
+        const canUseTool = (agent as any).canUseTool(SESSION_ID);
+        const result = await canUseTool(
+          "ExitPlanMode",
+          { plan: "do stuff" },
+          { signal: new AbortController().signal, suggestions, toolUseID: "toolu_mode" },
+        );
+
+        expect(result.behavior).toBe("allow");
+        expect(result.updatedPermissions).toEqual([
+          { type: "setMode", mode: "bypassPermissions", destination: "session" },
+        ]);
+      });
+    }
   });
 });
