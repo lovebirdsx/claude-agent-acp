@@ -5665,6 +5665,26 @@ export class ClaudeAcpAgent {
       fullChain ??
       mergeQueuedCommandAttachments(await getSessionMessages(sessionId), rawEntries ?? []);
 
+    // Parallel tool_use entries from one assistant turn are persisted as a
+    // chain (use1 -> use2 -> ...), each tool_result parenting onto its own
+    // use. The single-parent display walk follows only the LAST use's result
+    // branch, so the results of every earlier parallel use never replay and
+    // their cards would stay pending in the client forever. Track what this
+    // replay surfaces/settles, then backfill the forked-off results below.
+    const surfacedToolCalls = new Set<string>();
+    const settledToolCalls = new Set<string>();
+    const trackToolCallLifecycle = (notification: SessionNotification): void => {
+      const update = notification.update;
+      if (update.sessionUpdate === "tool_call") {
+        surfacedToolCalls.add(update.toolCallId);
+      } else if (
+        update.sessionUpdate === "tool_call_update" &&
+        (update.status === "completed" || update.status === "failed")
+      ) {
+        settledToolCalls.add(update.toolCallId);
+      }
+    };
+
     for (const message of messages) {
       // Rewind (回退) truncates the conversation to *before* the anchored user
       // turn. `resumeSessionAt` only truncates the in-memory Query — the on-disk
@@ -5719,6 +5739,7 @@ export class ClaudeAcpAgent {
             messageId: queuedMessageId,
           },
         )) {
+          trackToolCallLifecycle(notification);
           await this.client.sessionUpdate(notification);
         }
         continue;
@@ -5770,8 +5791,80 @@ export class ClaudeAcpAgent {
           parentToolUseId,
         },
       )) {
+        trackToolCallLifecycle(notification);
         await this.client.sessionUpdate(notification);
       }
+    }
+
+    await this.backfillForkedToolResults(
+      sessionId,
+      rawEntries,
+      surfacedToolCalls,
+      settledToolCalls,
+      toolUseCache,
+    );
+  }
+
+  /**
+   * Backfill tool_result blocks that fork off the single-parent display chain
+   * (see the tracking note in {@link replaySessionHistory}). The replayed
+   * `tool_call` is already on the client's timeline; only its result never
+   * arrived, so we re-emit just those result blocks — replaying the whole
+   * entry would duplicate any text it also carries, and re-emitting results
+   * the chain already settled would double-close those calls. Calls whose
+   * result is genuinely absent from the transcript (killed mid-turn) are left
+   * alone: there is nothing truthful to settle them with here.
+   */
+  private async backfillForkedToolResults(
+    sessionId: string,
+    rawEntries: RawTranscriptEntry[] | undefined,
+    surfacedToolCalls: Set<string>,
+    settledToolCalls: Set<string>,
+    toolUseCache: ToolUseCache,
+  ): Promise<void> {
+    if (rawEntries === undefined) return;
+    const orphaned = new Set(
+      [...surfacedToolCalls].filter((id) => !settledToolCalls.has(id)),
+    );
+    if (orphaned.size === 0) return;
+
+    let backfilled = 0;
+    for (const entry of rawEntries) {
+      if (entry.type !== "user" || !isDisplayMessageEntry(entry)) continue;
+      const content: unknown = (entry.message as { content?: unknown } | undefined)?.content;
+      if (!Array.isArray(content)) continue;
+      const blocks = content.filter((block) => {
+        if (typeof block !== "object" || block === null) return false;
+        const b = block as { type?: unknown; tool_use_id?: unknown };
+        return (
+          b.type === "tool_result" &&
+          typeof b.tool_use_id === "string" &&
+          orphaned.has(b.tool_use_id)
+        );
+      }) as ContentBlockParam[];
+      if (blocks.length === 0) continue;
+      for (const notification of toAcpNotifications(
+        blocks,
+        "user",
+        sessionId,
+        toolUseCache,
+        this.client,
+        this.logger,
+        {
+          registerHooks: false,
+          clientCapabilities: this.clientCapabilities,
+          cwd: this.sessions[sessionId]?.cwd,
+          taskState: this.sessions[sessionId]?.taskState,
+        },
+      )) {
+        await this.client.sessionUpdate(notification);
+      }
+      backfilled += blocks.length;
+    }
+    if (backfilled > 0) {
+      this.logger.log(
+        `replay: backfilled ${backfilled} tool_result(s) forked off the display chain for ${sessionId}`,
+      );
     }
   }
 

@@ -13583,6 +13583,178 @@ describe("replaySessionHistory across compaction (full transcript replay)", () =
   });
 });
 
+describe("replaySessionHistory: tool_results forked off the display chain", () => {
+  // Parallel tool_use entries from one assistant turn are persisted as a
+  // chain (use1 -> use2 -> ...), and each tool_result parents onto its own
+  // use. The single-parent display walk follows the LAST use's result branch,
+  // so the results of every EARLIER parallel use are unreachable on the chain —
+  // the replayed session then leaves those tool cards pending forever.
+  type ReplayEvent =
+    | { kind: "tool_call"; id: string }
+    | { kind: "tool_call_update"; id: string; status: unknown };
+
+  function createRecordingAgent() {
+    const events: ReplayEvent[] = [];
+    const client = {
+      sessionUpdate: async (notification: SessionNotification) => {
+        const update = notification.update;
+        if (update.sessionUpdate === "tool_call") {
+          events.push({ kind: "tool_call", id: update.toolCallId });
+        } else if (update.sessionUpdate === "tool_call_update") {
+          events.push({ kind: "tool_call_update", id: update.toolCallId, status: update.status });
+        }
+      },
+      extNotification: async () => {},
+    } as unknown as AcpClient;
+    return { agent: new ClaudeAcpAgent(client, { log: () => {}, error: () => {} }), events };
+  }
+
+  let sessionId: string;
+  let projectDir: string;
+  let transcript: string;
+
+  beforeEach(async () => {
+    sessionId = randomUUID();
+    projectDir = nodePath.join(
+      CLAUDE_CONFIG_DIR,
+      "projects",
+      `__forked_result_replay_test_${randomUUID()}`,
+    );
+    await nodeFs.mkdir(projectDir, { recursive: true });
+    transcript = nodePath.join(projectDir, `${sessionId}.jsonl`);
+  });
+
+  afterEach(async () => {
+    await nodeFs.rm(projectDir, { recursive: true, force: true });
+  });
+
+  function line(obj: Record<string, unknown>): string {
+    return JSON.stringify(obj);
+  }
+
+  const use1 = { type: "tool_use", id: "t1", name: "Grep", input: { pattern: "getHeadContent" } };
+  const use2 = { type: "tool_use", id: "t2", name: "Grep", input: { pattern: "getBlame" } };
+
+  async function writeForkedResultTranscript(withBoundary: boolean) {
+    const rows: Array<Record<string, unknown>> = [
+      {
+        type: "user",
+        uuid: "u1",
+        parentUuid: null,
+        message: { role: "user", content: "search both" },
+      },
+      {
+        type: "assistant",
+        uuid: "a1",
+        parentUuid: "u1",
+        message: { id: "msg_1", role: "assistant", content: [use1] },
+      },
+      {
+        type: "assistant",
+        uuid: "a2",
+        parentUuid: "a1",
+        message: { id: "msg_1", role: "assistant", content: [use2] },
+      },
+      // Fork: t1's result parents onto a1, so the display walk arriving via
+      // a2's branch never reaches it.
+      {
+        type: "user",
+        uuid: "r1",
+        parentUuid: "a1",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "found head" }] },
+      },
+      {
+        type: "user",
+        uuid: "r2",
+        parentUuid: "a2",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: "found blame" }] },
+      },
+    ];
+    if (withBoundary) {
+      rows.push(
+        {
+          type: "system",
+          subtype: "compact_boundary",
+          uuid: "cb",
+          parentUuid: null,
+          logicalParentUuid: "r2",
+        },
+        {
+          type: "user",
+          uuid: "sum",
+          parentUuid: "cb",
+          isCompactSummary: true,
+          isVisibleInTranscriptOnly: true,
+          message: { role: "user", content: "continued…" },
+        },
+        {
+          type: "user",
+          uuid: "u2",
+          parentUuid: "sum",
+          message: { role: "user", content: "next question" },
+        },
+      );
+    }
+    await nodeFs.writeFile(transcript, rows.map(line).join("\n") + "\n", "utf8");
+  }
+
+  it.each([{ withBoundary: false }, { withBoundary: true }])(
+    "backfills the forked-off tool_result so no card stays pending (withBoundary=$withBoundary)",
+    async ({ withBoundary }) => {
+      await writeForkedResultTranscript(withBoundary);
+      if (!withBoundary) {
+        // getSessionMessages walks the same single-parent chain and would drop
+        // r1 exactly like the display walk; mirror that here.
+        vi.mocked(getSessionMessages).mockResolvedValueOnce([
+          {
+            type: "user",
+            uuid: "u1",
+            session_id: "s",
+            message: { role: "user", content: "search both" },
+            parent_tool_use_id: null,
+          },
+          {
+            type: "assistant",
+            uuid: "a1",
+            session_id: "s",
+            message: { id: "msg_1", role: "assistant", content: [use1] },
+            parent_tool_use_id: null,
+          },
+          {
+            type: "assistant",
+            uuid: "a2",
+            session_id: "s",
+            message: { id: "msg_1", role: "assistant", content: [use2] },
+            parent_tool_use_id: null,
+          },
+          {
+            type: "user",
+            uuid: "r2",
+            session_id: "s",
+            message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: "found blame" }] },
+            parent_tool_use_id: null,
+          },
+        ] as any);
+      }
+      const { agent, events } = createRecordingAgent();
+
+      await (agent as any).replaySessionHistory(sessionId);
+
+      const calls = events.filter((e) => e.kind === "tool_call").map((e) => e.id);
+      const settled = events
+        .filter((e) => e.kind === "tool_call_update")
+        .map((e) => [e.id, e.status] as const);
+      expect(calls).toEqual(["t1", "t2"]);
+      expect(settled).toEqual(
+        expect.arrayContaining([
+          ["t2", "completed"],
+          ["t1", "completed"],
+        ]),
+      );
+    },
+  );
+});
+
 describe("replaySessionHistory: queued_command (mid-turn steering) attachments", () => {
   type ReplayEvent =
     | { kind: "user" | "agent"; text: string; messageId?: string }
