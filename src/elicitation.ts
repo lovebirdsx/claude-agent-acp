@@ -167,8 +167,8 @@ const CUSTOM_ANSWER_META_KEY = "_askUserQuestionCustomAnswer";
  * secondary text travels in the enum option's own `description` field.
  *
  * Each question is followed by its own optional free-text "custom answer" field
- * (`question_<n>_custom`), mirroring the CLI's per-question "Other" box: the
- * user can type their own answer instead of picking an option, scoped to that
+ * (`question_<n>_custom`), mirroring the CLI's per-question notes box: the user
+ * can annotate the picked option or type their own answer, scoped to that
  * specific question. Nothing is marked required, so the user can also just skip
  * — matching the built-in tool, which always offers Skip + a free-text box.
  */
@@ -211,7 +211,7 @@ export function askUserQuestionsToCreateRequest(
     properties[questionCustomFieldKey(index)] = {
       type: "string",
       title: "Other",
-      description: "Type your own answer instead of choosing an option above (optional).",
+      description: "Add a note to the selected option, or type your own answer instead (optional).",
       _meta: {
         [CUSTOM_ANSWER_META_KEY]: {
           questionId: questionFieldKey(index),
@@ -242,16 +242,25 @@ export type AskUserQuestionOutcome =
   { action: "answered"; updatedInput: Record<string, unknown> } | { action: "cancel" };
 
 /**
+ * Answer value the first-party CLI records when the user typed notes without
+ * picking an option. Echoed verbatim so the tool's own result formatter
+ * renders "(no option selected)" and applies its cautious "read the answers
+ * carefully" framing.
+ */
+const NOTES_ONLY_ANSWER = "(notes only)";
+
+/**
  * Fold an ACP elicitation response into the AskUserQuestion tool's input.
  *
  * Selected labels are read back from the indexed form fields and written into
  * `answers` as a `{ [questionText]: label }` map (comma-joining multi-selects)
  * — the key shape the tool's own `call()` reads. A non-empty per-question
- * custom-answer field (`question_<n>_custom`) takes precedence over that
- * question's selection, since the user typed their own answer instead of
- * picking one. Decline yields empty answers (the model is told the user skipped
- * rather than the turn aborting); cancel — and any custom/future action we
- * don't understand — aborts the tool call.
+ * custom-answer field (`question_<n>_custom`) rides along as `annotations`
+ * notes on the selection (or as a notes-only answer when nothing was picked),
+ * matching the first-party CLI — a typed remark must never swallow the
+ * selected option. Decline yields empty answers (the model is told the user
+ * skipped rather than the turn aborting); cancel — and any custom/future
+ * action we don't understand — aborts the tool call.
  */
 export function applyAskElicitationResponse(
   response: CreateElicitationResponse,
@@ -267,30 +276,43 @@ export function applyAskElicitationResponse(
   }
 
   const content = acceptedElicitationContent(response);
-  // Typed against the tool's own output schema so the answer/response shapes
+  // Typed against the tool's own output schema so the answer/annotation shapes
   // stay in sync with what the built-in tool's call() expects to read back.
   const answers: AskUserQuestionOutput["answers"] = {};
+  const annotations: NonNullable<AskUserQuestionOutput["annotations"]> = {};
   questions.forEach((question, index) => {
-    // A typed custom answer wins over the selection: the user chose to write
-    // their own answer for this question instead of picking an option.
+    const value = content[questionFieldKey(index)];
+    const selection =
+      value === undefined || value === null
+        ? ""
+        : Array.isArray(value)
+          ? value.join(", ")
+          : String(value);
+
+    // A typed custom answer annotates the selection instead of replacing it:
+    // the user picked an option AND added a remark, and both must reach the
+    // model. Only with no selection does the text stand alone as the answer.
     const custom = content[questionCustomFieldKey(index)];
     if (typeof custom === "string" && custom.trim() !== "") {
-      answers[question.question] = custom.trim();
+      answers[question.question] = selection !== "" ? selection : NOTES_ONLY_ANSWER;
+      annotations[question.question] = { notes: custom.trim() };
       return;
     }
 
-    const value = content[questionFieldKey(index)];
-    if (value === undefined || value === null) {
+    if (selection === "") {
       return;
     }
-    const text = Array.isArray(value) ? value.join(", ") : String(value);
-    if (text === "") {
-      return;
-    }
-    answers[question.question] = text;
+    answers[question.question] = selection;
   });
 
-  return { action: "answered", updatedInput: { ...toolInput, answers } };
+  return {
+    action: "answered",
+    updatedInput: {
+      ...toolInput,
+      answers,
+      ...(Object.keys(annotations).length > 0 ? { annotations } : {}),
+    },
+  };
 }
 
 /**

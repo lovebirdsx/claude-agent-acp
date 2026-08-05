@@ -334,7 +334,7 @@ describe("applyAskElicitationResponse", () => {
     });
   });
 
-  it("folds a per-question custom answer into that question's answer", () => {
+  it("folds a per-question custom answer into notes when nothing was picked", () => {
     const response = {
       action: "accept",
       content: { question_0: "A", question_1_custom: "something else entirely" },
@@ -345,12 +345,13 @@ describe("applyAskElicitationResponse", () => {
       updatedInput: {
         questions,
         metadata: { source: "test" },
-        answers: { "Single?": "A", "Multi?": "something else entirely" },
+        answers: { "Single?": "A", "Multi?": "(notes only)" },
+        annotations: { "Multi?": { notes: "something else entirely" } },
       },
     });
   });
 
-  it("prefers a question's custom answer over its selection", () => {
+  it("carries a typed custom answer as notes on the selection, never replacing it", () => {
     const response = {
       action: "accept",
       content: { question_0: "A", question_0_custom: "  my own take  " },
@@ -361,7 +362,25 @@ describe("applyAskElicitationResponse", () => {
       updatedInput: {
         questions,
         metadata: { source: "test" },
-        answers: { "Single?": "my own take" },
+        answers: { "Single?": "A" },
+        annotations: { "Single?": { notes: "my own take" } },
+      },
+    });
+  });
+
+  it("annotates a comma-joined multi-select the same way", () => {
+    const response = {
+      action: "accept",
+      content: { question_1: ["X", "Y"], question_1_custom: "both, but X first" },
+    } as CreateElicitationResponse;
+
+    expect(applyAskElicitationResponse(response, toolInput, questions)).toEqual({
+      action: "answered",
+      updatedInput: {
+        questions,
+        metadata: { source: "test" },
+        answers: { "Multi?": "X, Y" },
+        annotations: { "Multi?": { notes: "both, but X first" } },
       },
     });
   });
