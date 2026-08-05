@@ -31,6 +31,7 @@ import {
   promptToClaude,
   isLocalCommandMetadata,
   isSyntheticLoginMessage,
+  isSyntheticNoResponseMessage,
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
   claudeCliPath,
@@ -1710,6 +1711,89 @@ describe("synthetic login message (issue #863)", () => {
     ).toBe(true);
     // …but the TUI-specific "/login" instruction never reaches the client.
     expect(JSON.stringify(updates)).not.toContain("/login");
+  });
+});
+
+describe("synthetic no-response placeholder (resume rebalancing)", () => {
+  // The exact shape the SDK persists when resuming a session whose transcript
+  // ends with an interruption marker: model "<synthetic>", a single text block.
+  const syntheticNoResponseApiMessage = {
+    id: "1b722202-d9ca-4487-ae83-06e7d7c50e93",
+    model: "<synthetic>",
+    role: "assistant",
+    type: "message",
+    stop_reason: "stop_sequence",
+    content: [{ type: "text", text: "No response requested." }],
+  };
+
+  it("isSyntheticNoResponseMessage matches the resume-rebalancing placeholder", () => {
+    expect(isSyntheticNoResponseMessage(syntheticNoResponseApiMessage)).toBe(true);
+  });
+
+  it("isSyntheticNoResponseMessage does not match real or other synthetic messages", () => {
+    // Real model output that happens to say the same words.
+    expect(
+      isSyntheticNoResponseMessage({
+        ...syntheticNoResponseApiMessage,
+        model: "claude-haiku-4-5",
+      }),
+    ).toBe(false);
+    // Other synthetic rows (login / API errors) still replay as-is.
+    expect(
+      isSyntheticNoResponseMessage({
+        ...syntheticNoResponseApiMessage,
+        content: [{ type: "text", text: "Not logged in · Please run /login" }],
+      }),
+    ).toBe(false);
+    expect(isSyntheticNoResponseMessage(undefined)).toBe(false);
+    expect(isSyntheticNoResponseMessage("No response requested.")).toBe(false);
+  });
+
+  it("loadSession replay skips the placeholder but keeps the interruption marker", async () => {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (u: SessionNotification) => {
+        updates.push(u);
+      },
+      extNotification: async () => {},
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "u1",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: { role: "user", content: [{ type: "text", text: "排名" }] },
+      },
+      {
+        type: "user",
+        uuid: "u2",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: { role: "user", content: "[Request interrupted by user]" },
+      },
+      {
+        type: "assistant",
+        uuid: "a1",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: syntheticNoResponseApiMessage,
+      },
+    ] as Awaited<ReturnType<typeof getSessionMessages>>);
+
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+
+    // The interruption marker is a real transcript artifact the client shows…
+    expect(JSON.stringify(updates)).toContain("[Request interrupted by user]");
+    // …but the SDK's role-rebalancing placeholder never reaches the client.
+    expect(JSON.stringify(updates)).not.toContain("No response requested.");
   });
 });
 

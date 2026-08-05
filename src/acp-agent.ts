@@ -1505,6 +1505,32 @@ export function isSyntheticLoginMessage(apiMessage: unknown): boolean {
   );
 }
 
+/**
+ * True for the synthetic assistant row the SDK appends when resuming a session
+ * whose transcript ends with an interruption marker: the next user prompt would
+ * make two consecutive user rows, so the SDK rebalances role alternation with a
+ * placeholder assistant row (`model: "<synthetic>"`, text "No response
+ * requested."). It is written at resume time — after that session's replay
+ * already ran — so the live view never showed it, yet every later session/load
+ * replays it as if it were real output. It carries no information; skip it.
+ */
+export function isSyntheticNoResponseMessage(apiMessage: unknown): boolean {
+  if (!apiMessage || typeof apiMessage !== "object") {
+    return false;
+  }
+  const { model, content } = apiMessage as { model?: unknown; content?: unknown };
+  if (model !== "<synthetic>" || !Array.isArray(content) || content.length !== 1) {
+    return false;
+  }
+  const block = content[0] as { type?: unknown; text?: unknown } | null;
+  return (
+    !!block &&
+    block.type === "text" &&
+    typeof block.text === "string" &&
+    block.text.trim() === "No response requested."
+  );
+}
+
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   auto: "auto",
   default: "default",
@@ -5758,6 +5784,14 @@ export class ClaudeAcpAgent {
       // assistant message into an authRequired error instead of showing its
       // TUI-specific text; skip it on replay too (issue #863).
       if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) {
+        continue;
+      }
+
+      // The SDK's resume-time role rebalancing plants a synthetic "No response
+      // requested." assistant row after an interruption marker. It was never
+      // streamed live, so replaying it would show text the running session
+      // never had — skip it like the login placeholder above.
+      if (message.type === "assistant" && isSyntheticNoResponseMessage(message.message)) {
         continue;
       }
 

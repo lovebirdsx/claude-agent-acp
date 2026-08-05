@@ -25,7 +25,7 @@
 | 功能 | 提交 | 落点文件 | 备注 |
 |---|---|---|---|
 | 子代理用量累积并推父卡片 | `84e45ab` | `acp-agent.ts` `tools.ts` | 经 `_meta._universe/subagentStats` 推送 |
-| 恢复已压缩会话重建完整显示历史 | `b2d77dc` | `acp-agent.ts` | resume compacted session |
+| 恢复已压缩会话重建完整显示历史 | `b2d77dc` | `acp-agent.ts` | resume compacted session；replay 循环同时过滤 SDK resume 再平衡落的 `<synthetic>` 占位行（`isSyntheticNoResponseMessage`，text "No response requested."），与 login 占位同点 |
 | 结构化通知替代 Compacting 文本 chunk | `18f9c85` | `acp-agent.ts` | `COMPACTION_METHOD = "_universe/compaction"` ext-notification |
 | resume 时模型同步 CLI 往返移出关键路径 | `dd49937` | `acp-agent.ts` | perf |
 | reapplyRuntimeConfig 判别联合修 typecheck | `fba4954` | `acp-agent.ts` | 小修 |
