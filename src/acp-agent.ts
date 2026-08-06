@@ -1795,6 +1795,17 @@ export type NewSessionMeta = {
      * - SDKMessageFilter[]: emit only messages matching at least one filter
      */
     emitRawSDKMessages?: boolean | SDKMessageFilter[];
+    /**
+     * universe-editor extension (session/load + session/resume only): the model
+     * the editor remembers this session running — the user's in-session pick,
+     * with its context-lane spelling intact (e.g. "claude-fable-5[1m]"). A
+     * resumed session otherwise lands on the transcript's API model name, which
+     * drops the "[1m]" suffix and silently shrinks the effective context window
+     * from 1M to 200k. Re-asserted after load via the same "reassert-override"
+     * path as a settings pin; takes precedence over settings.model because it is
+     * the more specific, per-session choice.
+     */
+    resumeModel?: string;
   };
   additionalRoots?: string[];
 };
@@ -11192,6 +11203,9 @@ export class ClaudeAcpAgent {
         creationOpts.resume !== undefined,
         sessionId,
         await resumedModelHint,
+        // Only a resume carries the editor's per-session model memory; a fresh
+        // session/new takes its model from env/settings as before.
+        creationOpts.resume !== undefined ? readResumeModelMeta(params._meta) : undefined,
       );
       // A resumed session defers every CLI round-trip (re-asserting an
       // env/settings model pin, reading the live model/window) to
@@ -13312,6 +13326,13 @@ function immediateContextWindow(
       ) ?? DEFAULT_CONTEXT_WINDOW,
     authoritative: false,
   };
+}
+
+/** Read the editor's per-session model memory off a session/load or
+ *  session/resume request — see `NewSessionMeta.claudeCode.resumeModel`. */
+function readResumeModelMeta(meta: NewSessionRequest["_meta"]): string | undefined {
+  const value = (meta as NewSessionMeta | undefined)?.claudeCode?.resumeModel;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 /** Read the model a resumed session is actually running (via the

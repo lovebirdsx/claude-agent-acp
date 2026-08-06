@@ -403,6 +403,7 @@ export async function getAvailableModels(
   isResumedSession: boolean,
   sessionId: string,
   resumedModelHint?: string,
+  resumeModel?: string,
 ): Promise<SessionModelState & { resumeSync?: ResumedModelSync }> {
   const settings = settingsManager.getSettings();
 
@@ -410,16 +411,48 @@ export async function getAvailableModels(
   let resolvedFromInput: string | undefined;
   // Model priority (highest to lowest):
   // 1. ANTHROPIC_MODEL environment variable
-  // 2. settings.model (user configuration)
-  // 3. the resumed session's live model (resumed sessions only)
-  // 4. models[0] (default first model)
+  // 2. the editor's per-session memory (`_meta.claudeCode.resumeModel`, resumed
+  //    sessions only) — the user's in-session pick, kept in its context-lane
+  //    spelling ("claude-fable-5[1m]"). The transcript restores the bare API
+  //    name ("claude-fable-5"), which drops "[1m]" and clamps the effective
+  //    window to 200k, so the remembered spelling must win and be re-asserted.
+  // 3. settings.model (user configuration)
+  // 4. the resumed session's live model (resumed sessions only)
+  // 5. models[0] (default first model)
   if (process.env.ANTHROPIC_MODEL) {
     const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
     if (match) {
       currentModel = match;
       resolvedFromInput = process.env.ANTHROPIC_MODEL;
     }
-  } else if (typeof settings.model === "string") {
+  }
+  if (resolvedFromInput === undefined && isResumedSession && resumeModel !== undefined) {
+    const match = resolveModelPreference(models, resumeModel);
+    if (match) {
+      if (canonicalizeModelId(match.value) === canonicalizeModelId(resumeModel)) {
+        currentModel = match;
+      } else {
+        // The fuzzy/tokenized tiers matched a sibling row but dropped the
+        // context-lane spelling (the picker/SDK list only carries the bare
+        // "claude-fable-5" row for a "[1m]"-spelled pick): track the
+        // remembered id verbatim so the re-assert — and the context-window
+        // seeding keyed to the id — keep the lane. Mirrors the
+        // out-of-allowlist synthesis createSession applies to live models.
+        const sdkMatch = resolveModelPreference(sdkModels, resumeModel);
+        currentModel = {
+          ...(sdkMatch ?? match),
+          value: resumeModel,
+          displayName: resumeModel,
+          description: "",
+          resolvedModel: undefined,
+        };
+      }
+      resolvedFromInput = resumeModel;
+    }
+    // Unresolvable (e.g. dropped from the allowlist since): fall through to the
+    // settings pin / live-model paths below rather than pinning a phantom.
+  }
+  if (resolvedFromInput === undefined && typeof settings.model === "string") {
     const match = resolveSettingsModel(models, settings.model, logger);
     if (match) {
       currentModel = match;
