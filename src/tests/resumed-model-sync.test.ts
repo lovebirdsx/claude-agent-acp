@@ -105,6 +105,152 @@ describe("getAvailableModels on a resumed session", () => {
     expect(query.setModel).toHaveBeenCalledWith("claude-sonnet-4-6");
     expect(resumeSync).toBeUndefined();
   });
+
+  describe("editor-remembered resumeModel (_meta.claudeCode.resumeModel)", () => {
+    // A context-lane row mirrors the real failure mode: the transcript restores
+    // the bare API name, so only the editor's memory carries the "[1m]" spelling.
+    const LANE_INFOS: ModelInfo[] = [
+      ...MODEL_INFOS,
+      {
+        value: "claude-fable-5[1m]",
+        displayName: "Claude Fable (1M context)",
+        description: "1M context",
+        supportsEffort: true,
+        supportedEffortLevels: ["low", "medium", "high"],
+      },
+    ];
+
+    it("wins over the settings pin and keeps the context-lane spelling", async () => {
+      const query = makeQuery();
+      const { state, resumeSync } = await getAvailableModels(
+        query as unknown as Query,
+        LANE_INFOS,
+        LANE_INFOS,
+        makeSettings({ model: "claude-sonnet-4-6" }),
+        silentLogger,
+        true,
+        "claude-fable-5[1m]",
+      );
+
+      expect(query.getContextUsage).not.toHaveBeenCalled();
+      expect(query.setModel).not.toHaveBeenCalled();
+      expect(resumeSync).toBe("reassert-override");
+      expect(state.currentModelId).toBe("claude-fable-5[1m]");
+    });
+
+    it("falls back to the settings pin when the remembered model is unresolvable", async () => {
+      const query = makeQuery();
+      const { state, resumeSync } = await getAvailableModels(
+        query as unknown as Query,
+        MODEL_INFOS,
+        MODEL_INFOS,
+        makeSettings({ model: "claude-sonnet-4-6" }),
+        silentLogger,
+        true,
+        "claude-delisted-9[1m]",
+      );
+
+      expect(resumeSync).toBe("reassert-override");
+      expect(state.currentModelId).toBe("claude-sonnet-4-6");
+    });
+
+    it("defers to read-live-model when neither resumeModel nor settings resolve", async () => {
+      const query = makeQuery();
+      const { state, resumeSync } = await getAvailableModels(
+        query as unknown as Query,
+        MODEL_INFOS,
+        MODEL_INFOS,
+        makeSettings(),
+        silentLogger,
+        true,
+        "claude-delisted-9[1m]",
+      );
+
+      expect(resumeSync).toBe("read-live-model");
+      expect(state.currentModelId).toBe("claude-opus-4-5");
+    });
+
+    it("loses to the ANTHROPIC_MODEL environment override", async () => {
+      process.env.ANTHROPIC_MODEL = "claude-sonnet-4-6";
+      const query = makeQuery();
+      const { state, resumeSync } = await getAvailableModels(
+        query as unknown as Query,
+        LANE_INFOS,
+        LANE_INFOS,
+        makeSettings(),
+        silentLogger,
+        true,
+        "claude-fable-5[1m]",
+      );
+
+      expect(resumeSync).toBe("reassert-override");
+      expect(state.currentModelId).toBe("claude-sonnet-4-6");
+    });
+
+    it("is ignored on fresh sessions", async () => {
+      const query = makeQuery();
+      const { state, resumeSync } = await getAvailableModels(
+        query as unknown as Query,
+        LANE_INFOS,
+        LANE_INFOS,
+        makeSettings(),
+        silentLogger,
+        false,
+        "claude-fable-5[1m]",
+      );
+
+      expect(query.setModel).not.toHaveBeenCalled();
+      expect(resumeSync).toBeUndefined();
+      expect(state.currentModelId).toBe("claude-opus-4-5");
+    });
+
+    it("tracks the remembered id verbatim when the list only carries the bare sibling", async () => {
+      // The real failure mode: the SDK surfaces "claude-fable-5" but no "[1m]"
+      // row, so the tokenized tier would land on the bare row and re-assert the
+      // 200k lane. The remembered spelling must win instead.
+      const BARE_ONLY: ModelInfo[] = [
+        ...MODEL_INFOS,
+        {
+          value: "claude-fable-5",
+          displayName: "Fable 5",
+          description: "Claude Fable 5",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+        },
+      ];
+      const query = makeQuery();
+      const { state, resumeSync } = await getAvailableModels(
+        query as unknown as Query,
+        BARE_ONLY,
+        BARE_ONLY,
+        makeSettings({ model: "claude-sonnet-4-6" }),
+        silentLogger,
+        true,
+        "claude-fable-5[1m]",
+      );
+
+      expect(resumeSync).toBe("reassert-override");
+      expect(state.currentModelId).toBe("claude-fable-5[1m]");
+      // ...without adding a phantom picker row for the verbatim id.
+      expect(state.availableModels.some((m) => m.modelId === "claude-fable-5[1m]")).toBe(false);
+    });
+
+    it("keeps the picker row value for a canonically equivalent spelling", async () => {
+      const query = makeQuery();
+      const { state, resumeSync } = await getAvailableModels(
+        query as unknown as Query,
+        LANE_INFOS,
+        LANE_INFOS,
+        makeSettings(),
+        silentLogger,
+        true,
+        "claude-fable-5-1m",
+      );
+
+      expect(resumeSync).toBe("reassert-override");
+      expect(state.currentModelId).toBe("claude-fable-5[1m]");
+    });
+  });
 });
 
 describe("reconcileResumedSessionModel", () => {

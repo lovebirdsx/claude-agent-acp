@@ -1063,6 +1063,17 @@ export type NewSessionMeta = {
      * - SDKMessageFilter[]: emit only messages matching at least one filter
      */
     emitRawSDKMessages?: boolean | SDKMessageFilter[];
+    /**
+     * universe-editor extension (session/load + session/resume only): the model
+     * the editor remembers this session running — the user's in-session pick,
+     * with its context-lane spelling intact (e.g. "claude-fable-5[1m]"). A
+     * resumed session otherwise lands on the transcript's API model name, which
+     * drops the "[1m]" suffix and silently shrinks the effective context window
+     * from 1M to 200k. Re-asserted after load via the same "reassert-override"
+     * path as a settings pin; takes precedence over settings.model because it is
+     * the more specific, per-session choice.
+     */
+    resumeModel?: string;
   };
   additionalRoots?: string[];
 };
@@ -7276,6 +7287,9 @@ export class ClaudeAcpAgent {
       settingsManager,
       this.logger,
       creationOpts.resume !== undefined,
+      // Only a resume carries the editor's per-session model memory; a fresh
+      // session/new takes its model from env/settings as before.
+      creationOpts.resume !== undefined ? readResumeModelMeta(params._meta) : undefined,
     );
     this.logger.log(
       `[perf] createSession ${sessionId}: getAvailableModels ${Date.now() - modelsStart}ms`,
@@ -8361,6 +8375,13 @@ async function readResumedLiveModel(
  *  session/load has responded — see `reconcileResumedSessionModel`. */
 export type ResumedModelSync = "read-live-model" | "reassert-override";
 
+/** Read the editor's per-session model memory off a session/load or
+ *  session/resume request — see `NewSessionMeta.claudeCode.resumeModel`. */
+function readResumeModelMeta(meta: NewSessionRequest["_meta"]): string | undefined {
+  const value = (meta as NewSessionMeta | undefined)?.claudeCode?.resumeModel;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
 export async function getAvailableModels(
   query: Query,
   models: ModelInfo[],
@@ -8368,6 +8389,7 @@ export async function getAvailableModels(
   settingsManager: SettingsManager,
   logger: Logger,
   isResumedSession: boolean,
+  resumeModel?: string,
 ): Promise<{ state: SessionModelState; resumeSync?: ResumedModelSync }> {
   const settings = settingsManager.getSettings();
 
@@ -8376,17 +8398,49 @@ export async function getAvailableModels(
 
   // Model priority (highest to lowest):
   // 1. ANTHROPIC_MODEL environment variable
-  // 2. settings.model (user configuration)
-  // 3. the resumed session's live model (resumed sessions only, reconciled
+  // 2. the editor's per-session memory (`_meta.claudeCode.resumeModel`, resumed
+  //    sessions only) — the user's in-session pick, kept in its context-lane
+  //    spelling ("claude-fable-5[1m]"). The transcript restores the bare API
+  //    name ("claude-fable-5"), which drops "[1m]" and clamps the effective
+  //    window to 200k, so the remembered spelling must win and be re-asserted.
+  // 3. settings.model (user configuration)
+  // 4. the resumed session's live model (resumed sessions only, reconciled
   //    asynchronously after session/load — see below)
-  // 4. models[0] (default first model)
+  // 5. models[0] (default first model)
   if (process.env.ANTHROPIC_MODEL) {
     const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
     if (match) {
       currentModel = match;
       resolvedFromInput = process.env.ANTHROPIC_MODEL;
     }
-  } else if (typeof settings.model === "string") {
+  }
+  if (resolvedFromInput === undefined && isResumedSession && resumeModel !== undefined) {
+    const match = resolveModelPreference(models, resumeModel);
+    if (match) {
+      if (canonicalizeModelId(match.value) === canonicalizeModelId(resumeModel)) {
+        currentModel = match;
+      } else {
+        // The fuzzy/tokenized tiers matched a sibling row but dropped the
+        // context-lane spelling (the picker/SDK list only carries the bare
+        // "claude-fable-5" row for a "[1m]"-spelled pick): track the
+        // remembered id verbatim so the re-assert — and the context-window
+        // seeding keyed to the id — keep the lane. Mirrors the
+        // out-of-allowlist synthesis createSession applies to live models.
+        const sdkMatch = resolveModelPreference(sdkModels, resumeModel);
+        currentModel = {
+          ...(sdkMatch ?? match),
+          value: resumeModel,
+          displayName: resumeModel,
+          description: "",
+          resolvedModel: undefined,
+        };
+      }
+      resolvedFromInput = resumeModel;
+    }
+    // Unresolvable (e.g. dropped from the allowlist since): fall through to the
+    // settings pin / live-model paths below rather than pinning a phantom.
+  }
+  if (resolvedFromInput === undefined && typeof settings.model === "string") {
     const match = resolveSettingsModel(models, settings.model, logger);
     if (match) {
       currentModel = match;
