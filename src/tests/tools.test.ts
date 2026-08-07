@@ -2069,6 +2069,17 @@ describe("parseTaskCreateOutput", () => {
   it("returns undefined when task.id is missing", () => {
     expect(parseTaskCreateOutput(JSON.stringify({ task: { subject: "X" } }))).toBeUndefined();
   });
+
+  it("parses the prose result claude-code emits for TaskCreate", () => {
+    // Real headless transcripts (claude-code >= 2.1.220) carry prose, not
+    // JSON, as the TaskCreate tool_result content.
+    const parsed = parseTaskCreateOutput(
+      "Task #1 created successfully: 分析华容道 (huarong) 并给出优化建议",
+    );
+    expect(parsed).toEqual({
+      task: { id: "1", subject: "分析华容道 (huarong) 并给出优化建议" },
+    });
+  });
 });
 
 describe("applyTaskCreate / applyTaskUpdate", () => {
@@ -2122,12 +2133,19 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
     });
   });
 
-  it("skips TaskUpdate for an unseen task when no subject is available", () => {
+  it("creates a placeholder entry for an unseen task when no subject is available", () => {
     const state: TaskState = new Map();
     applyTaskUpdate(state, { taskId: "5", status: "in_progress" });
-    // Without a subject we'd render an empty-content plan entry, so the
-    // update is dropped instead of synthesizing a blank placeholder.
-    expect(state.has("5")).toBe(false);
+    // Real transcripts only carry {status, taskId} on TaskUpdate; if the
+    // TaskCreate half was lost (unparseable result), dropping the update would
+    // freeze the replayed plan — keep a placeholder so the state machine
+    // still advances.
+    expect(state.get("5")).toEqual({
+      subject: "Task #5",
+      status: "in_progress",
+      activeForm: undefined,
+      description: undefined,
+    });
   });
 });
 
@@ -2345,6 +2363,40 @@ describe("toAcpNotifications - Task* tools", () => {
 
     expect(notifications).toHaveLength(0);
     expect(taskState.size).toBe(0);
+  });
+
+  it("prefers the message-level toolUseResult sidecar over parsing the prose content", () => {
+    const toolUseCache: ToolUseCache = {
+      "create-1": {
+        type: "tool_use",
+        id: "create-1",
+        name: "TaskCreate",
+        input: { subject: "First", description: "" },
+      },
+    };
+    const taskState: TaskState = new Map();
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "create-1",
+          content: "Task #1 created successfully: First",
+          is_error: false,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState, toolUseResult: { task: { id: "1", subject: "First" } } },
+    );
+
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "plan",
+      entries: [{ content: "First", status: "pending", priority: "medium" }],
+    });
   });
 });
 

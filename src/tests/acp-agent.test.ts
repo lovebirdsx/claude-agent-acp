@@ -1797,6 +1797,121 @@ describe("synthetic no-response placeholder (resume rebalancing)", () => {
   });
 });
 
+describe("Task* replay restores the plan", () => {
+  it("rebuilds plan entries from prose Task* results via the tool_use_result sidecar", async () => {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (u: SessionNotification) => {
+        updates.push(u);
+      },
+      extNotification: async () => {},
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    // Replay normally runs after getOrCreateSession, so the per-session
+    // taskState accumulator exists; seed one here for the same reason.
+    agent.sessions["s1"] = {
+      taskState: new Map(),
+      messageIdToUuid: new Map(),
+    } as unknown as (typeof agent.sessions)[string];
+
+    const subject = "分析华容道 (huarong) 并给出优化建议";
+    // The exact shapes a headless claude-code (>= 2.1.220) transcript carries:
+    // TaskCreate/TaskUpdate tool_result content is prose; the structured data
+    // rides the message-level tool_use_result sidecar.
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "assistant",
+        uuid: "a1",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_create",
+              name: "TaskCreate",
+              input: { subject, description: "分析并给出建议" },
+            },
+          ],
+        },
+      },
+      {
+        type: "user",
+        uuid: "u1",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_create",
+              content: `Task #1 created successfully: ${subject}`,
+            },
+          ],
+        },
+        tool_use_result: { task: { id: "1", subject } },
+      },
+      {
+        type: "assistant",
+        uuid: "a2",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_update",
+              name: "TaskUpdate",
+              input: { taskId: "1", status: "in_progress" },
+            },
+          ],
+        },
+      },
+      {
+        type: "user",
+        uuid: "u2",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_update",
+              content: "Updated task #1 status",
+            },
+          ],
+        },
+        tool_use_result: {
+          success: true,
+          taskId: "1",
+          updatedFields: ["status"],
+          statusChange: { from: "pending", to: "in_progress" },
+        },
+      },
+    ] as Awaited<ReturnType<typeof getSessionMessages>>);
+
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+
+    const planUpdates = updates.filter((u) => u.update.sessionUpdate === "plan");
+    expect(planUpdates.length).toBeGreaterThan(0);
+    const last = planUpdates[planUpdates.length - 1]!;
+    expect(last.update).toMatchObject({
+      sessionUpdate: "plan",
+      entries: [{ content: subject, status: "in_progress", priority: "medium" }],
+    });
+  });
+});
+
 describe("subagent transcript replay", () => {
   const replayHistory = [
     {

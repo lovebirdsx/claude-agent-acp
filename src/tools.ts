@@ -1355,6 +1355,10 @@ function num(v: unknown): number {
  * Best-effort parse of a TaskCreate tool_result content into the structured
  * TaskCreateOutput. The SDK delivers tool outputs either as a string or as
  * an array of TextBlockParam-like blocks containing JSON text; try both.
+ * Headless claude-code (>= 2.1.220) instead emits prose ("Task #1 created
+ * successfully: <subject>") with the structured data on the message-level
+ * tool_use_result sidecar — fall back to matching that prose so history
+ * replay can rebuild the plan when the sidecar is unavailable.
  */
 export function parseTaskCreateOutput(content: unknown): TaskCreateOutput | undefined {
   const tryParse = (text: string): TaskCreateOutput | undefined => {
@@ -1371,6 +1375,10 @@ export function parseTaskCreateOutput(content: unknown): TaskCreateOutput | unde
     } catch {
       // ignore
     }
+    const prose = /^Task #(\S+) created successfully: (.*)$/s.exec(text);
+    if (prose) {
+      return { task: { id: prose[1]!, subject: (prose[2] ?? "").trim() } };
+    }
     return undefined;
   };
 
@@ -1386,6 +1394,25 @@ export function parseTaskCreateOutput(content: unknown): TaskCreateOutput | unde
           if (parsed) return parsed;
         }
       }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The structured sidecar the SDK attaches to the user message carrying a
+ * TaskCreate tool_result (`tool_use_result`). Headless claude-code's
+ * TaskCreate result content is prose rather than JSON, so when the sidecar is
+ * present it is the authoritative source; `parseTaskCreateOutput` on the
+ * content is the fallback.
+ */
+export function taskCreateOutputFromToolUseResult(
+  toolUseResult: unknown,
+): TaskCreateOutput | undefined {
+  if (toolUseResult && typeof toolUseResult === "object") {
+    const task = (toolUseResult as { task?: unknown }).task;
+    if (task && typeof task === "object" && typeof (task as { id?: unknown }).id === "string") {
+      return toolUseResult as TaskCreateOutput;
     }
   }
   return undefined;
@@ -1413,10 +1440,7 @@ export function applyTaskUpdate(state: TaskState, input: TaskUpdateInput | undef
     return;
   }
   const existing = state.get(input.taskId);
-  // Without a subject from either the existing entry or the update payload,
-  // we'd produce a plan entry with empty `content` — drop the update.
-  const subject = input.subject ?? existing?.subject;
-  if (!subject) return;
+  const subject = input.subject ?? existing?.subject ?? `Task #${input.taskId}`;
   state.set(input.taskId, {
     subject,
     status: input.status ?? existing?.status ?? "pending",

@@ -125,6 +125,7 @@ import {
   SubagentStatsState,
   subagentStatsToMeta,
   TaskState,
+  taskCreateOutputFromToolUseResult,
   taskStateToPlanEntries,
   toolInfoFromToolUse,
   toolUpdateFromDiffToolResponse,
@@ -5834,6 +5835,16 @@ export class ClaudeAcpAgent {
           taskState: this.sessions[sessionId]?.taskState,
           messageId: replayMessageId,
           parentToolUseId,
+          // Same sidecar the live prompt loop passes (see below): on replay
+          // it carries the structured TaskCreate/TaskUpdate output whose
+          // prose tool_result content can't be parsed into a task id, so the
+          // resumed plan would replay empty without it. SDK messages expose
+          // it as `tool_use_result`; raw transcript lines as `toolUseResult`.
+          toolUseResult:
+            message.type === "user"
+              ? ((message as { tool_use_result?: unknown }).tool_use_result ??
+                (message as { toolUseResult?: unknown }).toolUseResult)
+              : undefined,
         },
       )) {
         trackToolCallLifecycle(notification);
@@ -9263,7 +9274,11 @@ export function toAcpNotifications(
               applyTaskCreate(
                 taskState,
                 toolUse.input as Parameters<typeof applyTaskCreate>[1],
-                parseTaskCreateOutput(chunk.content),
+                // Headless claude-code emits prose result content; the
+                // structured task lives on the message-level tool_use_result
+                // sidecar. Prefer it, fall back to parsing the content.
+                taskCreateOutputFromToolUseResult(toolUseResult) ??
+                  parseTaskCreateOutput(chunk.content),
               );
             } else if (toolUse.name === "TaskUpdate") {
               applyTaskUpdate(taskState, toolUse.input as Parameters<typeof applyTaskUpdate>[1]);
