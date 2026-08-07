@@ -9246,6 +9246,16 @@ export class ClaudeAcpAgent {
           taskState: replayState()?.taskState,
           messageId: replayMessageId,
           parentToolUseId,
+          // Same sidecar the live prompt loop passes (see below): on replay
+          // it carries the structured TaskCreate/TaskUpdate output whose
+          // prose tool_result content can't be parsed into a task id, so the
+          // resumed plan would replay empty without it. SDK messages expose
+          // it as `tool_use_result`; raw transcript lines as `toolUseResult`.
+          toolUseResult:
+            message.type === "user"
+              ? ((message as { tool_use_result?: unknown }).tool_use_result ??
+                (message as { toolUseResult?: unknown }).toolUseResult)
+              : undefined,
         },
       )) {
         const toolName = (

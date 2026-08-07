@@ -223,6 +223,10 @@ function num(v: unknown): number {
  * Best-effort parse of a structured Task* tool_result. The SDK delivers tool
  * outputs either as a string or as an array of TextBlockParam-like blocks
  * containing JSON text; try both.
+ * Headless claude-code (>= 2.1.220) instead emits prose ("Task #1 created
+ * successfully: <subject>") with the structured data on the message-level
+ * tool_use_result sidecar — fall back to matching that prose so history
+ * replay can rebuild the plan when the sidecar is unavailable.
  */
 function parseJsonToolOutput<T>(
   content: unknown,
@@ -421,10 +425,7 @@ export function applyTaskUpdate(state: TaskState, input: TaskUpdateInput | undef
     return;
   }
   const existing = state.get(input.taskId);
-  // Without a subject from either the existing entry or the update payload,
-  // we'd produce a plan entry with empty `content` — drop the update.
-  const subject = input.subject ?? existing?.subject;
-  if (!subject) return;
+  const subject = input.subject ?? existing?.subject ?? `Task #${input.taskId}`;
   state.set(input.taskId, {
     subject,
     status: input.status ?? existing?.status ?? "pending",
