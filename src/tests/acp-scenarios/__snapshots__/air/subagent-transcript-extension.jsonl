@@ -2,6 +2,7 @@
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":3}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"capabilities":{},"name":"Summarize","prompt":"Summarize the repo","sessionUpdate":"subagent_spawned","subagentSessionId":"agent_t","task":"Summarize the repo"}}}
+{"kind":"extNotification","payload":{"method":"_universe/background_activity","params":{"autonomousTurn":false,"backgroundTasks":1,"sessionId":"<session>"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_t","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_transcript"}},"content":{"text":"Look at t","type":"text"},"messageId":"msg_transcript_sub","sessionUpdate":"agent_thought_chunk"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_t","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_transcript"}},"content":{"text":"he layout.","type":"text"},"messageId":"msg_transcript_sub","sessionUpdate":"agent_thought_chunk"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_t","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_transcript"}},"content":{"text":"The repo has ","type":"text"},"messageId":"msg_transcript_sub","sessionUpdate":"agent_message_chunk"}}}
@@ -12,5 +13,6 @@
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_t","update":{"content":[{"content":{"text":"a\nb","type":"text"},"type":"content"}],"sessionUpdate":"tool_call_update","status":"completed","toolCallId":"toolu_transcript_glob"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"content":[{"content":{"text":"Two packages.","type":"text"},"type":"content"}],"sessionUpdate":"tool_call_update","status":"completed","toolCallId":"toolu_transcript"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"sessionUpdate":"subagent_state_update","state":"completed","subagentSessionId":"agent_t"}}}
+{"kind":"extNotification","payload":{"method":"_universe/background_activity","params":{"autonomousTurn":true,"backgroundTasks":0,"sessionId":"<session>"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"cost":{"amount":0,"currency":"USD"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
 {"kind":"promptResponse","payload":{"_meta":{"quota":{"model_usage":[],"token_count":{"cachedInputTokens":0,"cachedWriteTokens":0,"inputTokens":0,"outputTokens":0,"reasoningOutputTokens":0,"totalTokens":0}}},"stopReason":"end_turn","usage":{"cachedReadTokens":0,"cachedWriteTokens":0,"inputTokens":0,"outputTokens":0,"totalTokens":0}}}

@@ -24,6 +24,7 @@
 
 | 功能 | 提交 | 落点文件 | 备注 |
 |---|---|---|---|
+| 会话后台活跃度通知 | （待提交） | `acp-agent.ts` | `BACKGROUND_ACTIVITY_METHOD = "_universe/background_activity"` ext-notification，params `{sessionId, backgroundTasks, autonomousTurn}`；解决 run_in_background 任务存活期间 editor 把 session 误判已结束的问题。`backgroundTasks` 数 `liveBackgroundTasks` 中未被 level 信号终结的条目；`autonomousTurn` 在 task_notification（或 autonomous origin 的 user 消息）唤醒时置位、autonomous result 清除、idle 兜底。值变化去重推送 + session/load|resume 强制补发 |
 | resume 重放恢复 Task* 计划 | （待提交） | `tools.ts` `acp-agent.ts` | headless ≥2.1.220 的 TaskCreate result content 是散文，结构化数据在消息级 `tool_use_result` sidecar。上游 a44c486 已自行实现同一功能（`parseTaskCreateOutput` 自带散文兜底、live 循环已传 sidecar），fork 只保留两处差异：**replay 调用点补传 sidecar**（raw transcript 行是 camelCase `toolUseResult`，上游 replay 只读 `tool_use_result`，故 fork 两拼写都读）；`applyTaskUpdate` 对未见 taskId 建 `Task #<id>` 占位条目（上游无 subject 时丢弃该更新）。fork 原 `taskCreateOutputFromToolUseResult` 助手已随 rebase 删除（上游 `parseTaskCreateOutput` 直接吃 sidecar 对象） |
 | resume reassert 编辑器记忆的会话模型 | （待提交） | `acp-agent.ts` | resume 从 transcript 恢复的是 API 裸模型名（丢 `[1m]` 后缀 → 有效窗口 1M 退化 200k、auto-compact 提前）。editor 在 session/load + session/resume 的 `_meta.claudeCode.resumeModel` 捎上 history 行记忆的 per-session 模型原值；`getAvailableModels` 优先级 env > resumeModel > settings.model，命中走既有 `reassert-override` 后台 setModel。列表无对应 lane 行时（tokenized 模糊匹配会落到裸行吞掉 `[1m]`）按 canonical 比较判别并**逐字跟踪原值**（合成条目拷最近 SDK 行能力标志），窗口播种按逐字 id 命中 `1m` 启发式 |
 | 子代理用量累积并推父卡片 | `84e45ab` | `acp-agent.ts` `tools.ts` | 经 `_meta._universe/subagentStats` 推送 |
@@ -51,8 +52,8 @@
 
 **已被上游实现、fork 不再保留的本地改动**：AskUserQuestion「选项+备注共存」。上游 a44c486 起 `applyAskElicitationResponse` 已实现同一意图——单选且已选中选项时，自由文本落 `annotations[question].notes`（原先 custom-wins 会吞掉已选项）；多选并入所选；无选择时文本即答案。fork 原有的 `"(notes only)"` 哨兵等子分支已在 rebase 时删去（源文件与测试整段切回上游）。日后 rebase 若此处再冲突，按上游语义走，勿重新加回。
 
-**五个自定义 ext-method / notification 名（须与父项目 editor 侧 `acpSessionModel.ts` 逐字一致）**：
-`universe-editor/ask_user_question`、`universe-editor/set_session_title`、`universe-editor/rewind_session`、`_universe/compaction`、`_claude/sdkMessage`。
+**六个自定义 ext-method / notification 名（须与父项目 editor 侧 `acpSessionModel.ts` 逐字一致）**：
+`universe-editor/ask_user_question`、`universe-editor/set_session_title`、`universe-editor/rewind_session`、`_universe/compaction`、`_universe/background_activity`、`_claude/sdkMessage`。
 
 ## rebase / 合并上游核对表
 
@@ -60,7 +61,7 @@
 2. `git -C vendor/claude-agent-acp fetch upstream`，查看上游新增 release：`git -C vendor/claude-agent-acp log --oneline HEAD..upstream/main`。
 3. rebase / merge 上游后，对着上面「本地改动清单」**逐条核对**每项功能是否仍在、是否需随上游 API 调整：
    - 尤其留意上游是否自行实现了 rewind / compaction / 标题持久化 —— 若上游版本与本地重叠，优先切到上游实现并删本地对应提交（减少 diff），但**必须先确认 wire 形状与父项目 editor 侧兼容**。
-4. **回归底线**：父项目侧的**跨仓契约测试**（`apps/editor` 的 ACP contract spec，见架构路线图 01·任务1）以真 fork dist 断言这五个 ext-method + `_meta` 印章的 wire 形状。跑它即验证本地改动在 rebase 后未漂移：
+4. **回归底线**：父项目侧的**跨仓契约测试**（`apps/editor` 的 ACP contract spec，见架构路线图 01·任务1）以真 fork dist 断言这六个 ext-method + `_meta` 印章的 wire 形状。跑它即验证本地改动在 rebase 后未漂移：
    - 改完 fork → `pnpm agent:build` → 跑 editor 契约测试；红即说明某个 ext-method 形状被上游/rebase 改动破坏。
 5. fork 自身单测：`npm --prefix vendor/claude-agent-acp test`（本地改动均带配套测试，见清单中带 `*.test.ts` 的提交）。
 
