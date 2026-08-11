@@ -24,6 +24,7 @@
 
 | 功能 | 提交 | 落点文件 | 备注 |
 |---|---|---|---|
+| 会话后台活跃度通知 | （待提交） | `acp-agent.ts` | `BACKGROUND_ACTIVITY_METHOD = "_universe/background_activity"` ext-notification，params `{sessionId, backgroundTasks, autonomousTurn}`；解决 run_in_background 任务存活期间 editor 把 session 误判已结束的问题。`backgroundTasks` 数 `liveBackgroundTasks` 中未被 level 信号终结的条目；`autonomousTurn` 在 task_notification（或 autonomous origin 的 user 消息）唤醒时置位、autonomous result 清除、idle 兜底。值变化去重推送 + session/load|resume 强制补发 |
 | resume 重放恢复 Task* 计划 | （待提交） | `tools.ts` `acp-agent.ts` | headless ≥2.1.220 的 TaskCreate/TaskUpdate result content 是散文，结构化数据在消息级 `tool_use_result` sidecar；replay 调用点补传 sidecar（raw transcript 行是 camelCase `toolUseResult`）、TaskCreate 优先用 sidecar 否则散文正则兜底、TaskUpdate 对未见 taskId 建 `Task #<id>` 占位条目 |
 | resume reassert 编辑器记忆的会话模型 | （待提交） | `acp-agent.ts` | resume 从 transcript 恢复的是 API 裸模型名（丢 `[1m]` 后缀 → 有效窗口 1M 退化 200k、auto-compact 提前）。editor 在 session/load + session/resume 的 `_meta.claudeCode.resumeModel` 捎上 history 行记忆的 per-session 模型原值；`getAvailableModels` 优先级 env > resumeModel > settings.model，命中走既有 `reassert-override` 后台 setModel。列表无对应 lane 行时（tokenized 模糊匹配会落到裸行吞掉 `[1m]`）按 canonical 比较判别并**逐字跟踪原值**（合成条目拷最近 SDK 行能力标志），窗口播种按逐字 id 命中 `1m` 启发式 |
 | AskUserQuestion 选项+备注共存 | （待提交） | `elicitation.ts` | 上游是 custom-wins（自由文本吞掉已选项）；改为对齐第一方 CLI：文本作 `annotations.notes` 附在所选项上，无选择时落 `"(notes only)"` 哨兵。rebase 时若上游动了 `applyAskElicitationResponse` 需保留此语义 |
@@ -50,8 +51,8 @@
 
 另有 ext-notification `_claude/sdkMessage`（原始 SDK 消息旁路，供父项目重建连接快照）也是本地印章，随上述提交散落在 `acp-agent.ts`。
 
-**五个自定义 ext-method / notification 名（须与父项目 editor 侧 `acpSessionModel.ts` 逐字一致）**：
-`universe-editor/ask_user_question`、`universe-editor/set_session_title`、`universe-editor/rewind_session`、`_universe/compaction`、`_claude/sdkMessage`。
+**六个自定义 ext-method / notification 名（须与父项目 editor 侧 `acpSessionModel.ts` 逐字一致）**：
+`universe-editor/ask_user_question`、`universe-editor/set_session_title`、`universe-editor/rewind_session`、`_universe/compaction`、`_universe/background_activity`、`_claude/sdkMessage`。
 
 ## rebase / 合并上游核对表
 

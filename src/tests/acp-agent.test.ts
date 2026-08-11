@@ -43,6 +43,7 @@ import {
   runPromptWithCancellation,
   CLAUDE_CONFIG_DIR,
   COMPACTION_METHOD,
+  BACKGROUND_ACTIVITY_METHOD,
   RESURRECTION_METHOD,
   rebuildTranscriptDisplayChain,
   isQueuedCommandEntry,
@@ -11277,6 +11278,242 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "next" }] }),
     ).rejects.toMatchObject({ code: -32603 });
     await agent.sessions["test-session"]?.consumer;
+  });
+});
+
+describe("background activity notification (_universe/background_activity)", () => {
+  // The editor's session state keys on the in-flight session/prompt RPC, so a
+  // session whose turn ended while a run_in_background task still runs looks
+  // done. This ext notification carries the real liveness: the live
+  // background-task count and whether an autonomous followup turn (no ACP
+  // prompt attached) is processing.
+
+  function createAgent() {
+    const extNotification = vi.fn(async () => {});
+    const mockClient = {
+      sessionUpdate: async () => {},
+      extNotification,
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const activityPayloads = () =>
+      extNotification.mock.calls
+        .filter(([method]) => method === BACKGROUND_ACTIVITY_METHOD)
+        .map(([, params]) => params);
+    return { agent, activityPayloads };
+  }
+
+  function resultMessage(overrides: Record<string, any> = {}) {
+    return {
+      type: "result" as const,
+      subtype: "success" as const,
+      stop_reason: "end_turn",
+      is_error: false,
+      result: "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+      ...overrides,
+    };
+  }
+
+  const stateChanged = (state: "running" | "idle") => ({
+    type: "system",
+    subtype: "session_state_changed",
+    state,
+    uuid: randomUUID(),
+    session_id: "test-session",
+  });
+  const running = () => stateChanged("running");
+  const idle = () => stateChanged("idle");
+
+  /** A non-subagent background task starting (e.g. run_in_background Bash). */
+  const backgroundTaskStarted = (taskId: string) => ({
+    type: "system",
+    subtype: "task_started",
+    task_id: taskId,
+    tool_use_id: `toolu_${taskId}`,
+    description: "copy files",
+    uuid: randomUUID(),
+    session_id: "test-session",
+  });
+
+  const taskNotification = (taskId: string) => ({
+    type: "system",
+    subtype: "task_notification",
+    task_id: taskId,
+    tool_use_id: `toolu_${taskId}`,
+    status: "completed",
+    output_file: "",
+    summary: "done",
+    uuid: randomUUID(),
+    session_id: "test-session",
+  });
+
+  const backgroundTasksChanged = (taskIds: string[]) => ({
+    type: "system",
+    subtype: "background_tasks_changed",
+    tasks: taskIds.map((task_id) => ({
+      task_id,
+      task_type: "local_bash",
+      description: "copy files",
+    })),
+    uuid: randomUUID(),
+    session_id: "test-session",
+  });
+
+  const assistantText = (text: string) => ({
+    type: "assistant",
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: "test-session",
+    message: {
+      role: "assistant",
+      model: "claude-sonnet-4-5",
+      stop_reason: "end_turn",
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      content: [{ type: "text", text }],
+    },
+  });
+
+  const prompt = (agent: ClaudeAcpAgent, text = "copy") =>
+    agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text }] });
+
+  it("emits backgroundTasks=1 when a background task starts and keeps it after the turn resolves", async () => {
+    const { agent, activityPayloads } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("task-1");
+        // The turn's terminal result: the background task is still live, and a
+        // non-subagent task never defers settlement — the prompt resolves here.
+        yield resultMessage();
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await prompt(agent);
+    expect(response.stopReason).toBe("end_turn");
+    await agent.sessions["test-session"]?.consumer;
+
+    // Exactly one push: the task outliving the turn must NOT produce a
+    // backgroundTasks=0 fallback once the prompt resolved.
+    expect(activityPayloads()).toEqual([
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+    ]);
+  });
+
+  it("reports the task_notification prune and the autonomous followup turn's start and end", async () => {
+    const { agent, activityPayloads } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("task-1");
+        yield resultMessage();
+        yield idle();
+        // The task settles; the notification wakes the model for a followup
+        // turn that no ACP prompt accounts for.
+        yield taskNotification("task-1");
+        yield assistantText("copy finished");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await prompt(agent);
+    expect(response.stopReason).toBe("end_turn");
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(activityPayloads()).toEqual([
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: true },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: false },
+    ]);
+  });
+
+  it("does not re-send when neither value changed", async () => {
+    const { agent, activityPayloads } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("task-1");
+        // A level payload that changes nothing (the task is still live) must
+        // not trigger a redundant push.
+        yield backgroundTasksChanged(["task-1"]);
+        yield resultMessage();
+        // The trailing idle with no autonomous cycle pending is also a no-op.
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(activityPayloads()).toEqual([
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+    ]);
+  });
+
+  it("clears a wake's autonomousTurn flag at the next idle when no followup comes", async () => {
+    const { agent, activityPayloads } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("task-1");
+        yield resultMessage();
+        yield idle();
+        yield taskNotification("task-1");
+        // The wake's followup never arrives (notification lost/skipped
+        // model-side): the idle backstop must unlatch the flag rather than
+        // leaving the session looking busy forever.
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(activityPayloads()).toEqual([
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: true },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: false },
+    ]);
   });
 });
 
