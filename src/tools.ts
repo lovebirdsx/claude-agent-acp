@@ -1352,6 +1352,84 @@ function num(v: unknown): number {
 }
 
 /**
+ * Identify a replayed, completed Task/Agent tool_result row and extract the
+ * sub-agent's identity from its message-level `tool_use_result` sidecar
+ * (AgentOutput). The sidecar's own `usage` only covers the sub-agent's FINAL
+ * API call — the CLI folds the run down to its result — so it wildly
+ * understates the real spend; the true tally must be re-accumulated from the
+ * sub-agent's own transcript, which `agentId` locates. Returns undefined for
+ * non-Task tools or older CLIs without the sidecar.
+ */
+export function replayedSubagentCardFromResult(
+  content: unknown,
+  toolUseResult: unknown,
+  toolUseCache: { [key: string]: { name: string } | undefined },
+): { toolCallId: string; agentId: string; agentType?: string } | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const structured = structuredResult<{ agentId?: unknown; agentType?: unknown }>(toolUseResult);
+  if (structured == null) return undefined;
+  const agentId = structured.agentId;
+  if (typeof agentId !== "string" || agentId.length === 0) return undefined;
+  for (const block of content) {
+    if (block == null || typeof block !== "object") continue;
+    const b = block as { type?: unknown; tool_use_id?: unknown };
+    if (b.type !== "tool_result" || typeof b.tool_use_id !== "string") continue;
+    const name = toolUseCache[b.tool_use_id]?.name;
+    if (name !== "Agent" && name !== "Task") continue;
+    return {
+      toolCallId: b.tool_use_id,
+      agentId,
+      ...(typeof structured.agentType === "string" && structured.agentType.length > 0
+        ? { agentType: structured.agentType }
+        : {}),
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Re-accumulate a sub-agent's tally from its own transcript file
+ * (`<session>/subagents/agent-<agentId>.jsonl`), folding every assistant
+ * turn's usage exactly like the live accumulateSubagentUsage path — each
+ * turn's cache reads bill separately, so only the sum matches the real spend.
+ * Lines are textually prefiltered before JSON.parse: the transcript's biggest
+ * rows are tool_result user rows we don't need. Returns undefined when no
+ * usage was found (a wrong number is worse than none).
+ */
+export function subagentTallyFromTranscript(
+  raw: string,
+  agentType?: string,
+): SubagentStatsEntry | undefined {
+  const state: SubagentStatsState = new Map();
+  const KEY = "tally";
+  for (const line of raw.split("\n")) {
+    if (!line.includes('"assistant"')) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (parsed == null || typeof parsed !== "object") continue;
+    const entry = parsed as {
+      type?: unknown;
+      message?: { usage?: SubagentUsage | null; model?: string | null } | null;
+    };
+    if (entry.type !== "assistant" || entry.message == null) continue;
+    accumulateSubagentUsage(state, KEY, {
+      usage: entry.message.usage,
+      model: entry.message.model,
+      ...(agentType !== undefined ? { subagentType: agentType } : {}),
+    });
+  }
+  const tally = state.get(KEY);
+  if (tally === undefined) return undefined;
+  const total =
+    tally.inputTokens + tally.outputTokens + tally.cacheReadTokens + tally.cacheCreateTokens;
+  return total > 0 ? tally : undefined;
+}
+
+/**
  * Best-effort parse of a TaskCreate tool_result content into the structured
  * TaskCreateOutput. The SDK delivers tool outputs either as a string or as
  * an array of TextBlockParam-like blocks containing JSON text; try both.

@@ -14191,6 +14191,195 @@ describe("replaySessionHistory: tool_results forked off the display chain", () =
   );
 });
 
+describe("replaySessionHistory: sub-agent stats restamped from the sub-agent transcript", () => {
+  // The live per-sub-agent tally is accumulated from sidechain messages that
+  // live outside the parent chain replay reads — it dies with the process. The
+  // completed Task's `toolUseResult` sidecar carries the sub-agent's id; its
+  // transcript (`<session>/subagents/agent-<id>.jsonl`) carries every turn's
+  // usage. Replay re-folds the transcript (the sidecar's own `usage` covers
+  // only the FINAL API call, understating the real spend by orders of
+  // magnitude) and restamps the card asynchronously after the replay.
+  function createRecordingAgent() {
+    const stats: Array<{ id: string; stats: unknown }> = [];
+    const client = {
+      sessionUpdate: async (notification: SessionNotification) => {
+        const update = notification.update;
+        if (update.sessionUpdate !== "tool_call_update") return;
+        const meta = (update as { _meta?: Record<string, unknown> | null })._meta;
+        const stamped = meta?.["_universe/subagentStats"];
+        if (stamped !== undefined) stats.push({ id: update.toolCallId, stats: stamped });
+      },
+      extNotification: async () => {},
+    } as unknown as AcpClient;
+    return { agent: new ClaudeAcpAgent(client, { log: () => {}, error: () => {} }), stats };
+  }
+
+  let sessionId: string;
+  let projectDir: string;
+  let transcript: string;
+  let subagentsDir: string;
+
+  beforeEach(async () => {
+    sessionId = randomUUID();
+    projectDir = nodePath.join(
+      CLAUDE_CONFIG_DIR,
+      "projects",
+      `__subagent_stats_replay_test_${randomUUID()}`,
+    );
+    subagentsDir = nodePath.join(projectDir, sessionId, "subagents");
+    await nodeFs.mkdir(subagentsDir, { recursive: true });
+    transcript = nodePath.join(projectDir, `${sessionId}.jsonl`);
+  });
+
+  afterEach(async () => {
+    await nodeFs.rm(projectDir, { recursive: true, force: true });
+  });
+
+  async function writeMainTranscript(withBoundary: boolean, agentId: string): Promise<void> {
+    const rows: Array<Record<string, unknown>> = [
+      {
+        type: "user",
+        uuid: "u1",
+        parentUuid: null,
+        message: { role: "user", content: "delegate" },
+      },
+      {
+        type: "assistant",
+        uuid: "a1",
+        parentUuid: "u1",
+        message: {
+          id: "msg_1",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "task_1",
+              name: "Agent",
+              input: { description: "explore", prompt: "go" },
+            },
+          ],
+        },
+      },
+      {
+        type: "user",
+        uuid: "r1",
+        parentUuid: "a1",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "task_1", content: "report" }],
+        },
+        toolUseResult: {
+          status: "completed",
+          agentId,
+          agentType: "Explore",
+          resolvedModel: "claude-sonnet-5",
+          content: [{ type: "text", text: "report" }],
+          totalDurationMs: 1000,
+          totalTokens: 49970,
+          totalToolUseCount: 3,
+          // Deliberately the final-call-only figures: the restamp must NOT
+          // use these — the real spend is the transcript's per-turn sum.
+          usage: {
+            input_tokens: 228,
+            output_tokens: 3406,
+            cache_read_input_tokens: 46336,
+            cache_creation_input_tokens: 0,
+          },
+        },
+      },
+    ];
+    if (withBoundary) {
+      rows.push(
+        {
+          type: "system",
+          subtype: "compact_boundary",
+          uuid: "cb",
+          parentUuid: null,
+          logicalParentUuid: "r1",
+        },
+        {
+          type: "user",
+          uuid: "u2",
+          parentUuid: "cb",
+          message: { role: "user", content: "next question" },
+        },
+      );
+    }
+    await nodeFs.writeFile(
+      transcript,
+      rows.map((r) => JSON.stringify(r)).join("\n") + "\n",
+      "utf8",
+    );
+  }
+
+  async function writeSubagentTranscript(agentId: string): Promise<void> {
+    const turn = (uuid: string, usage: Record<string, number>) =>
+      JSON.stringify({
+        type: "assistant",
+        uuid,
+        message: { role: "assistant", model: "claude-sonnet-5", usage, content: [] },
+      });
+    const rows = [
+      JSON.stringify({ type: "user", uuid: "su1", message: { role: "user", content: "go" } }),
+      turn("sa1", {
+        input_tokens: 100,
+        output_tokens: 1000,
+        cache_read_input_tokens: 20000,
+        cache_creation_input_tokens: 500,
+      }),
+      turn("sa2", {
+        input_tokens: 128,
+        output_tokens: 2406,
+        cache_read_input_tokens: 46336,
+        cache_creation_input_tokens: 0,
+      }),
+    ];
+    await nodeFs.writeFile(
+      nodePath.join(subagentsDir, `agent-${agentId}.jsonl`),
+      rows.join("\n") + "\n",
+      "utf8",
+    );
+  }
+
+  it.each([{ withBoundary: false }, { withBoundary: true }])(
+    "restamps the per-turn transcript sum, not the sidecar's final-call usage (withBoundary=$withBoundary)",
+    async ({ withBoundary }) => {
+      await writeMainTranscript(withBoundary, "sub1");
+      await writeSubagentTranscript("sub1");
+
+      const { agent, stats } = createRecordingAgent();
+      await (agent as any).replaySessionHistory(sessionId);
+
+      await vi.waitFor(() => expect(stats).toHaveLength(1));
+      expect(stats).toEqual([
+        {
+          id: "task_1",
+          stats: {
+            model: "claude-sonnet-5",
+            subagentType: "Explore",
+            inputTokens: 228,
+            outputTokens: 3406,
+            cacheReadTokens: 66336,
+            cacheCreateTokens: 500,
+          },
+        },
+      ]);
+    },
+  );
+
+  it("skips the restamp when the sub-agent transcript is missing (no stats beats wrong stats)", async () => {
+    await writeMainTranscript(false, "gone");
+
+    const { agent, stats } = createRecordingAgent();
+    await (agent as any).replaySessionHistory(sessionId);
+    await (agent as any).restampReplayedSubagentStats(sessionId, [
+      { toolCallId: "task_1", agentId: "gone", agentType: "Explore" },
+    ]);
+
+    expect(stats).toEqual([]);
+  });
+});
+
 describe("replaySessionHistory: queued_command (mid-turn steering) attachments", () => {
   type ReplayEvent =
     | { kind: "user" | "agent"; text: string; messageId?: string }

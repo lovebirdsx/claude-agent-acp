@@ -122,8 +122,11 @@ import {
   parseTaskCreateOutput,
   planEntries,
   registerHookCallback,
+  SubagentStatsEntry,
   SubagentStatsState,
+  replayedSubagentCardFromResult,
   subagentStatsToMeta,
+  subagentTallyFromTranscript,
   TaskState,
   taskCreateOutputFromToolUseResult,
   taskStateToPlanEntries,
@@ -1844,6 +1847,11 @@ export class ClaudeAcpAgent {
    *  the running generation and settled `end_turn`. See
    *  {@link DEFAULT_ORPHAN_QUEUED_TURN_GRACE_MS}. Mutable so tests can shrink it. */
   orphanQueuedTurnGraceMs: number = DEFAULT_ORPHAN_QUEUED_TURN_GRACE_MS;
+
+  /** Memoized per-agentId sub-agent tallies rebuilt from their transcripts on
+   *  replay — a completed run's totals are immutable, so rewind/fork re-replays
+   *  skip the disk read. See {@link restampReplayedSubagentStats}. */
+  private readonly subagentTallyCache = new Map<string, SubagentStatsEntry>();
 
   constructor(client: AcpClient, logger?: Logger) {
     this.sessions = {};
@@ -5811,6 +5819,10 @@ export class ClaudeAcpAgent {
       this.sessions[sessionId]?.cwd,
     );
     const fullChain = rawEntries ? rebuildTranscriptDisplayChain(rawEntries) : undefined;
+    // Sidecar lookup for the sub-agent stats restamp below: `getSessionMessages`
+    // strips the transcript's `toolUseResult`, the raw rows keep it.
+    const rawEntryByUuid = new Map<string, RawTranscriptEntry>();
+    for (const entry of rawEntries ?? []) rawEntryByUuid.set(entry.uuid, entry);
     if (fullChain !== undefined && rawEntries) {
       this.logger.log(
         `replay: rebuilt full display chain for ${sessionId}: ${fullChain.length} entries ` +
@@ -5835,6 +5847,14 @@ export class ClaudeAcpAgent {
     // replay surfaces/settles, then backfill the forked-off results below.
     const surfacedToolCalls = new Set<string>();
     const settledToolCalls = new Set<string>();
+    // Completed Task cards seen during this replay, restamped with their
+    // re-accumulated sub-agent tallies after the replay finishes (see
+    // restampReplayedSubagentStats).
+    const pendingSubagentRestamps: Array<{
+      toolCallId: string;
+      agentId: string;
+      agentType?: string;
+    }> = [];
     const trackToolCallLifecycle = (notification: SessionNotification): void => {
       const update = notification.update;
       if (update.sessionUpdate === "tool_call") {
@@ -5943,6 +5963,28 @@ export class ClaudeAcpAgent {
         if (content === null) continue;
       }
 
+      // The per-sub-agent tally lives only in process memory, accumulated from
+      // sidechain messages the parent-chain replay never sees — a resumed
+      // session's Task cards would lose their token/cost readout. Collect each
+      // replayed Task result's card here (the sidecar's `agentId` locates the
+      // sub-agent transcript to re-accumulate from); the stats themselves are
+      // restamped after the replay finishes, off the load critical path.
+      // `getSessionMessages` doesn't expose the sidecar, so fall back to the
+      // raw transcript row matched by uuid. Must run BEFORE the notification
+      // loop below: tool_result handling prunes the tool_use from the cache,
+      // and the card lookup needs its name to recognize Task cards.
+      if (message.type === "user") {
+        const sidecar =
+          (message as { tool_use_result?: unknown }).tool_use_result ??
+          (message as { toolUseResult?: unknown }).toolUseResult ??
+          (message.uuid !== undefined
+            ? (rawEntryByUuid.get(message.uuid) as { toolUseResult?: unknown } | undefined)
+                ?.toolUseResult
+            : undefined);
+        const card = replayedSubagentCardFromResult(content, sidecar, toolUseCache);
+        if (card !== undefined) pendingSubagentRestamps.push(card);
+      }
+
       for (const notification of toAcpNotifications(
         // @ts-expect-error - untyped in SDK but we handle all of these
         content,
@@ -5982,7 +6024,13 @@ export class ClaudeAcpAgent {
       surfacedToolCalls,
       settledToolCalls,
       toolUseCache,
+      pendingSubagentRestamps,
     );
+
+    // Deliberately not awaited: re-accumulating each Task card's tally reads
+    // the sub-agent transcripts from disk, which must not stretch session
+    // load. The stats trickle in right after, like the live stream's do.
+    void this.restampReplayedSubagentStats(sessionId, pendingSubagentRestamps);
   }
 
   /**
@@ -6001,6 +6049,7 @@ export class ClaudeAcpAgent {
     surfacedToolCalls: Set<string>,
     settledToolCalls: Set<string>,
     toolUseCache: ToolUseCache,
+    pendingSubagentRestamps: Array<{ toolCallId: string; agentId: string; agentType?: string }>,
   ): Promise<void> {
     if (rawEntries === undefined) return;
     const orphaned = new Set(
@@ -6023,6 +6072,15 @@ export class ClaudeAcpAgent {
         );
       }) as ContentBlockParam[];
       if (blocks.length === 0) continue;
+      // Same collection as the main replay loop: a forked-off Task result also
+      // carries the tool_use_result sidecar on its raw transcript row. Must
+      // run before the notification loop prunes the tool_use from the cache.
+      const card = replayedSubagentCardFromResult(
+        blocks,
+        (entry as { toolUseResult?: unknown }).toolUseResult,
+        toolUseCache,
+      );
+      if (card !== undefined) pendingSubagentRestamps.push(card);
       for (const notification of toAcpNotifications(
         blocks,
         "user",
@@ -6046,6 +6104,66 @@ export class ClaudeAcpAgent {
         `replay: backfilled ${backfilled} tool_result(s) forked off the display chain for ${sessionId}`,
       );
     }
+  }
+
+  /**
+   * Restamp replayed Task cards with their real sub-agent tallies, deferred
+   * off the replay critical path (the caller doesn't await). The result row's
+   * sidecar `usage` only covers the sub-agent's final API call — the honest
+   * numbers come from folding every assistant turn of the sub-agent's own
+   * transcript (`<session>/subagents/agent-<agentId>.jsonl`), exactly like the
+   * live tally. Reads run in parallel; completed tallies are immutable so they
+   * memoize per agentId across re-replays (rewind/fork). A missing or empty
+   * transcript skips its card: no stats beats wrong stats.
+   */
+  private async restampReplayedSubagentStats(
+    sessionId: string,
+    cards: Array<{ toolCallId: string; agentId: string; agentType?: string }>,
+  ): Promise<void> {
+    if (cards.length === 0) return;
+    let subagentsDir: string;
+    try {
+      const transcriptFile = await this.findTranscriptFile(
+        sessionId,
+        this.sessions[sessionId]?.cwd,
+      );
+      if (transcriptFile === undefined) return;
+      subagentsDir = path.join(
+        path.dirname(transcriptFile),
+        path.basename(transcriptFile, ".jsonl"),
+        "subagents",
+      );
+    } catch {
+      return;
+    }
+    await Promise.all(
+      cards.map(async (card) => {
+        try {
+          let tally = this.subagentTallyCache.get(card.agentId);
+          if (tally === undefined) {
+            const raw = await fs.readFile(
+              path.join(subagentsDir, `agent-${card.agentId}.jsonl`),
+              "utf8",
+            );
+            tally = subagentTallyFromTranscript(raw, card.agentType);
+            if (tally === undefined) return;
+            this.subagentTallyCache.set(card.agentId, tally);
+          }
+          await this.client.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: card.toolCallId,
+              _meta: { "_universe/subagentStats": subagentStatsToMeta(tally) },
+            },
+          });
+        } catch (error) {
+          this.logger.log(
+            `replay: skipped sub-agent stats restamp for ${card.toolCallId}: ${error}`,
+          );
+        }
+      }),
+    );
   }
 
   async readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {

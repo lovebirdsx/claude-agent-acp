@@ -23,6 +23,8 @@ import {
   parseTaskCreateOutput,
   taskStateToPlanEntries,
   accumulateSubagentUsage,
+  subagentTallyFromTranscript,
+  replayedSubagentCardFromResult,
   subagentStatsToMeta,
   SubagentStatsState,
   TaskState,
@@ -3366,6 +3368,107 @@ describe("accumulateSubagentUsage", () => {
       cacheReadTokens: 0,
       cacheCreateTokens: 0,
     });
+  });
+});
+
+describe("replayedSubagentCardFromResult", () => {
+  const cache = {
+    task_1: { name: "Agent" },
+    bash_1: { name: "Bash" },
+  };
+  const resultContent = (id: string) => [{ type: "tool_result", tool_use_id: id, content: "ok" }];
+  const sidecar = {
+    status: "completed",
+    agentId: "abc",
+    agentType: "general-purpose",
+    resolvedModel: "claude-sonnet-5",
+    usage: { input_tokens: 228, output_tokens: 3406 },
+  };
+
+  it("extracts the sub-agent identity from a completed Task sidecar", () => {
+    expect(replayedSubagentCardFromResult(resultContent("task_1"), sidecar, cache)).toEqual({
+      toolCallId: "task_1",
+      agentId: "abc",
+      agentType: "general-purpose",
+    });
+  });
+
+  it("ignores non-Task tools, missing sidecars, and sidecars without an agentId", () => {
+    expect(replayedSubagentCardFromResult(resultContent("bash_1"), sidecar, cache)).toBeUndefined();
+    expect(
+      replayedSubagentCardFromResult(resultContent("task_1"), undefined, cache),
+    ).toBeUndefined();
+    expect(
+      replayedSubagentCardFromResult(
+        resultContent("task_1"),
+        { ...sidecar, agentId: undefined },
+        cache,
+      ),
+    ).toBeUndefined();
+  });
+});
+
+describe("subagentTallyFromTranscript", () => {
+  const row = (type: string, usage?: Record<string, number>, model?: string) =>
+    JSON.stringify({
+      type,
+      message: { role: type, model, ...(usage !== undefined ? { usage } : {}), content: [] },
+    });
+
+  it("folds every assistant turn's usage like the live tally", () => {
+    const raw = [
+      row("user"),
+      row(
+        "assistant",
+        { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 1000 },
+        "kimi-k3",
+      ),
+      row("user"),
+      row(
+        "assistant",
+        { input_tokens: 200, output_tokens: 20, cache_read_input_tokens: 2000 },
+        "kimi-k3",
+      ),
+      "not json at all",
+      "",
+    ].join("\n");
+    expect(subagentTallyFromTranscript(raw, "Explore")).toEqual({
+      model: "kimi-k3",
+      subagentType: "Explore",
+      inputTokens: 300,
+      outputTokens: 30,
+      cacheReadTokens: 3000,
+      cacheCreateTokens: 0,
+    });
+  });
+
+  it("returns undefined when no assistant usage exists (missing beats wrong)", () => {
+    expect(subagentTallyFromTranscript("", "Explore")).toBeUndefined();
+    expect(subagentTallyFromTranscript(row("user"), "Explore")).toBeUndefined();
+    expect(
+      subagentTallyFromTranscript(
+        row("assistant", { input_tokens: 0, output_tokens: 0 }, "kimi-k3"),
+        "Explore",
+      ),
+    ).toBeUndefined();
+  });
+
+  it("keeps tokens but drops a synthetic model, and survives huge non-assistant rows", () => {
+    const raw = [
+      JSON.stringify({
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "t", content: "assistant ".repeat(50) }],
+        },
+      }),
+      row("assistant", { input_tokens: 5, output_tokens: 7 }, "<synthetic>"),
+    ].join("\n");
+    const tally = subagentTallyFromTranscript(raw);
+    expect(tally).toBeDefined();
+    expect(tally).not.toHaveProperty("model");
+    expect(tally!.inputTokens).toBe(5);
+    expect(tally!.outputTokens).toBe(7);
   });
 });
 
