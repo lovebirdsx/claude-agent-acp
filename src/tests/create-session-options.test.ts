@@ -232,6 +232,39 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.env?.CLAUDE_CODE_SUBAGENT_MODEL).toBeFalsy();
   });
 
+  it("defaults CLAUDE_CODE_ENTRYPOINT to cli", async () => {
+    vi.stubEnv("CLAUDE_CODE_ENTRYPOINT", "");
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect(capturedOptions!.env?.CLAUDE_CODE_ENTRYPOINT).toBe("cli");
+  });
+
+  it("respects a caller-provided CLAUDE_CODE_ENTRYPOINT", async () => {
+    vi.stubEnv("CLAUDE_CODE_ENTRYPOINT", "");
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            env: {
+              CLAUDE_CODE_ENTRYPOINT: "sdk-ts",
+            },
+          },
+        },
+      },
+    });
+
+    expect(capturedOptions!.env?.CLAUDE_CODE_ENTRYPOINT).toBe("sdk-ts");
+  });
+
+  it("respects a host-provided CLAUDE_CODE_ENTRYPOINT", async () => {
+    vi.stubEnv("CLAUDE_CODE_ENTRYPOINT", "sdk-ts");
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect(capturedOptions!.env?.CLAUDE_CODE_ENTRYPOINT).toBe("sdk-ts");
+  });
+
   it("inherits HOME and PATH from process.env when no env is provided", async () => {
     await agent.newSession({
       cwd: process.cwd(),
