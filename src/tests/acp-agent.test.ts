@@ -14592,6 +14592,84 @@ describe("replaySessionHistory: sub-agent process replayed from the sub-agent tr
     ).resolves.toBeUndefined();
     expect(updates).toEqual([]);
   });
+
+  async function writeSidecarRaw(agentId: string, body: string): Promise<void> {
+    await nodeFs.writeFile(nodePath.join(subagentsDir, `agent-${agentId}.jsonl`), body, "utf8");
+  }
+
+  async function sidecarSize(agentId: string): Promise<number> {
+    return (await nodeFs.stat(nodePath.join(subagentsDir, `agent-${agentId}.jsonl`))).size;
+  }
+
+  const nestedFor =
+    (parentId: string): ((n: SessionNotification) => boolean) =>
+    (n) =>
+      parentToolUseIdOf(n.update) === parentId;
+
+  it("delivers nested notifications before replaySessionHistory resolves (inside the load window)", async () => {
+    await writeMainTranscript("sub1");
+    await writeSubagentProcessTranscript("sub1");
+
+    const { agent, updates } = createRecordingAgent();
+    (agent as any).clientCapabilities = { _meta: { "subagent-transcript": true } };
+    await (agent as any).replaySessionHistory(sessionId);
+
+    // No vi.waitFor: replaySubagentTranscripts is awaited, so the nested
+    // children must already be on the client when the replay (and the
+    // `session/load` response it backs) resolves. With the old fire-and-forget
+    // call this assertion would race and fail.
+    expect(updates.some(childToolCompletion)).toBe(true);
+  });
+
+  it("skips a card whose sidecar exceeds the per-file cap without affecting other cards", async () => {
+    await writeMainTranscript("unused");
+    await writeSubagentProcessTranscript("small");
+    await writeSidecarRaw("big", "x".repeat(64 * 1024));
+
+    const { agent, updates } = createRecordingAgent();
+    // fileCapBytes just above the small sidecar's size: "small" passes, "big"
+    // (64KB) is skipped. totalCapBytes is large enough to be irrelevant here.
+    const fileCapBytes = (await sidecarSize("small")) + 1;
+    await (agent as any).replaySubagentTranscripts(
+      sessionId,
+      [
+        { toolCallId: "task_small", agentId: "small", agentType: "Explore" },
+        { toolCallId: "task_big", agentId: "big", agentType: "Explore" },
+      ],
+      true,
+      fileCapBytes,
+      1024 * 1024,
+    );
+
+    expect(updates.some(nestedFor("task_small"))).toBe(true);
+    expect(updates.some(nestedFor("task_big"))).toBe(false);
+  });
+
+  it("stops replaying remaining cards once the cumulative cap is exceeded", async () => {
+    await writeMainTranscript("unused");
+    await writeSubagentProcessTranscript("a");
+    await writeSubagentProcessTranscript("b");
+
+    const sizeA = await sidecarSize("a");
+    const sizeB = await sidecarSize("b");
+
+    const { agent, updates } = createRecordingAgent();
+    // totalCapBytes fits "a" but not "a" + "b": the first card replays, the
+    // second is cut off by the cumulative cap.
+    await (agent as any).replaySubagentTranscripts(
+      sessionId,
+      [
+        { toolCallId: "task_a", agentId: "a", agentType: "Explore" },
+        { toolCallId: "task_b", agentId: "b", agentType: "Explore" },
+      ],
+      true,
+      1024 * 1024, // fileCapBytes: irrelevant, both files are tiny
+      sizeA + sizeB - 1,
+    );
+
+    expect(updates.some(nestedFor("task_a"))).toBe(true);
+    expect(updates.some(nestedFor("task_b"))).toBe(false);
+  });
 });
 
 describe("replaySessionHistory: queued_command (mid-turn steering) attachments", () => {

@@ -150,6 +150,10 @@ const execFileAsync = promisify(execFile);
 
 const MAX_TITLE_LENGTH = 256;
 
+// Per-file and cumulative byte caps for sub-agent sidecar replay (see replaySubagentTranscripts).
+const SUBAGENT_REPLAY_FILE_CAP_BYTES = 16 * 1024 * 1024;
+const SUBAGENT_REPLAY_TOTAL_CAP_BYTES = 48 * 1024 * 1024;
+
 /**
  * Custom (extension) request the editor sends to persist a session title onto
  * the agent's durable store. Without this the editor's AI-generated title lives
@@ -6056,11 +6060,13 @@ export class ClaudeAcpAgent {
     // the sub-agent transcripts from disk, which must not stretch session
     // load. The stats trickle in right after, like the live stream's do.
     void this.restampReplayedSubagentStats(sessionId, pendingSubagentRestamps);
-    // Same deferred treatment: the sub-agents' processes (thoughts, text,
-    // nested tool calls) replay from their sidecar transcripts after load —
-    // the children arrive like the live sidechain did. The stats restamp and
-    // this update disjoint fields, so order between them doesn't matter.
-    void this.replaySubagentTranscripts(sessionId, pendingSubagentRestamps, forwardSubagentText);
+    // This one must be awaited: the client's history-replay ingestion budget
+    // treats the `session/load` response as the end of replay, so nested
+    // notifications delivered after it bypass the renderer's OOM circuit
+    // breaker (a giant sub-agent once grew the renderer to 5.5GB and OOM'd).
+    // Awaiting keeps the children inside the load window; the stats restamp
+    // above updates disjoint fields, so its fire-and-forget timing is fine.
+    await this.replaySubagentTranscripts(sessionId, pendingSubagentRestamps, forwardSubagentText);
   }
 
   /**
@@ -6211,17 +6217,23 @@ export class ClaudeAcpAgent {
    * same shape the live stream used (`parentToolUseId`-stamped notifications),
    * so the client renders replay and live identically.
    *
-   * Deferred off the replay critical path like {@link restampReplayedSubagentStats}:
-   * the caller doesn't await, and the children trickle in right after load.
-   * Per-card entries must arrive in order, so cards are processed sequentially
-   * (never Promise.all). Each card gets its own `toolUseCache` so the
-   * sub-agent's tool_use/tool_result pairs can't pollute the parent chain's
-   * cache. A missing transcript skips its card (no children beats wrong ones).
+   * Awaited by {@link replaySessionHistory} so the nested children land inside
+   * the load window: the client's history-replay ingestion budget treats the
+   * `session/load` response as the end of replay, and notifications delivered
+   * after it bypass the renderer's OOM circuit breaker. Per-card entries must
+   * arrive in order, so cards are processed sequentially (never Promise.all).
+   * Each card gets its own `toolUseCache` so the sub-agent's tool_use/tool_result
+   * pairs can't pollute the parent chain's cache. A missing or oversized
+   * transcript skips its card (no children beats wrong ones); a per-file byte
+   * cap and a cumulative per-load byte cap bound how much sidecar data one
+   * replay can push (a giant sub-agent once grew the renderer to 5.5GB).
    */
   private async replaySubagentTranscripts(
     sessionId: string,
     cards: Array<{ toolCallId: string; agentId: string; agentType?: string }>,
     forwardSubagentText: boolean,
+    fileCapBytes: number = SUBAGENT_REPLAY_FILE_CAP_BYTES,
+    totalCapBytes: number = SUBAGENT_REPLAY_TOTAL_CAP_BYTES,
   ): Promise<void> {
     if (cards.length === 0) return;
     let subagentsDir: string;
@@ -6240,14 +6252,41 @@ export class ClaudeAcpAgent {
       return;
     }
     let totalEntries = 0;
+    let replayedCards = 0;
+    let totalBytes = 0;
     for (const card of cards) {
-      let raw: string;
+      const file = path.join(subagentsDir, `agent-${card.agentId}.jsonl`);
+      let size: number;
       try {
-        raw = await fs.readFile(path.join(subagentsDir, `agent-${card.agentId}.jsonl`), "utf8");
+        size = (await fs.stat(file)).size;
       } catch (error) {
         this.logger.log(`subagent replay: skipped ${card.toolCallId}: ${error}`);
         continue;
       }
+      if (size > fileCapBytes) {
+        this.logger.log(
+          `subagent replay: skipped ${card.toolCallId}: sidecar ${size} bytes exceeds ` +
+            `${fileCapBytes} byte cap`,
+        );
+        continue;
+      }
+      if (totalBytes + size > totalCapBytes) {
+        this.logger.log(
+          `subagent replay: stopped after ${replayedCards}/${cards.length} cards ` +
+            `(${totalBytes} bytes replayed) — remaining would exceed ${totalCapBytes} byte cap ` +
+            `for ${sessionId}`,
+        );
+        break;
+      }
+      let raw: string;
+      try {
+        raw = await fs.readFile(file, "utf8");
+      } catch (error) {
+        this.logger.log(`subagent replay: skipped ${card.toolCallId}: ${error}`);
+        continue;
+      }
+      totalBytes += size;
+      replayedCards += 1;
       const entries = subagentReplayEntriesFromTranscript(raw);
       const toolUseCache: ToolUseCache = {};
       for (const entry of entries) {
@@ -6280,7 +6319,7 @@ export class ClaudeAcpAgent {
       totalEntries += entries.length;
     }
     this.logger.log(
-      `replay: replayed ${totalEntries} sub-agent entries across ${cards.length} card(s) for ${sessionId}`,
+      `replay: replayed ${totalEntries} sub-agent entries across ${replayedCards}/${cards.length} card(s) for ${sessionId}`,
     );
   }
 
