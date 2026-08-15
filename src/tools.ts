@@ -1273,6 +1273,16 @@ export type SubagentStatsEntry = {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreateTokens: number;
+  /**
+   * Internal last-seen usage snapshot per API message id — the dedupe ledger
+   * accumulateSubagentUsage uses to replace, not re-add, the earlier frames the
+   * SDK streams for one message. Pure bookkeeping: `subagentStatsToMeta` picks
+   * fields explicitly, so this never reaches `_meta` serialization.
+   */
+  perMessage?: Map<
+    string,
+    { input: number; output: number; cacheRead: number; cacheCreate: number }
+  >;
 };
 
 /** Per-session sub-agent tallies keyed by the parent tool_use id. */
@@ -1289,9 +1299,20 @@ type SubagentUsage = {
 /**
  * Fold one sub-agent assistant message's usage/model into the tally for its
  * parent tool call. Token counts accumulate across the sub-agent's turns; the
- * model / subagent_type are last-write-wins (a sub-agent uses one model). No-op
- * when the usage carries no positive tokens, so empty frames don't create hollow
- * entries.
+ * model / subagent_type are last-write-wins (a sub-agent uses one model).
+ *
+ * The SDK streams ONE API message as several assistant frames whose usage
+ * block is a point-in-time SNAPSHOT, not a delta — and gateways disagree on
+ * the shape (Moonshot/kimi lead with all-zero frames, Anthropic/deepseek
+ * repeat the full usage every frame). Frames carrying `messageId` therefore
+ * don't accumulate: the newest snapshot for an id REPLACES the previous
+ * frame's contribution (ledgered in `perMessage`), so kimi's zero-lead ends
+ * at the final frame's real numbers while deepseek isn't counted once per
+ * frame. Frames without an id keep the legacy plain accumulation.
+ *
+ * No-op when the usage carries no positive tokens and no new metadata, so
+ * empty frames don't manufacture hollow entries — an all-zero snapshot
+ * subtracts nothing when a later frame of the same id replaces it anyway.
  */
 export function accumulateSubagentUsage(
   state: SubagentStatsState,
@@ -1300,14 +1321,34 @@ export function accumulateSubagentUsage(
     usage?: SubagentUsage | null;
     model?: string | null;
     subagentType?: string | null;
+    messageId?: string | null;
   },
 ): void {
   const u = fields.usage;
-  const input = num(u?.input_tokens);
-  const output = num(u?.output_tokens);
-  const cacheRead = num(u?.cache_read_input_tokens);
-  const cacheCreate = num(u?.cache_creation_input_tokens);
+  const rawInput = num(u?.input_tokens);
+  const rawOutput = num(u?.output_tokens);
+  const rawCacheRead = num(u?.cache_read_input_tokens);
+  const rawCacheCreate = num(u?.cache_creation_input_tokens);
+  let input = rawInput;
+  let output = rawOutput;
+  let cacheRead = rawCacheRead;
+  let cacheCreate = rawCacheCreate;
   const existing = state.get(parentToolUseId);
+  const messageId =
+    typeof fields.messageId === "string" && fields.messageId.length > 0
+      ? fields.messageId
+      : undefined;
+  if (messageId !== undefined) {
+    const prev = existing?.perMessage?.get(messageId);
+    if (prev !== undefined) {
+      // Replace, don't re-add: subtract the earlier snapshot of this same API
+      // message before folding in the newer one.
+      input -= prev.input;
+      output -= prev.output;
+      cacheRead -= prev.cacheRead;
+      cacheCreate -= prev.cacheCreate;
+    }
+  }
   const model =
     typeof fields.model === "string" && fields.model.length > 0 && fields.model !== "<synthetic>"
       ? fields.model
@@ -1325,14 +1366,27 @@ export function accumulateSubagentUsage(
   ) {
     return;
   }
-  state.set(parentToolUseId, {
+  const next: SubagentStatsEntry = {
     ...(model !== undefined ? { model } : {}),
     ...(subagentType !== undefined ? { subagentType } : {}),
     inputTokens: (existing?.inputTokens ?? 0) + input,
     outputTokens: (existing?.outputTokens ?? 0) + output,
     cacheReadTokens: (existing?.cacheReadTokens ?? 0) + cacheRead,
     cacheCreateTokens: (existing?.cacheCreateTokens ?? 0) + cacheCreate,
-  });
+  };
+  if (messageId !== undefined) {
+    const perMessage = existing?.perMessage ?? new Map();
+    perMessage.set(messageId, {
+      input: rawInput,
+      output: rawOutput,
+      cacheRead: rawCacheRead,
+      cacheCreate: rawCacheCreate,
+    });
+    next.perMessage = perMessage;
+  } else if (existing?.perMessage !== undefined) {
+    next.perMessage = existing.perMessage;
+  }
+  state.set(parentToolUseId, next);
 }
 
 /** Serialize one sub-agent tally into the `_meta._universe/subagentStats` shape. */
@@ -1391,10 +1445,14 @@ export function replayedSubagentCardFromResult(
  * Re-accumulate a sub-agent's tally from its own transcript file
  * (`<session>/subagents/agent-<agentId>.jsonl`), folding every assistant
  * turn's usage exactly like the live accumulateSubagentUsage path — each
- * turn's cache reads bill separately, so only the sum matches the real spend.
- * Lines are textually prefiltered before JSON.parse: the transcript's biggest
- * rows are tool_result user rows we don't need. Returns undefined when no
- * usage was found (a wrong number is worse than none).
+ * turn's cache reads bill separately, so only the sum matches the real
+ * spend. The transcript holds 2-5 snapshot rows per API message id (the
+ * streaming frames persisted), so rows are deduped by `message.id` exactly
+ * like live frames are: the last snapshot of each message wins, otherwise
+ * the tally reads 2-3x high. Lines are textually prefiltered before
+ * JSON.parse: the transcript's biggest rows are tool_result user rows we
+ * don't need. Returns undefined when no usage was found (a wrong number is
+ * worse than none).
  */
 export function subagentTallyFromTranscript(
   raw: string,
@@ -1413,13 +1471,18 @@ export function subagentTallyFromTranscript(
     if (parsed == null || typeof parsed !== "object") continue;
     const entry = parsed as {
       type?: unknown;
-      message?: { usage?: SubagentUsage | null; model?: string | null } | null;
+      message?: {
+        id?: unknown;
+        usage?: SubagentUsage | null;
+        model?: string | null;
+      } | null;
     };
     if (entry.type !== "assistant" || entry.message == null) continue;
     accumulateSubagentUsage(state, KEY, {
       usage: entry.message.usage,
       model: entry.message.model,
       ...(agentType !== undefined ? { subagentType: agentType } : {}),
+      ...(typeof entry.message.id === "string" ? { messageId: entry.message.id } : {}),
     });
   }
   const tally = state.get(KEY);

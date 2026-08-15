@@ -3369,6 +3369,79 @@ describe("accumulateSubagentUsage", () => {
       cacheCreateTokens: 0,
     });
   });
+
+  it("replaces the earlier frame of the same message id (kimi zero-lead sequence)", () => {
+    const state: SubagentStatsState = new Map();
+    // Moonshot/kimi sequence: an all-zero first frame, then the final frame
+    // carrying the full usage — both stamped with the same message id.
+    accumulateSubagentUsage(state, "task-1", {
+      messageId: "m1",
+      model: "kimi-k3",
+      usage: { input_tokens: 0, output_tokens: 0 },
+    });
+    accumulateSubagentUsage(state, "task-1", {
+      messageId: "m1",
+      usage: {
+        input_tokens: 4124,
+        output_tokens: 326,
+        cache_read_input_tokens: 21335,
+      },
+    });
+    const entry = state.get("task-1")!;
+    expect(entry.model).toBe("kimi-k3");
+    expect(entry.inputTokens).toBe(4124);
+    expect(entry.outputTokens).toBe(326);
+    expect(entry.cacheReadTokens).toBe(21335);
+    expect(entry.cacheCreateTokens).toBe(0);
+    // The perMessage dedupe ledger is internal bookkeeping and must not reach
+    // the _meta wire shape.
+    expect(subagentStatsToMeta(entry)).toEqual({
+      model: "kimi-k3",
+      inputTokens: 4124,
+      outputTokens: 326,
+      cacheReadTokens: 21335,
+      cacheCreateTokens: 0,
+    });
+  });
+
+  it("dedupes full-usage repeat frames by id but still sums distinct messages", () => {
+    const state: SubagentStatsState = new Map();
+    // Anthropic/deepseek sequence: every frame carries the full usage of the
+    // same API message, so the second frame must REPLACE the first, not add.
+    accumulateSubagentUsage(state, "task-1", {
+      messageId: "m1",
+      usage: { input_tokens: 19784, output_tokens: 0 },
+    });
+    accumulateSubagentUsage(state, "task-1", {
+      messageId: "m1",
+      usage: { input_tokens: 19784, output_tokens: 316 },
+    });
+    accumulateSubagentUsage(state, "task-1", {
+      messageId: "m2",
+      usage: {
+        input_tokens: 1700,
+        output_tokens: 269,
+        cache_read_input_tokens: 19712,
+      },
+    });
+    const entry = state.get("task-1")!;
+    expect(entry.inputTokens).toBe(19784 + 1700);
+    expect(entry.outputTokens).toBe(316 + 269);
+    expect(entry.cacheReadTokens).toBe(19712);
+  });
+
+  it("keeps plain accumulation for frames without a message id", () => {
+    const state: SubagentStatsState = new Map();
+    accumulateSubagentUsage(state, "task-1", {
+      usage: { input_tokens: 19784, output_tokens: 0 },
+    });
+    accumulateSubagentUsage(state, "task-1", {
+      usage: { input_tokens: 19784, output_tokens: 316 },
+    });
+    const entry = state.get("task-1")!;
+    expect(entry.inputTokens).toBe(19784 * 2);
+    expect(entry.outputTokens).toBe(316);
+  });
 });
 
 describe("replayedSubagentCardFromResult", () => {
@@ -3451,6 +3524,38 @@ describe("subagentTallyFromTranscript", () => {
         "Explore",
       ),
     ).toBeUndefined();
+  });
+
+  it("dedupes the per-message snapshot rows persisted for one API message", () => {
+    const rowWithId = (id: string, usage: Record<string, number>, model?: string) =>
+      JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", id, model, usage, content: [] },
+      });
+    // Two snapshot rows of message m1 (first all-zero, final complete) plus
+    // one row of message m2: the tally must be each message's FINAL frame
+    // summed, not every row summed (which would read ~2-3x high). Rows carry
+    // no message id only on older transcripts, see the no-id test above.
+    const raw = [
+      rowWithId("m1", { input_tokens: 0, output_tokens: 0 }, "kimi-k3"),
+      rowWithId(
+        "m1",
+        { input_tokens: 4124, output_tokens: 326, cache_read_input_tokens: 21335 },
+        "kimi-k3",
+      ),
+      rowWithId(
+        "m2",
+        { input_tokens: 1700, output_tokens: 269, cache_read_input_tokens: 19712 },
+        "kimi-k3",
+      ),
+    ].join("\n");
+    const tally = subagentTallyFromTranscript(raw, "Explore");
+    expect(tally?.model).toBe("kimi-k3");
+    expect(tally?.subagentType).toBe("Explore");
+    expect(tally?.inputTokens).toBe(4124 + 1700);
+    expect(tally?.outputTokens).toBe(326 + 269);
+    expect(tally?.cacheReadTokens).toBe(21335 + 19712);
+    expect(tally?.cacheCreateTokens).toBe(0);
   });
 
   it("keeps tokens but drops a synthetic model, and survives huge non-assistant rows", () => {

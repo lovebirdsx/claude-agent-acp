@@ -4523,7 +4523,31 @@ export class ClaudeAcpAgent {
                 usage: message.message.usage,
                 model: message.message.model,
                 subagentType: message.subagent_type,
+                // One API message streams as several frames with SNAPSHOT
+                // usage; the message id lets the tally replace the earlier
+                // frame instead of double-counting (see the function's doc).
+                messageId: message.message.id,
               });
+            }
+
+            // Some gateways (e.g. Moonshot/kimi) never put a usage snapshot on
+            // streamed frames, so the live tally above can stay at zero or
+            // drift. When a Task result arrives, its sub-agent transcript
+            // already holds the authoritative final-frame usage — restamp the
+            // card with the same transcript-fold the replay path uses. Must
+            // collect the card BEFORE the toAcpNotifications loop below:
+            // tool_result handling prunes the tool_use from the cache, and
+            // the lookup needs its name to recognize Task cards (same reason
+            // the replay side does this before its loop).
+            if (message.type === "user") {
+              const card = replayedSubagentCardFromResult(
+                message.message.content,
+                message.tool_use_result,
+                session.toolUseCache,
+              );
+              if (card !== undefined) {
+                void this.restampReplayedSubagentStats(params.sessionId, [card]);
+              }
             }
 
             let content: typeof message.message.content;
@@ -6112,8 +6136,11 @@ export class ClaudeAcpAgent {
    * sidecar `usage` only covers the sub-agent's final API call — the honest
    * numbers come from folding every assistant turn of the sub-agent's own
    * transcript (`<session>/subagents/agent-<agentId>.jsonl`), exactly like the
-   * live tally. Reads run in parallel; completed tallies are immutable so they
-   * memoize per agentId across re-replays (rewind/fork). A missing or empty
+   * live tally. Not only used at replay: the live prompt loop also lands here
+   * when a Task result arrives, correcting cards whose streamed frames carried
+   * no usable usage snapshot (e.g. Moonshot leads with all-zero frames).
+   * Reads run in parallel; completed tallies are immutable so they memoize
+   * per agentId across re-replays (rewind/fork). A missing or empty
    * transcript skips its card: no stats beats wrong stats.
    */
   private async restampReplayedSubagentStats(
@@ -6159,7 +6186,7 @@ export class ClaudeAcpAgent {
           });
         } catch (error) {
           this.logger.log(
-            `replay: skipped sub-agent stats restamp for ${card.toolCallId}: ${error}`,
+            `subagent stats: skipped restamp for ${card.toolCallId}: ${error}`,
           );
         }
       }),
