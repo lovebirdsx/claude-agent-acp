@@ -14380,6 +14380,220 @@ describe("replaySessionHistory: sub-agent stats restamped from the sub-agent tra
   });
 });
 
+describe("replaySessionHistory: sub-agent process replayed from the sub-agent transcript", () => {
+  // The parent-chain replay restores a Task card's result but not the
+  // sub-agent's execution process — those rows live in the sub-agent's own
+  // sidecar transcript, which only the deferred replaySubagentTranscripts
+  // reads. It re-emits them with the parent card's tool_use id stamped as
+  // `parentToolUseId`, so the client nests them exactly like live sidechain
+  // messages did.
+  function createRecordingAgent() {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (notification: SessionNotification) => {
+        updates.push(notification);
+      },
+      extNotification: async () => {},
+    } as unknown as AcpClient;
+    return { agent: new ClaudeAcpAgent(client, { log: () => {}, error: () => {} }), updates };
+  }
+
+  const parentToolUseIdOf = (update: SessionNotification["update"]): string | undefined =>
+    (update as { _meta?: { claudeCode?: { parentToolUseId?: string } | null } | null })._meta
+      ?.claudeCode?.parentToolUseId;
+
+  const childThought = (n: SessionNotification): boolean =>
+    n.update.sessionUpdate === "agent_thought_chunk" && parentToolUseIdOf(n.update) === "task_1";
+
+  const childMessage = (n: SessionNotification): boolean =>
+    n.update.sessionUpdate === "agent_message_chunk" && parentToolUseIdOf(n.update) === "task_1";
+
+  const childToolCall = (n: SessionNotification): boolean => {
+    const u = n.update;
+    return (
+      u.sessionUpdate === "tool_call" &&
+      u.toolCallId === "child-tool" &&
+      parentToolUseIdOf(u) === "task_1"
+    );
+  };
+
+  const childToolCompletion = (n: SessionNotification): boolean => {
+    const u = n.update;
+    return (
+      u.sessionUpdate === "tool_call_update" &&
+      u.toolCallId === "child-tool" &&
+      u.status === "completed" &&
+      parentToolUseIdOf(u) === "task_1"
+    );
+  };
+
+  let sessionId: string;
+  let projectDir: string;
+  let transcript: string;
+  let subagentsDir: string;
+
+  beforeEach(async () => {
+    sessionId = randomUUID();
+    projectDir = nodePath.join(
+      CLAUDE_CONFIG_DIR,
+      "projects",
+      `__subagent_process_replay_test_${randomUUID()}`,
+    );
+    subagentsDir = nodePath.join(projectDir, sessionId, "subagents");
+    await nodeFs.mkdir(subagentsDir, { recursive: true });
+    transcript = nodePath.join(projectDir, `${sessionId}.jsonl`);
+  });
+
+  afterEach(async () => {
+    await nodeFs.rm(projectDir, { recursive: true, force: true });
+  });
+
+  async function writeMainTranscript(agentId: string): Promise<void> {
+    const rows: Array<Record<string, unknown>> = [
+      {
+        type: "user",
+        uuid: "u1",
+        parentUuid: null,
+        message: { role: "user", content: "delegate" },
+      },
+      {
+        type: "assistant",
+        uuid: "a1",
+        parentUuid: "u1",
+        message: {
+          id: "msg_1",
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "task_1", name: "Agent", input: { prompt: "go" } },
+          ],
+        },
+      },
+      {
+        type: "user",
+        uuid: "r1",
+        parentUuid: "a1",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "task_1", content: "report" }],
+        },
+        toolUseResult: {
+          status: "completed",
+          agentId,
+          agentType: "Explore",
+          content: [{ type: "text", text: "report" }],
+        },
+      },
+    ];
+    await nodeFs.writeFile(
+      transcript,
+      rows.map((r) => JSON.stringify(r)).join("\n") + "\n",
+      "utf8",
+    );
+  }
+
+  async function writeSubagentProcessTranscript(agentId: string): Promise<void> {
+    const rows = [
+      JSON.stringify({
+        type: "user",
+        uuid: "su1",
+        isSidechain: true,
+        message: { role: "user", content: "go explore" },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        uuid: "sa1",
+        isSidechain: true,
+        message: {
+          id: "msg_sub_1",
+          role: "assistant",
+          model: "claude-sonnet-5",
+          content: [
+            { type: "thinking", thinking: "pondering", signature: "" },
+            { type: "text", text: "step one" },
+            { type: "tool_use", id: "child-tool", name: "Bash", input: { command: "pwd" } },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "user",
+        uuid: "su2",
+        isSidechain: true,
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "child-tool", content: "pwd output" }],
+        },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        uuid: "sa2",
+        isSidechain: true,
+        message: {
+          id: "msg_sub_2",
+          role: "assistant",
+          model: "claude-sonnet-5",
+          content: [{ type: "text", text: "done" }],
+        },
+      }),
+    ];
+    await nodeFs.writeFile(
+      nodePath.join(subagentsDir, `agent-${agentId}.jsonl`),
+      rows.join("\n") + "\n",
+      "utf8",
+    );
+  }
+
+  it("capable client gets nested thoughts, text, and tool calls stamped with parentToolUseId", async () => {
+    await writeMainTranscript("sub1");
+    await writeSubagentProcessTranscript("sub1");
+
+    const { agent, updates } = createRecordingAgent();
+    (agent as any).clientCapabilities = { _meta: { "subagent-transcript": true } };
+    await (agent as any).replaySessionHistory(sessionId);
+
+    await vi.waitFor(() => expect(updates.some(childToolCompletion)).toBe(true));
+
+    const textOf = (n: SessionNotification): string =>
+      (n.update as { content: { text: string } }).content.text;
+    expect(updates.filter(childThought).map(textOf)).toEqual(["pondering"]);
+    expect(updates.filter(childMessage).map(textOf)).toEqual(["step one", "done"]);
+    expect(updates.some(childToolCall)).toBe(true);
+
+    // The sub-agent's initial prompt is never replayed: it never reached the
+    // client feed live (the parent card already shows the Task input).
+    const initialPrompt = updates.filter(
+      (n) => n.update.sessionUpdate === "user_message_chunk" && textOf(n) === "go explore",
+    );
+    expect(initialPrompt).toEqual([]);
+  });
+
+  it("legacy client gets only the nested tool attribution, no text/thinking", async () => {
+    await writeMainTranscript("sub1");
+    await writeSubagentProcessTranscript("sub1");
+
+    const { agent, updates } = createRecordingAgent();
+    await (agent as any).replaySessionHistory(sessionId);
+
+    await vi.waitFor(() => expect(updates.some(childToolCompletion)).toBe(true));
+
+    expect(updates.filter(childThought)).toEqual([]);
+    expect(updates.filter(childMessage)).toEqual([]);
+    expect(updates.some(childToolCall)).toBe(true);
+  });
+
+  it("does not throw when the sub-agent transcript is missing", async () => {
+    await writeMainTranscript("gone");
+    const { agent, updates } = createRecordingAgent();
+    await expect(
+      (agent as any).replaySubagentTranscripts(
+        sessionId,
+        [{ toolCallId: "task_1", agentId: "gone", agentType: "Explore" }],
+        true,
+      ),
+    ).resolves.toBeUndefined();
+    expect(updates).toEqual([]);
+  });
+});
+
 describe("replaySessionHistory: queued_command (mid-turn steering) attachments", () => {
   type ReplayEvent =
     | { kind: "user" | "agent"; text: string; messageId?: string }

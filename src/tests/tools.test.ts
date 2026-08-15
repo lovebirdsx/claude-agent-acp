@@ -24,6 +24,7 @@ import {
   taskStateToPlanEntries,
   accumulateSubagentUsage,
   subagentTallyFromTranscript,
+  subagentReplayEntriesFromTranscript,
   replayedSubagentCardFromResult,
   subagentStatsToMeta,
   SubagentStatsState,
@@ -3574,6 +3575,105 @@ describe("subagentTallyFromTranscript", () => {
     expect(tally).not.toHaveProperty("model");
     expect(tally!.inputTokens).toBe(5);
     expect(tally!.outputTokens).toBe(7);
+  });
+});
+
+describe("subagentReplayEntriesFromTranscript", () => {
+  const line = (fields: Record<string, unknown>) => JSON.stringify(fields);
+
+  it("drops a sub-agent's initial user prompt (string content never reached the live feed)", () => {
+    const raw = [
+      line({ type: "user", uuid: "su1", message: { role: "user", content: "delegate" } }),
+    ].join("\n");
+    expect(subagentReplayEntriesFromTranscript(raw)).toEqual([]);
+  });
+
+  it("keeps user tool_result rows with content reduced to only tool_result blocks", () => {
+    const raw = [
+      line({
+        type: "user",
+        uuid: "su2",
+        isSidechain: true,
+        message: {
+          role: "user",
+          content: [
+            { type: "text", text: "interleaved prose" },
+            { type: "tool_result", tool_use_id: "child-tool", content: "pwd" },
+          ],
+        },
+      }),
+    ].join("\n");
+    expect(subagentReplayEntriesFromTranscript(raw)).toEqual([
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "child-tool", content: "pwd" }],
+      },
+    ]);
+  });
+
+  it("passes assistant content through untouched and carries messageId + model", () => {
+    const content = [
+      { type: "thinking", thinking: "pondering", signature: "" },
+      { type: "text", text: "step one" },
+      { type: "tool_use", id: "child-tool", name: "Bash", input: { command: "pwd" } },
+    ];
+    const raw = [
+      line({
+        type: "assistant",
+        uuid: "sa1",
+        isSidechain: true,
+        message: { role: "assistant", id: "msg_sub_1", model: "claude-sonnet-5", content },
+      }),
+    ].join("\n");
+    expect(subagentReplayEntriesFromTranscript(raw)).toEqual([
+      { role: "assistant", content, model: "claude-sonnet-5", messageId: "msg_sub_1" },
+    ]);
+  });
+
+  it("skips isMeta / teamName / nested sidechain rows", () => {
+    const raw = [
+      line({ type: "assistant", isMeta: true, message: { role: "assistant", content: [] } }),
+      line({
+        type: "assistant",
+        teamName: "team-a",
+        message: { role: "assistant", content: [{ type: "text", text: "team row" }] },
+      }),
+      line({
+        type: "assistant",
+        parent_tool_use_id: "grandparent-tool",
+        message: { role: "assistant", content: [{ type: "text", text: "nested" }] },
+      }),
+    ].join("\n");
+    expect(subagentReplayEntriesFromTranscript(raw)).toEqual([]);
+  });
+
+  it("keeps isSidechain rows (every sidecar line is sidechain by nature)", () => {
+    const raw = [
+      line({
+        type: "assistant",
+        isSidechain: true,
+        message: { role: "assistant", content: [{ type: "text", text: "sidechain row" }] },
+      }),
+    ].join("\n");
+    expect(subagentReplayEntriesFromTranscript(raw)).toEqual([
+      { role: "assistant", content: [{ type: "text", text: "sidechain row" }] },
+    ]);
+  });
+
+  it("tolerates bad JSON and blank lines, keeping the good rows in order", () => {
+    const raw = [
+      "not json at all",
+      "",
+      line({
+        type: "assistant",
+        isSidechain: true,
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+      }),
+      "{broken",
+    ].join("\n");
+    expect(subagentReplayEntriesFromTranscript(raw)).toEqual([
+      { role: "assistant", content: [{ type: "text", text: "ok" }] },
+    ]);
   });
 });
 

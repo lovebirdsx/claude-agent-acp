@@ -125,6 +125,7 @@ import {
   SubagentStatsEntry,
   SubagentStatsState,
   replayedSubagentCardFromResult,
+  subagentReplayEntriesFromTranscript,
   subagentStatsToMeta,
   subagentTallyFromTranscript,
   TaskState,
@@ -6055,6 +6056,11 @@ export class ClaudeAcpAgent {
     // the sub-agent transcripts from disk, which must not stretch session
     // load. The stats trickle in right after, like the live stream's do.
     void this.restampReplayedSubagentStats(sessionId, pendingSubagentRestamps);
+    // Same deferred treatment: the sub-agents' processes (thoughts, text,
+    // nested tool calls) replay from their sidecar transcripts after load —
+    // the children arrive like the live sidechain did. The stats restamp and
+    // this update disjoint fields, so order between them doesn't matter.
+    void this.replaySubagentTranscripts(sessionId, pendingSubagentRestamps, forwardSubagentText);
   }
 
   /**
@@ -6190,6 +6196,91 @@ export class ClaudeAcpAgent {
           );
         }
       }),
+    );
+  }
+
+  /**
+   * Replay a sub-agent's execution process from its sidecar transcript, so a
+   * resumed/reloaded session's Task card shows the same nested children it
+   * showed live. Live, the SDK streams the sub-agent's turns as sidechain
+   * messages tagged with `parent_tool_use_id`; the client nests them under the
+   * parent card as they arrive. The parent-chain replay never sees that
+   * sidechain — its rows live in `<session>/subagents/agent-<agentId>.jsonl` —
+   * so without this the card's children (thoughts, text, nested tool calls)
+   * would be missing and only the result would show. We re-emit them in the
+   * same shape the live stream used (`parentToolUseId`-stamped notifications),
+   * so the client renders replay and live identically.
+   *
+   * Deferred off the replay critical path like {@link restampReplayedSubagentStats}:
+   * the caller doesn't await, and the children trickle in right after load.
+   * Per-card entries must arrive in order, so cards are processed sequentially
+   * (never Promise.all). Each card gets its own `toolUseCache` so the
+   * sub-agent's tool_use/tool_result pairs can't pollute the parent chain's
+   * cache. A missing transcript skips its card (no children beats wrong ones).
+   */
+  private async replaySubagentTranscripts(
+    sessionId: string,
+    cards: Array<{ toolCallId: string; agentId: string; agentType?: string }>,
+    forwardSubagentText: boolean,
+  ): Promise<void> {
+    if (cards.length === 0) return;
+    let subagentsDir: string;
+    try {
+      const transcriptFile = await this.findTranscriptFile(
+        sessionId,
+        this.sessions[sessionId]?.cwd,
+      );
+      if (transcriptFile === undefined) return;
+      subagentsDir = path.join(
+        path.dirname(transcriptFile),
+        path.basename(transcriptFile, ".jsonl"),
+        "subagents",
+      );
+    } catch {
+      return;
+    }
+    let totalEntries = 0;
+    for (const card of cards) {
+      let raw: string;
+      try {
+        raw = await fs.readFile(path.join(subagentsDir, `agent-${card.agentId}.jsonl`), "utf8");
+      } catch (error) {
+        this.logger.log(`subagent replay: skipped ${card.toolCallId}: ${error}`);
+        continue;
+      }
+      const entries = subagentReplayEntriesFromTranscript(raw);
+      const toolUseCache: ToolUseCache = {};
+      for (const entry of entries) {
+        if (entry.role === "assistant" && isSyntheticLoginMessage(entry)) continue;
+        if (entry.role === "assistant" && isSyntheticNoResponseMessage(entry)) continue;
+        let content = entry.content;
+        if (entry.role === "assistant" && !forwardSubagentText) {
+          content = stripSubagentTextAndThinking(content);
+        }
+        for (const notification of toAcpNotifications(
+          // @ts-expect-error - untyped transcript content, handled like the main replay loop
+          content,
+          entry.role,
+          sessionId,
+          toolUseCache,
+          this.client,
+          this.logger,
+          {
+            registerHooks: false,
+            clientCapabilities: this.clientCapabilities,
+            cwd: this.sessions[sessionId]?.cwd,
+            taskState: this.sessions[sessionId]?.taskState,
+            messageId: entry.messageId,
+            parentToolUseId: card.toolCallId,
+          },
+        )) {
+          await this.client.sessionUpdate(notification);
+        }
+      }
+      totalEntries += entries.length;
+    }
+    this.logger.log(
+      `replay: replayed ${totalEntries} sub-agent entries across ${cards.length} card(s) for ${sessionId}`,
     );
   }
 

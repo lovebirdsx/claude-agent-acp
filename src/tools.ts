@@ -1493,6 +1493,100 @@ export function subagentTallyFromTranscript(
 }
 
 /**
+ * One display-able entry extracted from a sub-agent's sidecar transcript
+ * (`<session>/subagents/agent-<agentId>.jsonl`), shaped for replay through
+ * toAcpNotifications. `content` mirrors the API message's `content` field
+ * (already filtered per the rules below); `model`/`messageId` are carried for
+ * the synthetic-placeholder predicates and message grouping the replayer uses.
+ */
+export type SubagentReplayEntry = {
+  role: "user" | "assistant";
+  content: unknown;
+  model?: string;
+  messageId?: string;
+};
+
+/**
+ * Parse a sub-agent's sidecar transcript into the ordered display entries the
+ * live stream would have nested under the parent Task card.
+ *
+ * Live, the SDK streams each sub-agent turn as a sidechain message tagged with
+ * `parent_tool_use_id`; the client nests those under the parent card as they
+ * arrive. The parent-chain replay never sees that sidechain — its rows live in
+ * this file — so replay re-emits them from here, in file order, to restore
+ * exactly what the user saw live.
+ *
+ * Line handling mirrors subagentTallyFromTranscript: bad JSON is skipped, not
+ * fatal. Rows are kept in file order and filtered to:
+ * - `type` "user" | "assistant" with a non-empty `message`;
+ * - not `isMeta` / carrying a `teamName`, and NOT itself a nested sidechain
+ *   row (its own `parent_tool_use_id`): the client renders only one level of
+ *   nesting, so sub-sub-agents don't replay. Every row in this file is
+ *   naturally stamped `isSidechain: true` (sidecar rows are sidechain by
+ *   definition) — unlike the parent transcript's display-chain filter, that
+ *   flag must never gate replay here;
+ * - user rows keep only their `tool_result` blocks: live, a sub-agent's
+ *   initial user prompt never reaches the client feed (the parent card already
+ *   shows the Task input), so a user row whose content is a plain string or
+ *   text blocks (the initial prompt) is dropped entirely;
+ * - assistant rows pass `content` through untouched, with `messageId` from
+ *   `message.id` and `model` from `message.model`.
+ */
+export function subagentReplayEntriesFromTranscript(raw: string): SubagentReplayEntry[] {
+  const entries: SubagentReplayEntry[] = [];
+  for (const line of raw.split("\n")) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (parsed == null || typeof parsed !== "object") continue;
+    const row = parsed as {
+      type?: unknown;
+      isMeta?: unknown;
+      isSidechain?: unknown;
+      teamName?: unknown;
+      parent_tool_use_id?: unknown;
+      message?: {
+        role?: unknown;
+        content?: unknown;
+        model?: unknown;
+        id?: unknown;
+      } | null;
+    };
+    if (row.type !== "user" && row.type !== "assistant") continue;
+    if (row.isMeta === true) continue;
+    if (row.teamName !== undefined) continue;
+    if (typeof row.parent_tool_use_id === "string" && row.parent_tool_use_id.length > 0) {
+      continue;
+    }
+    const message = row.message;
+    if (message == null || typeof message !== "object") continue;
+    if (message.content === undefined) continue;
+    if (row.type === "user") {
+      if (!Array.isArray(message.content)) continue;
+      const content = message.content.filter(
+        (block) =>
+          block != null &&
+          typeof block === "object" &&
+          (block as { type?: unknown }).type === "tool_result",
+      );
+      if (content.length === 0) continue;
+      entries.push({ role: "user", content });
+    } else {
+      entries.push({
+        role: "assistant",
+        content: message.content,
+        ...(typeof message.model === "string" ? { model: message.model } : {}),
+        ...(typeof message.id === "string" ? { messageId: message.id } : {}),
+      });
+    }
+  }
+  return entries;
+}
+
+/**
  * Best-effort parse of a TaskCreate tool_result content into the structured
  * TaskCreateOutput. The SDK delivers tool outputs either as a string or as
  * an array of TextBlockParam-like blocks containing JSON text; try both.
