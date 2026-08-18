@@ -80,7 +80,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { createHash, randomUUID } from "crypto";
 import { claudeConfigDir } from "../paths.js";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -4276,6 +4276,8 @@ describe("permission request cancellation", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      subagentSpawns: new Map(),
+      subagentResumeRedirects: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       backgroundToolCalls: new Set(),
@@ -10772,6 +10774,8 @@ describe("session/close", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      subagentSpawns: new Map(),
+      subagentResumeRedirects: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       backgroundToolCalls: new Set(),
@@ -10868,6 +10872,8 @@ describe("session/delete", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      subagentSpawns: new Map(),
+      subagentResumeRedirects: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       backgroundToolCalls: new Set(),
@@ -11709,6 +11715,8 @@ describe("getOrCreateSession param change detection", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      subagentSpawns: new Map(),
+      subagentResumeRedirects: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       backgroundToolCalls: new Set(),
@@ -16104,6 +16112,8 @@ describe("post-error recovery", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      subagentSpawns: new Map(),
+      subagentResumeRedirects: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       backgroundToolCalls: new Set(),
@@ -21764,6 +21774,8 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      subagentSpawns: new Map(),
+      subagentResumeRedirects: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       backgroundToolCalls: new Set(),
@@ -24892,18 +24904,18 @@ describe("replaySessionHistory: sub-agent process replayed from the sub-agent tr
 
   beforeEach(async () => {
     sessionId = randomUUID();
-    projectDir = nodePath.join(
-      CLAUDE_CONFIG_DIR,
+    projectDir = path.join(
+      claudeConfigDir(),
       "projects",
       `__subagent_process_replay_test_${randomUUID()}`,
     );
-    subagentsDir = nodePath.join(projectDir, sessionId, "subagents");
-    await nodeFs.mkdir(subagentsDir, { recursive: true });
-    transcript = nodePath.join(projectDir, `${sessionId}.jsonl`);
+    subagentsDir = path.join(projectDir, sessionId, "subagents");
+    await mkdir(subagentsDir, { recursive: true });
+    transcript = path.join(projectDir, `${sessionId}.jsonl`);
   });
 
   afterEach(async () => {
-    await nodeFs.rm(projectDir, { recursive: true, force: true });
+    await rm(projectDir, { recursive: true, force: true });
   });
 
   async function writeMainTranscript(agentId: string): Promise<void> {
@@ -24942,7 +24954,7 @@ describe("replaySessionHistory: sub-agent process replayed from the sub-agent tr
         },
       },
     ];
-    await nodeFs.writeFile(
+    await writeFile(
       transcript,
       rows.map((r) => JSON.stringify(r)).join("\n") + "\n",
       "utf8",
@@ -24993,8 +25005,8 @@ describe("replaySessionHistory: sub-agent process replayed from the sub-agent tr
         },
       }),
     ];
-    await nodeFs.writeFile(
-      nodePath.join(subagentsDir, `agent-${agentId}.jsonl`),
+    await writeFile(
+      path.join(subagentsDir, `agent-${agentId}.jsonl`),
       rows.join("\n") + "\n",
       "utf8",
     );
@@ -25052,11 +25064,11 @@ describe("replaySessionHistory: sub-agent process replayed from the sub-agent tr
   });
 
   async function writeSidecarRaw(agentId: string, body: string): Promise<void> {
-    await nodeFs.writeFile(nodePath.join(subagentsDir, `agent-${agentId}.jsonl`), body, "utf8");
+    await writeFile(path.join(subagentsDir, `agent-${agentId}.jsonl`), body, "utf8");
   }
 
   async function sidecarSize(agentId: string): Promise<number> {
-    return (await nodeFs.stat(nodePath.join(subagentsDir, `agent-${agentId}.jsonl`))).size;
+    return (await stat(path.join(subagentsDir, `agent-${agentId}.jsonl`))).size;
   }
 
   const nestedFor =

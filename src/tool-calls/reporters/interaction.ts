@@ -378,6 +378,28 @@ export class GenericReporter implements ToolReporter {
  * A client that is not AIR gets the fenced error text.
  */
 export class AgentControlReporter extends GenericReporter {
+  constructor(private readonly controlToolName: string) {
+    super(controlToolName);
+  }
+
+  toolUse(input: unknown): ToolUseFacts {
+    // Fork: SendMessage's `summary` labels the card (the generic reporter
+    // would show the bare tool name) and its `message` is input the user
+    // reads — the same display copy Agent/Task gives the subagent prompt.
+    if (this.controlToolName !== "SendMessage") return super.toolUse(input);
+    const send = input as { summary?: unknown; message?: unknown } | undefined;
+    return {
+      title:
+        typeof send?.summary === "string" && send.summary.length > 0
+          ? send.summary
+          : "SendMessage",
+      kind: "other",
+      ...(typeof send?.message === "string" && send.message.length > 0
+        ? { display: [textContent(send.message)] }
+        : {}),
+    };
+  }
+
   errorResult({ result, capabilities }: ToolResultContext): ToolResultFacts | undefined {
     return capabilities.air.client ? toAcpContentUpdate(result.content, false) : undefined;
   }
