@@ -105,6 +105,8 @@ function installSession(
     toolUseCache: {},
     emittedToolCalls: new Set(),
     liveBackgroundTasks: new Map(),
+    subagentSpawns: new Map(),
+    subagentResumeRedirects: new Map(),
     emittedAssistantText: false,
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),

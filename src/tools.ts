@@ -461,6 +461,27 @@ export function toolInfoFromToolUse(
       };
     }
 
+    case "SendMessage": {
+      const input = toolUse.input as { summary?: unknown; message?: unknown } | undefined;
+      const summary =
+        typeof input?.summary === "string" && input.summary.length > 0
+          ? input.summary
+          : "SendMessage";
+      return {
+        title: summary,
+        kind: "other",
+        content:
+          input && typeof input.message === "string" && input.message.length > 0
+            ? [
+                {
+                  type: "content",
+                  content: { type: "text", text: input.message },
+                },
+              ]
+            : [],
+      };
+    }
+
     case "Other": {
       const input = toolUse.input;
       let output;
@@ -1439,6 +1460,155 @@ export function replayedSubagentCardFromResult(
     };
   }
   return undefined;
+}
+
+/**
+ * Identify a SendMessage tool_result that resumed a previously-completed
+ * sub-agent. The message-level `tool_use_result` sidecar carries
+ * `resumedAgentId` (the same agent id the original Agent/Task sidecar carries
+ * as `agentId`), and the cached tool_use's `input.message` is the coordinator
+ * text that resumed the agent — the anchor the sidecar transcript uses to
+ * split the resume run off the original run (see
+ * {@link splitSubagentTranscriptByResumes}). Returns undefined for non-
+ * SendMessage tools, sidecars without a `resumedAgentId`, or a tool_use whose
+ * input carries no message text (nothing to match an anchor with).
+ */
+export function resumedSubagentCardFromResult(
+  content: unknown,
+  toolUseResult: unknown,
+  toolUseCache: { [key: string]: { name?: unknown; input?: unknown } | undefined },
+): { toolCallId: string; agentId: string; messageText: string } | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const structured = structuredResult<{ resumedAgentId?: unknown }>(toolUseResult);
+  if (structured == null) return undefined;
+  const agentId = structured.resumedAgentId;
+  if (typeof agentId !== "string" || agentId.length === 0) return undefined;
+  for (const block of content) {
+    if (block == null || typeof block !== "object") continue;
+    const b = block as { type?: unknown; tool_use_id?: unknown };
+    if (b.type !== "tool_result" || typeof b.tool_use_id !== "string") continue;
+    const cached = toolUseCache[b.tool_use_id];
+    if (cached?.name !== "SendMessage") continue;
+    const messageText =
+      cached.input !== null &&
+      typeof cached.input === "object" &&
+      typeof (cached.input as { message?: unknown }).message === "string"
+        ? ((cached.input as { message: string }).message)
+        : "";
+    if (messageText.length === 0) return undefined;
+    return { toolCallId: b.tool_use_id, agentId, messageText };
+  }
+  return undefined;
+}
+
+/**
+ * The fixed coordinator-line prefix the SDK writes at the start of a resumed
+ * sub-agent's sidecar transcript (`<session>/subagents/agent-<id>.jsonl`) when
+ * a SendMessage resumes it mid-file: a `user` row whose string content begins
+ * with this prefix and then carries the SendMessage `message` verbatim.
+ */
+const COORDINATOR_MESSAGE_PREFIX = "The coordinator sent a message while you were working:";
+
+/**
+ * Split one sub-agent sidecar transcript (raw `.jsonl` text) into N+1 raw
+ * fragments along its resume boundaries, where N = `resumeMessages.length`.
+ * Fragment 0 is the original run; fragments 1..N are each a SendMessage
+ * resume run, starting at the coordinator anchor line that delivered the
+ * corresponding message. `resumeMessages` must be in timeline order (the
+ * SendMessage cards' order); each anchor is matched against the NEXT pending
+ * message only, so repeated message texts and mid-run injections (a
+ * coordinator line whose text matches no pending message, e.g. a steering
+ * nudge to a still-running agent) don't fabricate boundaries. The anchor line
+ * lands at the head of the resume fragment — `subagentReplayEntriesFromTranscript`
+ * and `subagentTallyFromTranscript` drop it anyway (string user content / no
+ * assistant usage).
+ */
+export function splitSubagentTranscriptByResumes(raw: string, resumeMessages: string[]): string[] {
+  if (resumeMessages.length === 0) return [raw];
+  const lines = raw.split("\n");
+  const segments: string[] = [];
+  let start = 0;
+  let next = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // Cheap textual prefilter: only lines carrying the prefix can be anchors.
+    if (!line.includes(COORDINATOR_MESSAGE_PREFIX)) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (parsed == null || typeof parsed !== "object") continue;
+    const row = parsed as { type?: unknown; message?: { content?: unknown } | null };
+    if (row.type !== "user") continue;
+    const content = row.message?.content;
+    if (typeof content !== "string" || !content.startsWith(COORDINATOR_MESSAGE_PREFIX)) continue;
+    const pending = resumeMessages[next];
+    if (pending === undefined || !content.includes(pending)) continue;
+    segments.push(lines.slice(start, i).join("\n"));
+    start = i;
+    next++;
+  }
+  segments.push(lines.slice(start).join("\n"));
+  return segments;
+}
+
+/**
+ * Record one `task_started` frame against the session's sub-agent spawn/resume
+ * bookkeeping. The first `task_started` for a task id seeds the original
+ * spawn's tool_use id; a later one carrying a DIFFERENT tool_use id is a
+ * SendMessage resume and installs a redirect from the original id to the
+ * resume id, so the resume's sidechain messages (still stamped with the
+ * original id) can be re-attributed to the SendMessage card. Non-subagent
+ * tasks and frames without a tool_use id are ignored.
+ */
+export function recordSubagentTaskStarted(
+  spawns: Map<string, string>,
+  redirects: Map<string, string>,
+  taskId: string,
+  toolUseId: string | undefined,
+  subagentType: unknown,
+): void {
+  if (!subagentType || !toolUseId) return;
+  const original = spawns.get(taskId);
+  if (original === undefined) {
+    spawns.set(taskId, toolUseId);
+  } else if (original !== toolUseId) {
+    redirects.set(original, toolUseId);
+  }
+}
+
+/**
+ * Drop the active resume redirect for a task id once it settles (a
+ * `task_notification` or terminal `task_updated`). The spawn entry is kept: it
+ * is the anchor that lets a LATER SendMessage resume install a fresh redirect.
+ */
+export function clearSubagentResumeRedirect(
+  spawns: Map<string, string>,
+  redirects: Map<string, string>,
+  taskId: string,
+): void {
+  const original = spawns.get(taskId);
+  if (original !== undefined) redirects.delete(original);
+}
+
+/**
+ * Rewrite a message's `parent_tool_use_id` in place when it names a tool_use
+ * that a SendMessage resume redirected (see {@link recordSubagentTaskStarted}).
+ * Applied to every SDK message before both the raw-message bypass and the ACP
+ * notification conversion so the two paths see one consistent parent id.
+ */
+export function redirectParentToolUseId(message: unknown, redirects: Map<string, string>): void {
+  if (typeof message !== "object" || message === null || !("parent_tool_use_id" in message)) {
+    return;
+  }
+  const parent = (message as { parent_tool_use_id?: unknown }).parent_tool_use_id;
+  if (typeof parent !== "string") return;
+  const target = redirects.get(parent);
+  if (target !== undefined) {
+    (message as { parent_tool_use_id: string | null }).parent_tool_use_id = target;
+  }
 }
 
 /**

@@ -26,6 +26,11 @@ import {
   subagentTallyFromTranscript,
   subagentReplayEntriesFromTranscript,
   replayedSubagentCardFromResult,
+  resumedSubagentCardFromResult,
+  splitSubagentTranscriptByResumes,
+  recordSubagentTaskStarted,
+  clearSubagentResumeRedirect,
+  redirectParentToolUseId,
   subagentStatsToMeta,
   SubagentStatsState,
   TaskState,
@@ -3928,5 +3933,232 @@ describe("AskUserQuestion tool_result rendering from tool_use_result", () => {
     expect(update).toEqual({
       content: [{ type: "content", content: { type: "text", text: rawAskResult.content } }],
     });
+  });
+});
+
+describe("toolInfoFromToolUse - SendMessage", () => {
+  it("uses input.summary as the title and input.message as content", () => {
+    const info = toolInfoFromToolUse(
+      {
+        name: "SendMessage",
+        id: "toolu_send_1",
+        input: { summary: "Fix the diff bug", message: "please fix the close-tab error" },
+      },
+      false,
+    );
+
+    expect(info.kind).toBe("other");
+    expect(info.title).toBe("Fix the diff bug");
+    expect(info.content).toEqual([
+      { type: "content", content: { type: "text", text: "please fix the close-tab error" } },
+    ]);
+  });
+
+  it("falls back to the tool name when summary is missing, and drops empty message", () => {
+    const noSummary = toolInfoFromToolUse(
+      { name: "SendMessage", id: "toolu_send_2", input: { message: "hi" } },
+      false,
+    );
+    expect(noSummary.title).toBe("SendMessage");
+
+    const noMessage = toolInfoFromToolUse(
+      { name: "SendMessage", id: "toolu_send_3", input: { summary: "Nudge" } },
+      false,
+    );
+    expect(noMessage.title).toBe("Nudge");
+    expect(noMessage.content).toEqual([]);
+  });
+});
+
+describe("resumedSubagentCardFromResult", () => {
+  const cache = {
+    send_1: { name: "SendMessage", input: { message: "fix the bug" } },
+    agent_1: { name: "Agent", input: {} },
+    bash_1: { name: "Bash", input: {} },
+  };
+  const resultContent = (id: string) => [{ type: "tool_result", tool_use_id: id, content: "ok" }];
+  const sidecar = { success: true, message: "had no active task", resumedAgentId: "agent-abc" };
+
+  it("extracts the resume identity and message text from a SendMessage result", () => {
+    expect(resumedSubagentCardFromResult(resultContent("send_1"), sidecar, cache)).toEqual({
+      toolCallId: "send_1",
+      agentId: "agent-abc",
+      messageText: "fix the bug",
+    });
+  });
+
+  it("ignores non-SendMessage tools, missing sidecars, and empty resumedAgentId", () => {
+    expect(
+      resumedSubagentCardFromResult(resultContent("agent_1"), sidecar, cache),
+    ).toBeUndefined();
+    expect(
+      resumedSubagentCardFromResult(resultContent("send_1"), undefined, cache),
+    ).toBeUndefined();
+    expect(
+      resumedSubagentCardFromResult(
+        resultContent("send_1"),
+        { ...sidecar, resumedAgentId: undefined },
+        cache,
+      ),
+    ).toBeUndefined();
+    expect(
+      resumedSubagentCardFromResult(
+        resultContent("send_1"),
+        { ...sidecar, resumedAgentId: "" },
+        cache,
+      ),
+    ).toBeUndefined();
+  });
+
+  it("ignores a SendMessage result whose cached input carries no message text", () => {
+    const noInput = { send_2: { name: "SendMessage" } };
+    expect(
+      resumedSubagentCardFromResult(resultContent("send_2"), sidecar, noInput),
+    ).toBeUndefined();
+  });
+});
+
+describe("splitSubagentTranscriptByResumes", () => {
+  const PREFIX = "The coordinator sent a message while you were working:";
+  const coordLine = (text: string) =>
+    JSON.stringify({ type: "user", message: { role: "user", content: `${PREFIX}\n${text}` } });
+  const assistantLine = (text: string) =>
+    JSON.stringify({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text }] },
+    });
+
+  it("returns a single segment when there are no resume messages", () => {
+    const raw = [assistantLine("a1"), assistantLine("a2")].join("\n");
+    expect(splitSubagentTranscriptByResumes(raw, [])).toEqual([raw]);
+  });
+
+  it("splits a single resume into two segments, anchor line starting the resume segment", () => {
+    const a1 = assistantLine("a1");
+    const a2 = assistantLine("a2");
+    const coord = coordLine("resume A");
+    const raw = [a1, coord, a2].join("\n");
+    expect(splitSubagentTranscriptByResumes(raw, ["resume A"])).toEqual([
+      a1,
+      [coord, a2].join("\n"),
+    ]);
+  });
+
+  it("splits two resumes into three segments in timeline order", () => {
+    const a1 = assistantLine("a1");
+    const a2 = assistantLine("a2");
+    const a3 = assistantLine("a3");
+    const r1 = coordLine("R1");
+    const r2 = coordLine("R2");
+    const raw = [a1, r1, a2, r2, a3].join("\n");
+    expect(splitSubagentTranscriptByResumes(raw, ["R1", "R2"])).toEqual([
+      a1,
+      [r1, a2].join("\n"),
+      [r2, a3].join("\n"),
+    ]);
+  });
+
+  it("does not cut on a coordinator line whose text does not match the next resume", () => {
+    // A mid-run injection (or an already-consumed message) must stay in the
+    // current segment rather than fabricate a card boundary.
+    const a1 = assistantLine("a1");
+    const coord = coordLine("unrelated nudge");
+    const a2 = assistantLine("a2");
+    const raw = [a1, coord, a2].join("\n");
+    expect(splitSubagentTranscriptByResumes(raw, ["resume A"])).toEqual([raw]);
+  });
+
+  it("matches duplicate message texts by next-pending order", () => {
+    const a1 = assistantLine("a1");
+    const a2 = assistantLine("a2");
+    const a3 = assistantLine("a3");
+    const r1 = coordLine("dup");
+    const r2 = coordLine("dup");
+    const raw = [a1, r1, a2, r2, a3].join("\n");
+    expect(splitSubagentTranscriptByResumes(raw, ["dup", "dup"])).toEqual([
+      a1,
+      [r1, a2].join("\n"),
+      [r2, a3].join("\n"),
+    ]);
+  });
+
+  it("skips a coordinator line that only matches a later (not next) resume message", () => {
+    // next-pending matching: a coordinator line for "R2" arriving before "R1"
+    // is not cut, only the "R1" line cuts.
+    const a1 = assistantLine("a1");
+    const a2 = assistantLine("a2");
+    const r2early = coordLine("R2");
+    const r1 = coordLine("R1");
+    const raw = [a1, r2early, a2, r1].join("\n");
+    expect(splitSubagentTranscriptByResumes(raw, ["R1", "R2"])).toEqual([
+      [a1, r2early, a2].join("\n"),
+      r1,
+    ]);
+  });
+
+  it("tolerates bad JSON lines without losing the cut", () => {
+    const a1 = assistantLine("a1");
+    const coord = coordLine("resume A");
+    const a2 = assistantLine("a2");
+    const raw = [a1, "not json at all", coord, a2].join("\n");
+    expect(splitSubagentTranscriptByResumes(raw, ["resume A"])).toEqual([
+      [a1, "not json at all"].join("\n"),
+      [coord, a2].join("\n"),
+    ]);
+  });
+});
+
+describe("subagent spawn / resume redirect bookkeeping", () => {
+  it("records the original spawn, then redirects a later resume tool_use", () => {
+    const spawns = new Map<string, string>();
+    const redirects = new Map<string, string>();
+
+    recordSubagentTaskStarted(spawns, redirects, "agent-1", "toolu_orig", "general-purpose");
+    expect(spawns.get("agent-1")).toBe("toolu_orig");
+    expect(redirects.size).toBe(0);
+
+    // A repeated task_started for the same spawn is not a resume.
+    recordSubagentTaskStarted(spawns, redirects, "agent-1", "toolu_orig", "general-purpose");
+    expect(redirects.size).toBe(0);
+
+    // A different tool_use_id for the same agent is a SendMessage resume.
+    recordSubagentTaskStarted(spawns, redirects, "agent-1", "toolu_send", "general-purpose");
+    expect(redirects.get("toolu_orig")).toBe("toolu_send");
+  });
+
+  it("ignores non-subagent tasks and missing tool_use ids", () => {
+    const spawns = new Map<string, string>();
+    const redirects = new Map<string, string>();
+
+    recordSubagentTaskStarted(spawns, redirects, "agent-2", "toolu_x", undefined);
+    expect(spawns.has("agent-2")).toBe(false);
+
+    recordSubagentTaskStarted(spawns, redirects, "agent-3", undefined, "general-purpose");
+    expect(spawns.has("agent-3")).toBe(false);
+  });
+
+  it("clears the redirect but keeps the spawn entry", () => {
+    const spawns = new Map<string, string>([["agent-1", "toolu_orig"]]);
+    const redirects = new Map<string, string>([["toolu_orig", "toolu_send"]]);
+
+    clearSubagentResumeRedirect(spawns, redirects, "agent-1");
+    expect(redirects.size).toBe(0);
+    expect(spawns.get("agent-1")).toBe("toolu_orig");
+  });
+
+  it("redirects a sidechain message's parent_tool_use_id in place", () => {
+    const redirects = new Map<string, string>([["toolu_orig", "toolu_send"]]);
+
+    const hit = { parent_tool_use_id: "toolu_orig" };
+    redirectParentToolUseId(hit, redirects);
+    expect(hit.parent_tool_use_id).toBe("toolu_send");
+
+    const miss = { parent_tool_use_id: "toolu_other" };
+    redirectParentToolUseId(miss, redirects);
+    expect(miss.parent_tool_use_id).toBe("toolu_other");
+
+    const absent = {} as { parent_tool_use_id?: unknown };
+    redirectParentToolUseId(absent, redirects);
+    expect(absent.parent_tool_use_id).toBeUndefined();
   });
 });

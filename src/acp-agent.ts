@@ -124,7 +124,12 @@ import {
   registerHookCallback,
   SubagentStatsEntry,
   SubagentStatsState,
+  clearSubagentResumeRedirect,
+  recordSubagentTaskStarted,
+  redirectParentToolUseId,
   replayedSubagentCardFromResult,
+  resumedSubagentCardFromResult,
+  splitSubagentTranscriptByResumes,
   subagentReplayEntriesFromTranscript,
   subagentStatsToMeta,
   subagentTallyFromTranscript,
@@ -921,6 +926,18 @@ type Session = {
       endedPerLevel?: "ended" | "sweep-armed";
     }
   >;
+  /** Sub-agent spawn bookkeeping for SendMessage resume redirection (fork):
+   *  agent id → the tool_use id of the Agent/Task call that ORIGINALLY spawned
+   *  it. Seeded at `task_started` (first-wins) and, on replay, from the
+   *  replayed Agent/Task card; kept for the session's lifetime so a later
+   *  SendMessage resume can always find the original id to redirect from. */
+  subagentSpawns: Map<string, string>;
+  /** Original spawn tool_use id → the tool_use id of the currently-active
+   *  SendMessage resume. While set, sidechain messages still stamped with the
+   *  original id are re-attributed (see {@link redirectParentToolUseId}) to the
+   *  SendMessage card so the resume's process is visible there. Cleared when
+   *  the resume settles (task_notification / terminal task_updated). */
+  subagentResumeRedirects: Map<string, string>;
   /** Whether an autonomous model cycle — one with no in-flight ACP prompt,
    *  e.g. a task-notification wake's followup or a peer/coordinator/observer
    *  handling — is currently processing. Set at the wake signal (the
@@ -1255,6 +1272,72 @@ export type ToolUseCache = {
     input: unknown;
   };
 };
+
+/** A replayed sub-agent card: either the original Agent/Task card (no
+ *  `messageText`) or a SendMessage resume card (`messageText` carries the
+ *  coordinator text used to split the sidecar transcript). Collected by the
+ *  replay loop in timeline order, so the original card precedes its resumes. */
+type ReplayedSubagentCard = {
+  toolCallId: string;
+  agentId: string;
+  agentType?: string;
+  messageText?: string;
+};
+
+/** Cards grouped by agent id, group-internal order preserved from the flat
+ *  timeline-ordered list (cards[0] = original spawn, cards[1..] = resumes). */
+type ReplayedSubagentCardGroup = {
+  agentId: string;
+  agentType?: string;
+  cards: Array<{ toolCallId: string; messageText?: string }>;
+};
+
+function groupSubagentCards(cards: ReplayedSubagentCard[]): ReplayedSubagentCardGroup[] {
+  const groups = new Map<string, ReplayedSubagentCardGroup>();
+  for (const card of cards) {
+    let group = groups.get(card.agentId);
+    if (group === undefined) {
+      group = {
+        agentId: card.agentId,
+        ...(card.agentType !== undefined ? { agentType: card.agentType } : {}),
+        cards: [],
+      };
+      groups.set(card.agentId, group);
+    }
+    group.cards.push({
+      toolCallId: card.toolCallId,
+      ...(card.messageText !== undefined ? { messageText: card.messageText } : {}),
+    });
+  }
+  return [...groups.values()];
+}
+
+/** The resume message texts of a card group, in timeline order (cards[1..] are
+ *  the SendMessage resume cards; cards[0] is the original Agent/Task card). */
+function resumeMessagesOf(group: ReplayedSubagentCardGroup): string[] {
+  return group.cards
+    .slice(1)
+    .map((card) => card.messageText)
+    .filter((text): text is string => typeof text === "string" && text.length > 0);
+}
+
+/**
+ * Map a split sidecar transcript's segments onto a group's cards, folding any
+ * overflow segments (resume runs whose SendMessage card was not collected)
+ * back into the original card so their content is not lost. Missing segments
+ * (more cards than resume anchors — an anomaly) yield empty strings so the
+ * caller can skip those cards.
+ */
+function segmentsPerCard(segments: string[], cardCount: number): string[] {
+  const out: string[] = [];
+  for (let k = 0; k < cardCount; k++) {
+    out.push(k < segments.length ? segments[k] : "");
+  }
+  for (let k = cardCount; k < segments.length; k++) {
+    out[0] = out[0].length > 0 ? `${out[0]}\n${segments[k]}` : segments[k];
+  }
+  return out;
+}
 
 type StreamedToolInput = {
   id: string;
@@ -3088,6 +3171,16 @@ export class ClaudeAcpAgent {
           return;
         }
 
+        // fork: SendMessage resume redirection. A resumed sub-agent's sidechain
+        // messages keep the ORIGINAL Agent/Task tool_use id as their
+        // parent_tool_use_id; rewrite it in place (before the raw-message
+        // bypass and the switch below) so both the `_claude/sdkMessage` bypass
+        // and the ACP notifications attribute the resume's process to the
+        // SendMessage card instead of the already-settled original card.
+        if (session.subagentResumeRedirects.size > 0) {
+          redirectParentToolUseId(message, session.subagentResumeRedirects);
+        }
+
         if (
           session.emitRawSDKMessages &&
           shouldEmitRawMessage(session.emitRawSDKMessages, message)
@@ -3592,6 +3685,18 @@ export class ClaudeAcpAgent {
                   parentToolUseId: message.tool_use_id,
                   isSubagent: !!message.subagent_type,
                 });
+                // fork: SendMessage resume redirection. The first task_started
+                // for an agent seeds the original spawn id; a later one with a
+                // different tool_use id is a SendMessage resume, whose sidechain
+                // messages still carry the ORIGINAL id — record the redirect so
+                // the live loop re-attributes them to the SendMessage card.
+                recordSubagentTaskStarted(
+                  session.subagentSpawns,
+                  session.subagentResumeRedirects,
+                  message.task_id,
+                  message.tool_use_id,
+                  message.subagent_type,
+                );
                 if (message.subagent_type && session.activeTurn && !session.activeTurn.settled) {
                   (session.activeTurn.spawnedTaskIds ??= new Set()).add(message.task_id);
                 }
@@ -3616,6 +3721,13 @@ export class ClaudeAcpAgent {
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
                 session.liveBackgroundTasks.delete(message.task_id);
+                // fork: the resume run (if any) is done — drop its redirect so
+                // a later SendMessage resume installs a fresh one.
+                clearSubagentResumeRedirect(
+                  session.subagentSpawns,
+                  session.subagentResumeRedirects,
+                  message.task_id,
+                );
                 // Its `tool_use_id` maps back to the spawning tool_call card:
                 // settle that card to its real terminal status now (the
                 // placeholder result left it at `in_progress`).
@@ -3655,6 +3767,11 @@ export class ClaudeAcpAgent {
                   message.patch.status === "killed"
                 ) {
                   session.liveBackgroundTasks.delete(message.task_id);
+                  clearSubagentResumeRedirect(
+                    session.subagentSpawns,
+                    session.subagentResumeRedirects,
+                    message.task_id,
+                  );
                   await this.emitBackgroundActivity(params.sessionId, session);
                 }
                 break;
@@ -5879,11 +5996,7 @@ export class ClaudeAcpAgent {
     // Completed Task cards seen during this replay, restamped with their
     // re-accumulated sub-agent tallies after the replay finishes (see
     // restampReplayedSubagentStats).
-    const pendingSubagentRestamps: Array<{
-      toolCallId: string;
-      agentId: string;
-      agentType?: string;
-    }> = [];
+    const pendingSubagentRestamps: ReplayedSubagentCard[] = [];
     const trackToolCallLifecycle = (notification: SessionNotification): void => {
       const update = notification.update;
       if (update.sessionUpdate === "tool_call") {
@@ -6011,7 +6124,27 @@ export class ClaudeAcpAgent {
                 ?.toolUseResult
             : undefined);
         const card = replayedSubagentCardFromResult(content, sidecar, toolUseCache);
-        if (card !== undefined) pendingSubagentRestamps.push(card);
+        if (card !== undefined) {
+          pendingSubagentRestamps.push(card);
+          // fork: seed the spawn bookkeeping so a SendMessage resume that
+          // happens after this replayed agent can still redirect its sidechain
+          // to the SendMessage card (first-wins — the original card is
+          // timeline-first).
+          if (replaySession && !replaySession.subagentSpawns.has(card.agentId)) {
+            replaySession.subagentSpawns.set(card.agentId, card.toolCallId);
+          }
+        }
+        // fork: also collect SendMessage resume cards so the resume run's
+        // sidecar entries and tally land on the SendMessage card, not the
+        // original Agent/Task card.
+        const resumeCard = resumedSubagentCardFromResult(content, sidecar, toolUseCache);
+        if (resumeCard !== undefined) {
+          pendingSubagentRestamps.push({
+            toolCallId: resumeCard.toolCallId,
+            agentId: resumeCard.agentId,
+            messageText: resumeCard.messageText,
+          });
+        }
       }
 
       for (const notification of toAcpNotifications(
@@ -6085,7 +6218,7 @@ export class ClaudeAcpAgent {
     surfacedToolCalls: Set<string>,
     settledToolCalls: Set<string>,
     toolUseCache: ToolUseCache,
-    pendingSubagentRestamps: Array<{ toolCallId: string; agentId: string; agentType?: string }>,
+    pendingSubagentRestamps: ReplayedSubagentCard[],
   ): Promise<void> {
     if (rawEntries === undefined) return;
     const orphaned = new Set(
@@ -6157,9 +6290,10 @@ export class ClaudeAcpAgent {
    */
   private async restampReplayedSubagentStats(
     sessionId: string,
-    cards: Array<{ toolCallId: string; agentId: string; agentType?: string }>,
+    cards: ReplayedSubagentCard[],
   ): Promise<void> {
     if (cards.length === 0) return;
+    const groups = groupSubagentCards(cards);
     let subagentsDir: string;
     try {
       const transcriptFile = await this.findTranscriptFile(
@@ -6176,29 +6310,41 @@ export class ClaudeAcpAgent {
       return;
     }
     await Promise.all(
-      cards.map(async (card) => {
+      groups.map(async (group) => {
         try {
-          let tally = this.subagentTallyCache.get(card.agentId);
-          if (tally === undefined) {
-            const raw = await fs.readFile(
-              path.join(subagentsDir, `agent-${card.agentId}.jsonl`),
-              "utf8",
-            );
-            tally = subagentTallyFromTranscript(raw, card.agentType);
-            if (tally === undefined) return;
-            this.subagentTallyCache.set(card.agentId, tally);
+          const raw = await fs.readFile(
+            path.join(subagentsDir, `agent-${group.agentId}.jsonl`),
+            "utf8",
+          );
+          const segments = segmentsPerCard(
+            splitSubagentTranscriptByResumes(raw, resumeMessagesOf(group)),
+            group.cards.length,
+          );
+          for (let k = 0; k < group.cards.length; k++) {
+            const card = group.cards[k];
+            const segment = segments[k];
+            if (segment === undefined || segment.length === 0) continue;
+            // Per-card tally now differs after a resume split, so key the memo
+            // on (agentId, toolCallId) rather than agentId alone.
+            const cacheKey = `${group.agentId}#${card.toolCallId}`;
+            let tally = this.subagentTallyCache.get(cacheKey);
+            if (tally === undefined) {
+              tally = subagentTallyFromTranscript(segment, group.agentType);
+              if (tally === undefined) continue;
+              this.subagentTallyCache.set(cacheKey, tally);
+            }
+            await this.client.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "tool_call_update",
+                toolCallId: card.toolCallId,
+                _meta: { "_universe/subagentStats": subagentStatsToMeta(tally) },
+              },
+            });
           }
-          await this.client.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "tool_call_update",
-              toolCallId: card.toolCallId,
-              _meta: { "_universe/subagentStats": subagentStatsToMeta(tally) },
-            },
-          });
         } catch (error) {
           this.logger.log(
-            `subagent stats: skipped restamp for ${card.toolCallId}: ${error}`,
+            `subagent stats: skipped restamp for ${group.agentId}: ${error}`,
           );
         }
       }),
@@ -6230,12 +6376,13 @@ export class ClaudeAcpAgent {
    */
   private async replaySubagentTranscripts(
     sessionId: string,
-    cards: Array<{ toolCallId: string; agentId: string; agentType?: string }>,
+    cards: ReplayedSubagentCard[],
     forwardSubagentText: boolean,
     fileCapBytes: number = SUBAGENT_REPLAY_FILE_CAP_BYTES,
     totalCapBytes: number = SUBAGENT_REPLAY_TOTAL_CAP_BYTES,
   ): Promise<void> {
     if (cards.length === 0) return;
+    const groups = groupSubagentCards(cards);
     let subagentsDir: string;
     try {
       const transcriptFile = await this.findTranscriptFile(
@@ -6254,18 +6401,18 @@ export class ClaudeAcpAgent {
     let totalEntries = 0;
     let replayedCards = 0;
     let totalBytes = 0;
-    for (const card of cards) {
-      const file = path.join(subagentsDir, `agent-${card.agentId}.jsonl`);
+    for (const group of groups) {
+      const file = path.join(subagentsDir, `agent-${group.agentId}.jsonl`);
       let size: number;
       try {
         size = (await fs.stat(file)).size;
       } catch (error) {
-        this.logger.log(`subagent replay: skipped ${card.toolCallId}: ${error}`);
+        this.logger.log(`subagent replay: skipped ${group.agentId}: ${error}`);
         continue;
       }
       if (size > fileCapBytes) {
         this.logger.log(
-          `subagent replay: skipped ${card.toolCallId}: sidecar ${size} bytes exceeds ` +
+          `subagent replay: skipped ${group.agentId}: sidecar ${size} bytes exceeds ` +
             `${fileCapBytes} byte cap`,
         );
         continue;
@@ -6282,41 +6429,54 @@ export class ClaudeAcpAgent {
       try {
         raw = await fs.readFile(file, "utf8");
       } catch (error) {
-        this.logger.log(`subagent replay: skipped ${card.toolCallId}: ${error}`);
+        this.logger.log(`subagent replay: skipped ${group.agentId}: ${error}`);
         continue;
       }
       totalBytes += size;
-      replayedCards += 1;
-      const entries = subagentReplayEntriesFromTranscript(raw);
-      const toolUseCache: ToolUseCache = {};
-      for (const entry of entries) {
-        if (entry.role === "assistant" && isSyntheticLoginMessage(entry)) continue;
-        if (entry.role === "assistant" && isSyntheticNoResponseMessage(entry)) continue;
-        let content = entry.content;
-        if (entry.role === "assistant" && !forwardSubagentText) {
-          content = stripSubagentTextAndThinking(content);
+      // fork: split the sidecar along its SendMessage resume boundaries and
+      // feed each fragment to its own card (segment 0 → original Agent/Task
+      // card, segment k → the k-th resume card). The file is read once per
+      // agent regardless of how many cards share it.
+      const segments = segmentsPerCard(
+        splitSubagentTranscriptByResumes(raw, resumeMessagesOf(group)),
+        group.cards.length,
+      );
+      for (let k = 0; k < group.cards.length; k++) {
+        const card = group.cards[k];
+        const segment = segments[k];
+        if (segment === undefined || segment.length === 0) continue;
+        replayedCards += 1;
+        const entries = subagentReplayEntriesFromTranscript(segment);
+        const toolUseCache: ToolUseCache = {};
+        for (const entry of entries) {
+          if (entry.role === "assistant" && isSyntheticLoginMessage(entry)) continue;
+          if (entry.role === "assistant" && isSyntheticNoResponseMessage(entry)) continue;
+          let content = entry.content;
+          if (entry.role === "assistant" && !forwardSubagentText) {
+            content = stripSubagentTextAndThinking(content);
+          }
+          for (const notification of toAcpNotifications(
+            // @ts-expect-error - untyped transcript content, handled like the main replay loop
+            content,
+            entry.role,
+            sessionId,
+            toolUseCache,
+            this.client,
+            this.logger,
+            {
+              registerHooks: false,
+              clientCapabilities: this.clientCapabilities,
+              cwd: this.sessions[sessionId]?.cwd,
+              taskState: this.sessions[sessionId]?.taskState,
+              messageId: entry.messageId,
+              parentToolUseId: card.toolCallId,
+            },
+          )) {
+            await this.client.sessionUpdate(notification);
+          }
         }
-        for (const notification of toAcpNotifications(
-          // @ts-expect-error - untyped transcript content, handled like the main replay loop
-          content,
-          entry.role,
-          sessionId,
-          toolUseCache,
-          this.client,
-          this.logger,
-          {
-            registerHooks: false,
-            clientCapabilities: this.clientCapabilities,
-            cwd: this.sessions[sessionId]?.cwd,
-            taskState: this.sessions[sessionId]?.taskState,
-            messageId: entry.messageId,
-            parentToolUseId: card.toolCallId,
-          },
-        )) {
-          await this.client.sessionUpdate(notification);
-        }
+        totalEntries += entries.length;
       }
-      totalEntries += entries.length;
     }
     this.logger.log(
       `replay: replayed ${totalEntries} sub-agent entries across ${replayedCards}/${cards.length} card(s) for ${sessionId}`,
@@ -7913,6 +8073,8 @@ export class ClaudeAcpAgent {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      subagentSpawns: new Map(),
+      subagentResumeRedirects: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       backgroundToolCalls: new Set(),
