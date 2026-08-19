@@ -14394,6 +14394,24 @@ describe("replaySessionHistory: sub-agent stats restamped from the sub-agent tra
 
     expect(stats).toEqual([]);
   });
+
+  it("skips the restamp when the sidecar exceeds the file cap (never reads it into memory)", async () => {
+    await writeMainTranscript(false, "big");
+    await nodeFs.writeFile(
+      nodePath.join(subagentsDir, "agent-big.jsonl"),
+      "x".repeat(1024 * 1024),
+      "utf8",
+    );
+
+    const { agent, stats } = createRecordingAgent();
+    await (agent as any).restampReplayedSubagentStats(
+      sessionId,
+      [{ toolCallId: "task_1", agentId: "big", agentType: "Explore" }],
+      1024, // fileCapBytes: the 1MB sidecar is skipped
+    );
+
+    expect(stats).toEqual([]);
+  });
 });
 
 describe("replaySessionHistory: sub-agent process replayed from the sub-agent transcript", () => {
@@ -14685,6 +14703,131 @@ describe("replaySessionHistory: sub-agent process replayed from the sub-agent tr
 
     expect(updates.some(nestedFor("task_a"))).toBe(true);
     expect(updates.some(nestedFor("task_b"))).toBe(false);
+  });
+});
+
+describe("replaySessionHistory: main transcript replay byte cap", () => {
+  // The main-chain replay re-ships the whole display chain, which for a
+  // Grep/Read-heavy session can be hundreds of MB of tool_result content.
+  // replaySessionHistory now bounds that with a per-message cap (truncate one
+  // giant content field) and a cumulative cap (stop and tell the user), so a
+  // resume can't OOM the renderer by re-sending the entire corpus.
+  function createRecordingAgent() {
+    const chunks: Array<{ role: "user" | "agent"; text: string }> = [];
+    const client = {
+      sessionUpdate: async (notification: SessionNotification) => {
+        const update = notification.update;
+        if (
+          (update.sessionUpdate === "user_message_chunk" ||
+            update.sessionUpdate === "agent_message_chunk") &&
+          update.content.type === "text"
+        ) {
+          chunks.push({
+            role: update.sessionUpdate === "user_message_chunk" ? "user" : "agent",
+            text: update.content.text,
+          });
+        }
+      },
+      extNotification: async () => {},
+    } as unknown as AcpClient;
+    return { agent: new ClaudeAcpAgent(client, { log: () => {}, error: () => {} }), chunks };
+  }
+
+  let sessionId: string;
+  let projectDir: string;
+  let transcript: string;
+
+  beforeEach(async () => {
+    sessionId = randomUUID();
+    projectDir = nodePath.join(
+      CLAUDE_CONFIG_DIR,
+      "projects",
+      `__main_replay_cap_test_${randomUUID()}`,
+    );
+    await nodeFs.mkdir(projectDir, { recursive: true });
+    transcript = nodePath.join(projectDir, `${sessionId}.jsonl`);
+    vi.mocked(getSessionMessages).mockClear();
+  });
+
+  afterEach(async () => {
+    await nodeFs.rm(projectDir, { recursive: true, force: true });
+  });
+
+  const line = (obj: Record<string, unknown>): string => JSON.stringify(obj);
+
+  // A compacted transcript so the full-chain path (not the mocked
+  // getSessionMessages) feeds the replay and the cap operates on raw entries.
+  async function writeTranscript(assistantTexts: string[]): Promise<void> {
+    const rows: string[] = [
+      line({
+        type: "user",
+        uuid: "u1",
+        parentUuid: null,
+        message: { role: "user", content: "question" },
+      }),
+      line({
+        type: "assistant",
+        uuid: "a1",
+        parentUuid: "u1",
+        message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: assistantTexts[0] }] },
+      }),
+      line({
+        type: "system",
+        subtype: "compact_boundary",
+        uuid: "cb",
+        parentUuid: null,
+        logicalParentUuid: "a1",
+        compactMetadata: { trigger: "auto", preTokens: 100000 },
+      }),
+      line({
+        type: "user",
+        uuid: "sum",
+        parentUuid: "cb",
+        isCompactSummary: true,
+        message: { role: "user", content: "summary" },
+      }),
+    ];
+    assistantTexts.slice(1).forEach((text, i) => {
+      const idx = i + 2;
+      rows.push(
+        line({
+          type: "assistant",
+          uuid: `a${idx}`,
+          parentUuid: idx === 2 ? "sum" : `a${idx - 1}`,
+          message: { id: `msg_${idx}`, role: "assistant", content: [{ type: "text", text }] },
+        }),
+      );
+    });
+    await nodeFs.writeFile(transcript, rows.join("\n") + "\n", "utf8");
+  }
+
+  it("stops replaying once the cumulative byte budget is exceeded and tells the user", async () => {
+    await writeTranscript(["A".repeat(1000), "B".repeat(1000), "C".repeat(1000)]);
+
+    const { agent, chunks } = createRecordingAgent();
+    await (agent as any).replaySessionHistory(sessionId, { replayTotalCapBytes: 1500 });
+
+    const agentTexts = chunks.filter((c) => c.role === "agent").map((c) => c.text);
+    expect(agentTexts).toContain("A".repeat(1000));
+    expect(agentTexts).not.toContain("B".repeat(1000));
+    expect(agentTexts).not.toContain("C".repeat(1000));
+    // The tail isn't dropped silently: an explanatory chunk marks the cut.
+    expect(chunks.some((c) => c.role === "agent" && c.text.includes("truncated"))).toBe(true);
+  });
+
+  it("truncates a single oversized message to the per-message cap with a marker", async () => {
+    await writeTranscript(["X".repeat(10000)]);
+
+    const { agent, chunks } = createRecordingAgent();
+    await (agent as any).replaySessionHistory(sessionId, { replayMessageCapBytes: 1000 });
+
+    const replayed = chunks
+      .filter((c) => c.role === "agent")
+      .map((c) => c.text)
+      .find((t) => t.includes("X"));
+    expect(replayed).toBeDefined();
+    expect(replayed!.length).toBeLessThanOrEqual(1000);
+    expect(replayed!).toContain("truncated");
   });
 });
 
