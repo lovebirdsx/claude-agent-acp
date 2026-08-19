@@ -356,6 +356,74 @@ function isEmptyUserInterruptionDiagnostic(
 const SUBAGENT_REPLAY_FILE_CAP_BYTES = 16 * 1024 * 1024;
 const SUBAGENT_REPLAY_TOTAL_CAP_BYTES = 48 * 1024 * 1024;
 
+// Per-message and cumulative byte caps for the main transcript replay (see
+// replaySessionHistory). The main chain matters more than the sub-agent
+// sidecars — it is the history the user actually reads — so the total budget is
+// looser than the 48MB sub-agent cap, but still bounded so a Grep/Read-heavy
+// session can't re-ship its whole tool_result corpus and OOM the renderer.
+const MAIN_REPLAY_MESSAGE_CAP_BYTES = 1 * 1024 * 1024;
+const MAIN_REPLAY_TOTAL_CAP_BYTES = 96 * 1024 * 1024;
+
+// Appended to a replayed content field when it is truncated (see
+// truncateReplayContent); kept short so it survives even a tiny cap.
+const REPLAY_TRUNCATION_MARKER = "… [truncated: replay size limit]";
+
+// Rough on-wire byte estimate for a replayed content payload (a string or a
+// block array), used to bound the replay without pulling in a size dependency.
+function estimateReplayContentBytes(content: unknown): number {
+  if (typeof content === "string") return content.length;
+  if (!Array.isArray(content)) return 0;
+  let total = 0;
+  for (const block of content) {
+    if (typeof block === "string") {
+      total += block.length;
+      continue;
+    }
+    if (block === null || typeof block !== "object") continue;
+    try {
+      total += JSON.stringify(block).length;
+    } catch {
+      // Un-stringifiable block (shouldn't come from a JSON transcript) — ignore.
+    }
+  }
+  return total;
+}
+
+// Cap the oversized text fields of a replayed content payload, returning a new
+// value only when something was cut. A single giant tool_result (a Grep/Read
+// dump) would otherwise blow the renderer by itself. Only string
+// `text`/`thinking`/`content` fields are touched; tool_use ids and image data
+// pass through untouched.
+function truncateReplayContent(content: unknown, maxBytes: number): unknown {
+  if (typeof content === "string") {
+    return content.length <= maxBytes
+      ? content
+      : content.slice(0, Math.max(0, maxBytes - REPLAY_TRUNCATION_MARKER.length)) +
+          REPLAY_TRUNCATION_MARKER;
+  }
+  if (!Array.isArray(content)) return content;
+  let changed = false;
+  const result = content.map((block) => {
+    if (block === null || typeof block !== "object") return block;
+    const b = block as { text?: unknown; thinking?: unknown; content?: unknown };
+    let next = block;
+    for (const key of ["text", "thinking", "content"] as const) {
+      const value = b[key];
+      if (typeof value === "string" && value.length > maxBytes) {
+        changed = true;
+        next = {
+          ...(next as object),
+          [key]:
+            value.slice(0, Math.max(0, maxBytes - REPLAY_TRUNCATION_MARKER.length)) +
+            REPLAY_TRUNCATION_MARKER,
+        };
+      }
+    }
+    return next;
+  });
+  return changed ? result : content;
+}
+
 /**
  * Custom (extension) request the editor sends to persist a session title onto
  * the agent's durable store. Without this the editor's AI-generated title lives
@@ -9146,7 +9214,10 @@ export class ClaudeAcpAgent {
     resumedMessages?: SessionMessage[],
     pending?: PendingReplay,
     stopBeforeUuid?: string,
+    replayCaps: { messageCapBytes?: number; totalCapBytes?: number } = {},
   ): Promise<void> {
+    const replayMessageCapBytes = replayCaps.messageCapBytes ?? MAIN_REPLAY_MESSAGE_CAP_BYTES;
+    const replayTotalCapBytes = replayCaps.totalCapBytes ?? MAIN_REPLAY_TOTAL_CAP_BYTES;
     const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
     const rawEntries =
@@ -9390,9 +9461,9 @@ export class ClaudeAcpAgent {
       await replayAsyncTasks.taskNotification(notification);
     };
 
-    const replayMessage = async (message: SessionMessage): Promise<void> => {
+    const replayMessage = async (message: SessionMessage): Promise<boolean> => {
       if (pending?.stopped || isReplayHiddenMetaMessage(message)) {
-        return;
+        return false;
       }
       if (
         message.type === "user" &&
@@ -9416,7 +9487,7 @@ export class ClaudeAcpAgent {
       // assistant message into an authRequired error instead of showing its
       // TUI-specific text; skip it on replay too (issue #863).
       if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) {
-        return;
+        return false;
       }
 
       // The SDK's resume-time role rebalancing plants a synthetic "No response
@@ -9424,7 +9495,7 @@ export class ClaudeAcpAgent {
       // streamed live, so replaying it would show text the running session
       // never had — skip it like the login placeholder above.
       if (message.type === "assistant" && isSyntheticNoResponseMessage(message.message)) {
-        return;
+        return false;
       }
 
       // Capable clients saw every synthetic usage-limit message as a typed
@@ -9447,7 +9518,7 @@ export class ClaudeAcpAgent {
             message.uuid === activeUsageLimit?.uuid,
           );
         }
-        return;
+        return false;
       }
 
       // @ts-expect-error - untyped in SDK but we handle all of these
@@ -9472,7 +9543,7 @@ export class ClaudeAcpAgent {
         }
         // Live, the prompt loop skips this record and the SDK frame reports the stop.
         content = isTaskNotificationRecord(message) ? null : stripLocalCommandMetadata(content);
-        if (content === null) return;
+        if (content === null) return false;
       } else if (Array.isArray(content)) {
         for (const block of content) {
           if (
@@ -9517,8 +9588,41 @@ export class ClaudeAcpAgent {
         );
         if (replayCompaction.recordSummary(assistantMessageText(message.message))) {
           await replayCompaction.finish(message.uuid, "completed");
-          return;
+          return false;
         }
+      }
+
+      // Bound how much this replay re-ships. Cap any single message's content
+      // (a lone Grep/Read tool_result can be enormous) and stop the whole
+      // replay once the cumulative budget is spent, so a huge transcript can't
+      // re-send its entire corpus into the renderer and OOM it. Unlike the
+      // sub-agent sidecar replay, the main chain is what the user reads, so we
+      // tell them we truncated rather than dropping the tail silently. Only
+      // main-session traffic counts against the budget: native sub-agent child
+      // sessions are separate histories with their own load.
+      if (replayTargetSessionId === sessionId) {
+        content = truncateReplayContent(content, replayMessageCapBytes);
+        const messageBytes = estimateReplayContentBytes(content);
+        if (replayedBytes + messageBytes > replayTotalCapBytes) {
+          this.logger.log(
+            `replay: truncated history for ${sessionId} after ${replayedBytes} bytes ` +
+              `(next message ${messageBytes} bytes would exceed the ${replayTotalCapBytes} byte cap)`,
+          );
+          await this.client.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: {
+                type: "text",
+                text:
+                  "History replay truncated: the rest of this session's history exceeds the " +
+                  "replay size limit.",
+              },
+            },
+          });
+          return true;
+        }
+        replayedBytes += messageBytes;
       }
 
       // The per-sub-agent tally lives only in process memory, accumulated from
@@ -9634,6 +9738,7 @@ export class ClaudeAcpAgent {
           for (const childMessage of childMessages) await replayMessage(childMessage);
         }
       }
+      return false;
     };
     // Parallel tool_use entries from one assistant turn are persisted as a
     // chain (use1 -> use2 -> ...), each tool_result parenting onto its own
@@ -9647,6 +9752,8 @@ export class ClaudeAcpAgent {
     // re-accumulated sub-agent tallies after the replay finishes (see
     // restampReplayedSubagentStats).
     const pendingSubagentRestamps: ReplayedSubagentCard[] = [];
+    // Cumulative on-wire byte budget for this replay; see the loop below.
+    let replayedBytes = 0;
     const trackToolCallLifecycle = (notification: SessionNotification): void => {
       const update = notification.update;
       if (update.sessionUpdate === "tool_call") {
@@ -9714,7 +9821,7 @@ export class ClaudeAcpAgent {
         }
         continue;
       }
-      await replayMessage(message as SessionMessage);
+      if (await replayMessage(message as SessionMessage)) break;
     }
 
     if (nativeReplayEnabled && !pending?.stopped) {
@@ -9857,6 +9964,7 @@ export class ClaudeAcpAgent {
   private async restampReplayedSubagentStats(
     sessionId: string,
     cards: ReplayedSubagentCard[],
+    fileCapBytes: number = SUBAGENT_REPLAY_FILE_CAP_BYTES,
   ): Promise<void> {
     if (cards.length === 0) return;
     const groups = groupSubagentCards(cards);
@@ -9875,10 +9983,20 @@ export class ClaudeAcpAgent {
     await Promise.all(
       groups.map(async (group) => {
         try {
-          const raw = await fs.readFile(
-            path.join(subagentsDir, `agent-${group.agentId}.jsonl`),
-            "utf8",
-          );
+          const file = path.join(subagentsDir, `agent-${group.agentId}.jsonl`);
+          // Skip oversized sidecars before reading them into memory. Unlike the
+          // process replay (which streams per entry), the stats restamp reads
+          // the whole file at once, so an un-capped read of a giant sidecar
+          // would blow this node process's own heap.
+          const { size } = await fs.stat(file);
+          if (size > fileCapBytes) {
+            this.logger.log(
+              `subagent stats: skipped restamp for ${group.agentId}: sidecar ${size} bytes ` +
+                `exceeds ${fileCapBytes} byte cap`,
+            );
+            return;
+          }
+          const raw = await fs.readFile(file, "utf8");
           const segments = segmentsPerCard(
             splitSubagentTranscriptByResumes(raw, resumeMessagesOf(group)),
             group.cards.length,
