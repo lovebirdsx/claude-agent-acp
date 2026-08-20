@@ -882,10 +882,11 @@ type Session = {
    *  reconciliation (`reconcileResumedSessionModel`). No extra `getContextUsage`
    *  IPC is on these paths: on a fresh session it stalls until the first turn
    *  runs, and on a resumed session it re-assembles the whole transcript (see
-   *  the seeding call sites and `contextWindowCache`). At each turn's result /
-   *  compact boundary the *effective* window (getContextUsage's `maxTokens`,
-   *  i.e. after any `autoCompactWindow` clamp) overrides it, so `used / size`
-   *  matches the point auto-compaction actually fires at. */
+   *  the seeding call sites and `contextWindowCache`). Each result clamps the
+   *  confirmed physical window by the local `autoCompactWindow` setting; no
+   *  in-session getContextUsage refresh remains — it would fan out into 10+
+   *  `max_tokens:1` count requests on gateways without count_tokens, see the
+   *  result handler. */
   contextWindowSize: number;
   /** Whether `contextWindowSize` came from an authoritative source (the
    *  cross-session cache, a resumed session's `getContextUsage` report, or a
@@ -3415,29 +3416,19 @@ export class ClaudeAcpAgent {
                 // right after the user sees the compaction card complete, which
                 // is confusing and wrong.
                 //
-                // Prefer the SDK's authoritative post-compaction `used` via
-                // getContextUsage — it reflects the real retained context
-                // (system prompt + tools + surviving messages), which the
-                // per-message API usage numbers can't give us until the next
-                // turn's result. If the control request fails, fall back to the
-                // used:0 approximation: directionally correct (context just
-                // dropped dramatically) and replaced within seconds by the next
-                // result message.
-                //
-                // `size` comes from getContextUsage's `maxTokens` (the effective
-                // window after the autoCompactWindow clamp) when available, kept
-                // in session.contextWindowSize; otherwise the previously learned
-                // window (modelUsage / the model heuristic) stands.
+                // Fork: used:0 is an approximation — deliberately NO
+                // getContextUsage here; its counting fallback on gateways
+                // without /v1/messages/count_tokens fans out into 10+ real
+                // `max_tokens:1` requests (see the result handler). It is
+                // directionally correct (context just dropped dramatically) and
+                // replaced by the next result message; `size` keeps the
+                // previously learned window (modelUsage / the model heuristic).
                 //
                 // The compaction outcome card is emitted from the `status`
                 // handler (keyed on `compact_result`) via COMPACTION_METHOD, not
                 // here, so the failure path gets a card too.
-                const usage = await fetchContextUsage(session.query, this.logger);
                 lastAssistantUsage = null;
-                lastAssistantTotalUsage = usage?.used ?? 0;
-                if (usage?.maxTokens != null) {
-                  session.contextWindowSize = usage.maxTokens;
-                }
+                lastAssistantTotalUsage = 0;
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -4097,9 +4088,8 @@ export class ClaudeAcpAgent {
                 matchingModelUsage.usage.contextWindow > 0
               ) {
                 // Clamp the model's physical window by any autoCompactWindow
-                // setting so that, if the authoritative getContextUsage refresh
-                // below fails, we still fall back to the effective window rather
-                // than the raw physical one.
+                // setting so the reported `size` is the effective window that
+                // governs auto-compaction, not the raw physical one.
                 const clamp = resolveAutoCompactWindow(session.settingsManager.getSettings());
                 session.contextWindowSize =
                   clamp != null
@@ -4131,15 +4121,15 @@ export class ClaudeAcpAgent {
                 }
               }
 
-              // Prefer the SDK's effective window (autoCompactWindow clamp applied)
-              // over the model's physical window from modelUsage — it's what
-              // actually governs auto-compaction, so `used / size` matches what
-              // the user sees compaction fire at. One local control request per
-              // turn; mid-stream deltas reuse this cached value.
-              const refreshed = await fetchContextUsage(session.query, this.logger);
-              if (refreshed?.maxTokens != null) {
-                session.contextWindowSize = refreshed.maxTokens;
-              }
+              // Fork: deliberately NO per-turn getContextUsage refresh here.
+              // Each call makes the CLI re-count every context segment (system
+              // prompt blocks, memory files, tools, agents, …); on gateways
+              // without /v1/messages/count_tokens the CLI's counting fallback
+              // fans that out into 10+ real `max_tokens:1` messages requests —
+              // every turn. The local autoCompactWindow clamp above already
+              // yields the effective window; the only remaining getContextUsage
+              // caller is the resumed-session reconciliation
+              // (`readResumedLiveModel`).
 
               // Send usage_update notification
               if (lastAssistantTotalUsage !== null) {
@@ -8151,8 +8141,7 @@ export class ClaudeAcpAgent {
       allowlistedModelInfo,
     );
     // Cap the seed by any autoCompactWindow clamp so a fresh session reports the
-    // effective window from the start instead of flashing the physical size
-    // until the first turn's getContextUsage refresh.
+    // effective window from the start instead of the physical size.
     const seedClamp = resolveAutoCompactWindow(settingsManager.getSettings());
     const seededWindow =
       seedClamp != null
@@ -10334,9 +10323,9 @@ function inferContextWindowFromModel(...texts: Array<string | undefined>): numbe
  *  `CLAUDE_CODE_AUTO_COMPACT_WINDOW=300000` auto-compacts at 300k, so 300k — not
  *  1M — is the correct `size` denominator). The SDK applies this clamp inside
  *  the CLI binary and only surfaces it via `getContextUsage().maxTokens`, which
- *  we don't call until a turn's `result`; reading it here lets us report the
- *  clamped window from session creation instead of flashing the physical size
- *  until the first turn completes.
+ *  we only call during resumed-session reconciliation; reading the
+ *  setting here lets us report the clamped window everywhere else without that
+ *  round-trip.
  *
  *  Checked in priority order: the resolved `settings.autoCompactWindow` field,
  *  the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` entry in `settings.env`, then the same
@@ -10369,34 +10358,6 @@ function computeInitialContextWindow(
   const physical = inferContextWindowFromModel(...modelTexts) ?? DEFAULT_CONTEXT_WINDOW;
   const clamp = resolveAutoCompactWindow(settings);
   return clamp != null ? Math.min(physical, clamp) : physical;
-}
-
-/** Fetch the SDK's authoritative context-window occupancy via the
- *  `getContextUsage` control request. Unlike the per-message API usage numbers
- *  (which only count message tokens), `totalTokens` includes the system prompt,
- *  tool schemas, MCP tools, and memory-file overhead — the real occupancy the
- *  user sees. Returns `null` on any control-request failure.
- *
- *  `maxTokens` is the *effective* window after the `autoCompactWindow` clamp
- *  (e.g. `CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000` makes it 200k even on a 1M
- *  model), which is what actually governs when auto-compaction fires — so it's
- *  the correct `size` denominator. `rawMaxTokens` is the model's physical limit;
- *  we only fall back to it (and ultimately to `modelUsage`/the heuristic, via a
- *  null result) when `maxTokens` is missing or non-positive. We never take a max
- *  of the two: when a user explicitly clamps the window, `maxTokens <
- *  rawMaxTokens` is the desired behaviour. */
-async function fetchContextUsage(
-  query: Query,
-  logger: Logger,
-): Promise<{ used: number; maxTokens: number | null } | null> {
-  try {
-    const usage = await query.getContextUsage();
-    const maxTokens = pickWindowSize(usage.maxTokens) ?? pickWindowSize(usage.rawMaxTokens);
-    return { used: usage.totalTokens, maxTokens };
-  } catch (error) {
-    logger.error("Failed to fetch context usage from SDK:", error);
-    return null;
-  }
 }
 
 /** Cross-session cache of authoritative context windows, keyed by

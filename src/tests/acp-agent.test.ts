@@ -6238,10 +6238,13 @@ describe("usage_update computation", () => {
     expect(usageUpdates).toHaveLength(0);
   });
 
-  it("result prefers getContextUsage maxTokens over modelUsage contextWindow", async () => {
-    // The bug this fixes: a 1M physical model with an explicit autoCompactWindow
-    // clamp (e.g. CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000) must report size=200k,
-    // not the physical 1M, so the percentage matches where compaction fires.
+  it("result clamps the modelUsage window by autoCompactWindow without getContextUsage IPC", async () => {
+    // A 1M physical model with an explicit autoCompactWindow clamp (e.g.
+    // CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000) must report size=200k, not the
+    // physical 1M, so the percentage matches where compaction fires. The clamp
+    // is resolved locally from settings — a per-turn getContextUsage would make
+    // the CLI re-count every context segment, which on gateways without
+    // /v1/messages/count_tokens degrades into 10+ real max_tokens:1 requests.
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createStreamEvent("message_start", {
@@ -6271,9 +6274,12 @@ describe("usage_update computation", () => {
     ]);
     const session = agent.sessions["test-session"];
     session.contextWindowSize = 1000000;
-    (session.query as any).getContextUsage = vi
-      .fn()
-      .mockResolvedValue({ totalTokens: 3000, maxTokens: 200000, rawMaxTokens: 1000000 });
+    session.settingsManager = {
+      dispose: vi.fn(),
+      getSettings: () => ({ autoCompactWindow: 200000 }),
+    } as any;
+    const getContextUsage = vi.fn();
+    (session.query as any).getContextUsage = getContextUsage;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
@@ -6281,11 +6287,11 @@ describe("usage_update computation", () => {
     // The result update (last) reflects the 200k effective window.
     expect(usageUpdates[usageUpdates.length - 1].update.size).toBe(200000);
     expect(session.contextWindowSize).toBe(200000);
+    expect(getContextUsage).not.toHaveBeenCalled();
   });
 
-  it("result keeps the physical window when getContextUsage is unclamped (1M)", async () => {
-    // No autoCompactWindow clamp: maxTokens == rawMaxTokens == 1M, so a normal
-    // 1M user sees no regression.
+  it("result keeps the physical window when no clamp is set (1M)", async () => {
+    // No autoCompactWindow clamp: the modelUsage physical window stands.
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createStreamEvent("message_start", {
@@ -6315,54 +6321,11 @@ describe("usage_update computation", () => {
     ]);
     const session = agent.sessions["test-session"];
     session.contextWindowSize = 1000000;
-    (session.query as any).getContextUsage = vi
-      .fn()
-      .mockResolvedValue({ totalTokens: 3000, maxTokens: 1000000, rawMaxTokens: 1000000 });
+    (session.query as any).getContextUsage = vi.fn();
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdates[usageUpdates.length - 1].update.size).toBe(1000000);
-    expect(session.contextWindowSize).toBe(1000000);
-  });
-
-  it("result ignores a non-positive maxTokens and keeps the modelUsage window", async () => {
-    const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
-      createStreamEvent("message_start", {
-        model: "claude-opus-4-6-1m",
-        usage: {
-          input_tokens: 2000,
-          output_tokens: 1000,
-          cache_read_input_tokens: 0,
-          cache_creation_input_tokens: 0,
-        },
-      }),
-      createResultMessageWithModel({
-        modelUsage: {
-          "claude-opus-4-6-1m": {
-            inputTokens: 2000,
-            outputTokens: 1000,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.02,
-            contextWindow: 1000000,
-            maxOutputTokens: 16384,
-          },
-        },
-      }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
-    ]);
-    const session = agent.sessions["test-session"];
-    (session.query as any).getContextUsage = vi
-      .fn()
-      .mockResolvedValue({ totalTokens: 3000, maxTokens: 0, rawMaxTokens: 0 });
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
-
-    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
-    // maxTokens:0 and rawMaxTokens:0 are both invalid → fall back to modelUsage.
     expect(usageUpdates[usageUpdates.length - 1].update.size).toBe(1000000);
     expect(session.contextWindowSize).toBe(1000000);
   });
@@ -6813,34 +6776,7 @@ describe("usage_update computation", () => {
     expect(usageUpdate.update.size).toBe(1000000);
   });
 
-  it("compact_boundary uses getContextUsage maxTokens as the effective size", async () => {
-    const { agent, updates } = createMockAgentWithCapture();
-    // No trailing idle: an idle with no preceding result now fails the turn as
-    // abandoned (issue #825), and a real compaction turn always produces a
-    // result. Here the stream simply ends, settling the prompt end_turn.
-    injectSession(agent, [
-      { type: "system", subtype: "compact_boundary", session_id: "test-session" },
-    ]);
-    const session = agent.sessions["test-session"];
-    // A 1M physical window was learned earlier, but the user clamped the
-    // effective window (autoCompactWindow) to 200k — getContextUsage reports
-    // that via maxTokens, which is the denominator auto-compaction fires at.
-    session.contextWindowSize = 1000000;
-    (session.query as any).getContextUsage = vi
-      .fn()
-      .mockResolvedValue({ totalTokens: 12345, maxTokens: 200000, rawMaxTokens: 1000000 });
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
-
-    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdate).toBeDefined();
-    expect(usageUpdate.update.used).toBe(12345);
-    // size follows the effective window (maxTokens), not the physical 1M.
-    expect(usageUpdate.update.size).toBe(200000);
-    expect(session.contextWindowSize).toBe(200000);
-  });
-
-  it("compact_boundary falls back to rawMaxTokens when maxTokens is missing", async () => {
+  it("compact_boundary emits used:0 with the learned window, without getContextUsage IPC", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // No trailing idle: an idle with no preceding result now fails the turn as
     // abandoned (issue #825), and a real compaction turn always produces a
@@ -6850,36 +6786,21 @@ describe("usage_update computation", () => {
     ]);
     const session = agent.sessions["test-session"];
     session.contextWindowSize = 500000;
-    (session.query as any).getContextUsage = vi
-      .fn()
-      .mockResolvedValue({ totalTokens: 12345, rawMaxTokens: 1000000 });
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
-
-    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdate).toBeDefined();
-    expect(usageUpdate.update.used).toBe(12345);
-    expect(usageUpdate.update.size).toBe(1000000);
-    expect(session.contextWindowSize).toBe(1000000);
-  });
-
-  it("compact_boundary falls back to used:0 when getContextUsage fails", async () => {
-    const { agent, updates } = createMockAgentWithCapture();
-    // No trailing idle — see the sibling test above (issue #825).
-    injectSession(agent, [
-      { type: "system", subtype: "compact_boundary", session_id: "test-session" },
-    ]);
-    const session = agent.sessions["test-session"];
-    session.contextWindowSize = 200000;
-    (session.query as any).getContextUsage = vi.fn().mockRejectedValue(new Error("boom"));
+    // Fork: no getContextUsage at the boundary (its counting fallback on
+    // gateways without /v1/messages/count_tokens fans out into 10+ real
+    // max_tokens:1 requests). used:0 is directionally correct and replaced by
+    // the next result; size keeps the previously learned window.
+    const getContextUsage = vi.fn();
+    (session.query as any).getContextUsage = getContextUsage;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdate).toBeDefined();
     expect(usageUpdate.update.used).toBe(0);
-    expect(usageUpdate.update.size).toBe(200000);
-    expect(session.contextWindowSize).toBe(200000);
+    expect(usageUpdate.update.size).toBe(500000);
+    expect(session.contextWindowSize).toBe(500000);
+    expect(getContextUsage).not.toHaveBeenCalled();
   });
 
   it("caches the turn's authoritative window under the resolved id and serves it on a later switch, with no getContextUsage IPC", async () => {
