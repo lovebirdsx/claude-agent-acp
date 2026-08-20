@@ -232,11 +232,11 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.env?.CLAUDE_CODE_SUBAGENT_MODEL).toBeFalsy();
   });
 
-  it("defaults CLAUDE_CODE_ENTRYPOINT to cli", async () => {
+  it("defaults CLAUDE_CODE_ENTRYPOINT to universe-editor", async () => {
     vi.stubEnv("CLAUDE_CODE_ENTRYPOINT", "");
     await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
-    expect(capturedOptions!.env?.CLAUDE_CODE_ENTRYPOINT).toBe("cli");
+    expect(capturedOptions!.env?.CLAUDE_CODE_ENTRYPOINT).toBe("universe-editor");
   });
 
   it("respects a caller-provided CLAUDE_CODE_ENTRYPOINT", async () => {

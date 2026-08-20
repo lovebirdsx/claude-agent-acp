@@ -7748,12 +7748,15 @@ export class ClaudeAcpAgent {
       // model resolves and neither the host env nor the caller's env
       // already sets the var — an explicit setting always wins.
       ...(resolveSubagentModelEnv(settingsManager, userProvidedOptions?.env) || {}),
-      // Fork patch: default the entrypoint to "cli" instead of the SDK's
-      // "sdk-ts" so the native CLI's /resume and --continue pick up sessions
-      // created here; an explicit host or caller setting always wins.
+      // Fork patch: default the entrypoint to "universe-editor" instead of the
+      // SDK's "sdk-ts" so the native CLI's /resume and --continue pick up
+      // sessions created here. "cli" doesn't work — in print/SDK mode the CLI
+      // rewrites "cli" to "sdk-cli", which /resume filters out; an unknown
+      // custom value passes through untouched, is persisted as-is, and stays
+      // visible to /resume. An explicit host or caller setting always wins.
       ...(!process.env.CLAUDE_CODE_ENTRYPOINT?.trim() &&
       !userProvidedOptions?.env?.CLAUDE_CODE_ENTRYPOINT?.trim()
-        ? { CLAUDE_CODE_ENTRYPOINT: "cli" }
+        ? { CLAUDE_CODE_ENTRYPOINT: "universe-editor" }
         : {}),
       // Opt-in to session state events like when the agent is idle
       CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
