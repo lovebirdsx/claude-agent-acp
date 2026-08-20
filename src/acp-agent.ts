@@ -6824,9 +6824,8 @@ export class ClaudeAcpAgent {
                 matchingModelUsage.usage.contextWindow > 0
               ) {
                 // Clamp the model's physical window by any autoCompactWindow
-                // setting so that, if the authoritative getContextUsage refresh
-                // below fails, we still fall back to the effective window rather
-                // than the raw physical one.
+                // setting so the reported `size` is the effective window that
+                // governs auto-compaction, not the raw physical one.
                 const clamp = resolveAutoCompactWindow(session.settingsManager.getSettings());
                 session.contextWindowSize =
                   clamp != null
@@ -13893,9 +13892,9 @@ function inferContextWindowFromModel(...texts: Array<string | undefined>): numbe
  *  `CLAUDE_CODE_AUTO_COMPACT_WINDOW=300000` auto-compacts at 300k, so 300k — not
  *  1M — is the correct `size` denominator). The SDK applies this clamp inside
  *  the CLI binary and only surfaces it via `getContextUsage().maxTokens`, which
- *  we don't call until a turn's `result`; reading it here lets us report the
- *  clamped window from session creation instead of flashing the physical size
- *  until the first turn completes.
+ *  we only call during resumed-session reconciliation; reading the
+ *  setting here lets us report the clamped window everywhere else without that
+ *  round-trip.
  *
  *  Checked in priority order: the resolved `settings.autoCompactWindow` field,
  *  the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` entry in `settings.env`, then the same

@@ -57,6 +57,8 @@
 
 **已被上游实现、fork 不再保留的本地改动**：AskUserQuestion「选项+备注共存」。上游 a44c486 起 `applyAskElicitationResponse` 已实现同一意图——单选且已选中选项时，自由文本落 `annotations[question].notes`（原先 custom-wins 会吞掉已选项）；多选并入所选；无选择时文本即答案。fork 原有的 `"(notes only)"` 哨兵等子分支已在 rebase 时删去（源文件与测试整段切回上游）。日后 rebase 若此处再冲突，按上游语义走，勿重新加回。
 
+**每 turn / compact_boundary 的 getContextUsage 刷新移除**：上游 a44c486 起自身已不在 result 处做 per-turn `getContextUsage`（改用 `modelUsage.contextWindow` + 本地 `resolveAutoCompactWindow` clamp），compact_boundary 改用 `compact_metadata.post_tokens`（比 fork 的 used:0 近似更准），`fetchContextUsage` 助手随之不存在。fork 这条改动整体被上游吸收，不再单列；唯一保留相关的是上游新增的 `refreshContextWindowInBackground`（仅在窗口非权威时后台跑一次，不等不阻塞），它不属于本改动要删的「每 turn」路径。日后 rebase 若上游又在 result / compact_boundary 处引入同步 `getContextUsage`，按本条删。
+
 **六个自定义 ext-method / notification 名（须与父项目 editor 侧 `acpSessionModel.ts` 逐字一致）**：
 `universe-editor/ask_user_question`、`universe-editor/set_session_title`、`universe-editor/rewind_session`、`_universe/compaction`、`_universe/background_activity`、`_claude/sdkMessage`。
 
