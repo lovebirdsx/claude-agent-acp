@@ -24,6 +24,7 @@
 
 | 功能 | 提交 | 落点文件 | 备注 |
 |---|---|---|---|
+| 官方订阅额度用量 | （待提交） | **`usage.ts`(新文件)** `acp-agent.ts` | `SUBSCRIPTION_USAGE_METHOD = "universe-editor/subscription_usage"`，编辑器用量指示器在 claude.ai OAuth 订阅下显示额度窗口百分比而非网关人民币开销。数据源是 SDK 的 `Query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET()`（即 `/usage` 的后端）——**方法名自带"可能变"警告，必须运行时特性探测**（`typeof fn !== "function"` → `supported:false`）而不能静态调用，抛错同样降级；原样透传 `rate_limits`，归一化在编辑器侧（两个 fork 各写一份必漂移）。注意 `subscription_type: null` 是**正常值**（API key 会话）不是错误，编辑器据此回退 ¥ 读数。`acp-agent.ts` 只加 `getSubscriptionUsage(sid)` + 一条 builder `.onRequest`，主体在新文件。配套测试 `tests/usage.test.ts` |
 | SendMessage 续跑子 Agent 的 live 重定向 + replay 分段回放 | （待提交） | `tools.ts` `acp-agent.ts` | SendMessage 唤醒已完成子 Agent 时，SDK 续跑 sidechain 消息的 `parent_tool_use_id` 仍是**最初 Agent 调用的 id**，内容被路由到已折叠的原始卡，续跑不可见。修法一（live）：Session 增 `subagentSpawns`（agentId→原始 tool_use id，task_started first-wins / replay 播种）与 `subagentResumeRedirects`（原始 id→活跃续跑 id，task_started 记录、task_notification/终态 task_updated 清除）；live 循环在消息处理早期（`_claude/sdkMessage` 旁路之前）用 `redirectParentToolUseId` 原地改写 `parent_tool_use_id`，使 usage 累计/stats 推送/嵌套通知都落到 SendMessage 卡。修法二（replay）：`resumedSubagentCardFromResult` 从 SendMessage tool_result 的 `resumedAgentId` + toolUseCache 的 `input.message` 识别续跑卡；`splitSubagentTranscriptByResumes` 按「coordinator 前缀行 + 包含对应 message 文本」把 sidecar 分段，`restampReplayedSubagentStats`/`replaySubagentTranscripts` 按 agentId 分组读文件一次、段 k 喂第 k 张卡（0=原始卡），tally cache key 改 `${agentId}#${toolCallId}`；`toolInfoFromToolUse` 增 SendMessage case（summary 作 title、message 作 content） |
 | resume 回放重放子代理执行过程 | （待提交） | `tools.ts` `acp-agent.ts` | 主链回放看不到子代理 sidechain，过程行活在 `<session>/subagents/agent-<id>.jsonl`。回放结束后**异步**（不阻塞 load）逐卡读侧车 transcript，经 `toAcpNotifications` 带 `parentToolUseId` 回灌成与 live 同形状的嵌套通知，客户端无需区分 live/replay；user 行只保留 tool_result（子代理初始 prompt 不进客户端 feed）；legacy 客户端沿用 strip text/thinking（只发嵌套 tool 归因）；子代理 tool_use/tool_result 用每卡独立 toolUseCache 不污染主链 |
 | 落盘 entrypoint 默认 `universe-editor` | （待提交） | `acp-agent.ts` `tests/create-session-options.test.ts` | 原生 CLI 的 `/resume`/`--continue` 选择器按 entrypoint ∈ {sdk-cli,sdk-ts,sdk-py} 过滤候选会话，SDK 在 env 未设时默认盖 `sdk-ts` 致 ACP 会话在 CLI 不可见。fork 在 query env 组装处条件注入 `CLAUDE_CODE_ENTRYPOINT=universe-editor`（host env / caller `_meta.claudeCode.options.env` 显式设置优先，与 `resolveSubagentModelEnv` 同语义）；不能用 `cli`——CLI 的 print/SDK 模式把 `cli` 强制改写为 `sdk-cli`，/resume 又过滤 sdk-*，未知值则原样透传落盘且对 /resume 可见 |
@@ -59,8 +60,8 @@
 
 **每 turn / compact_boundary 的 getContextUsage 刷新移除**：上游 a44c486 起自身已不在 result 处做 per-turn `getContextUsage`（改用 `modelUsage.contextWindow` + 本地 `resolveAutoCompactWindow` clamp），compact_boundary 改用 `compact_metadata.post_tokens`（比 fork 的 used:0 近似更准），`fetchContextUsage` 助手随之不存在。fork 这条改动整体被上游吸收，不再单列；唯一保留相关的是上游新增的 `refreshContextWindowInBackground`（仅在窗口非权威时后台跑一次，不等不阻塞），它不属于本改动要删的「每 turn」路径。日后 rebase 若上游又在 result / compact_boundary 处引入同步 `getContextUsage`，按本条删。
 
-**六个自定义 ext-method / notification 名（须与父项目 editor 侧 `acpSessionModel.ts` 逐字一致）**：
-`universe-editor/ask_user_question`、`universe-editor/set_session_title`、`universe-editor/rewind_session`、`_universe/compaction`、`_universe/background_activity`、`_claude/sdkMessage`。
+**七个自定义 ext-method / notification 名（须与父项目 editor 侧 `acpExtMethods.ts` 逐字一致）**：
+`universe-editor/ask_user_question`、`universe-editor/set_session_title`、`universe-editor/rewind_session`、`universe-editor/subscription_usage`、`_universe/compaction`、`_universe/background_activity`、`_claude/sdkMessage`。
 
 ## rebase / 合并上游核对表
 
@@ -68,7 +69,7 @@
 2. `git -C vendor/claude-agent-acp fetch upstream`，查看上游新增 release：`git -C vendor/claude-agent-acp log --oneline HEAD..upstream/main`。
 3. rebase / merge 上游后，对着上面「本地改动清单」**逐条核对**每项功能是否仍在、是否需随上游 API 调整：
    - 尤其留意上游是否自行实现了 rewind / compaction / 标题持久化 —— 若上游版本与本地重叠，优先切到上游实现并删本地对应提交（减少 diff），但**必须先确认 wire 形状与父项目 editor 侧兼容**。
-4. **回归底线**：父项目侧的**跨仓契约测试**（`apps/editor` 的 ACP contract spec，见架构路线图 01·任务1）以真 fork dist 断言这六个 ext-method + `_meta` 印章的 wire 形状。跑它即验证本地改动在 rebase 后未漂移：
+4. **回归底线**：父项目侧的**跨仓契约测试**（`apps/editor/integration/scenarios/acpForkContract.integration.test.ts`）以真 fork dist 断言上列 ext-method + `_meta` 印章的 wire 形状。跑它即验证本地改动在 rebase 后未漂移：
    - 改完 fork → `pnpm agent:build` → 跑 editor 契约测试；红即说明某个 ext-method 形状被上游/rebase 改动破坏。
 5. fork 自身单测：`npm --prefix vendor/claude-agent-acp test`（本地改动均带配套测试，见清单中带 `*.test.ts` 的提交）。
 
