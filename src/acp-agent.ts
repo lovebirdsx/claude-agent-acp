@@ -147,6 +147,12 @@ import {
   type AskUserQuestionResult,
 } from "./interactive.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
+import {
+  readSubscriptionUsage,
+  SUBSCRIPTION_USAGE_METHOD,
+  type SubscriptionUsageRequest,
+  type SubscriptionUsageResponse,
+} from "./usage.js";
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
@@ -5631,6 +5637,22 @@ export class ClaudeAcpAgent {
   }
 
   /**
+   * Read the claude.ai plan's rate-limit windows for the editor's usage
+   * indicator, backing the `universe-editor/subscription_usage` ext-method.
+   * The actual SDK call is experimental, so it is isolated in `usage.ts` and
+   * degrades to `supported: false` rather than throwing.
+   */
+  async getSubscriptionUsage(
+    params: SubscriptionUsageRequest,
+  ): Promise<SubscriptionUsageResponse> {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
+      throw RequestError.resourceNotFound(params.sessionId);
+    }
+    return await readSubscriptionUsage(session.query, this.logger);
+  }
+
+  /**
    * Translate the ACP messageId the client stamped on a user turn into the SDK
    * message uuid the Agent SDK's rewind/resume APIs key on, using the live
    * session's `messageIdToUuid` table (populated during the message loop and on
@@ -10273,6 +10295,11 @@ export function runAcp() {
       REWIND_SESSION_METHOD,
       (params) => params as RewindSessionRequest,
       (ctx) => agent.rewindSession(ctx.params),
+    )
+    .onRequest(
+      SUBSCRIPTION_USAGE_METHOD,
+      (params) => params as SubscriptionUsageRequest,
+      (ctx) => agent.getSubscriptionUsage(ctx.params),
     )
     .onRequest(methods.agent.session.prompt, (ctx) =>
       runPromptWithCancellation(agent, ctx.params, ctx.signal),
