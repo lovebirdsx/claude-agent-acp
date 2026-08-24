@@ -24,9 +24,10 @@
  *   the adapter sends instead of the text chunk origin/main streamed.
  * - A `_meta` key of the adapter's own namespace (see
  *   {@link ADAPTER_META_PREFIXES}), e.g. the running per-sub-agent tally the
- *   adapter adds to the parent Task card. The capability keys the adapter
- *   advertises on `initialize` (`universe-editor/capabilities`) are the same
- *   kind of difference, on a message that is not a session update.
+ *   adapter adds to the parent Task card, or the mid-turn cost breakdown it
+ *   adds to a `usage_update`, whose other fields are the same. The capability
+ *   keys the adapter advertises on `initialize` (`universe-editor/capabilities`)
+ *   are the same kind of difference, on a message that is not a session update.
  * - A `usage_update` without a `cost` that the adapter sends while the
  *   response to `session/load` is still on its way. The adapter reports the
  *   context window of the session it restored; origin/main reported it only
@@ -401,6 +402,11 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
         summaryChunks.get(want.compactionId as string) === text &&
         canonical(without(want, "summary")) === canonical(got)
       );
+    }
+    if (want.sessionUpdate === "usage_update") {
+      // Same report plus a `_meta` key of the adapter's namespace: the
+      // mid-turn cost breakdown rides along on the same usage_update.
+      return canonical(withoutAirOnlyKeys(actual)) === canonical(wanted);
     }
     return false;
   };
