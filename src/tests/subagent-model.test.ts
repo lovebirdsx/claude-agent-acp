@@ -6,6 +6,10 @@ function settingsManagerWithModel(model: string | undefined): SettingsManager {
   return { getSettings: () => ({ model }) } as unknown as SettingsManager;
 }
 
+function settingsManagerWithEnv(env: Record<string, string>): SettingsManager {
+  return { getSettings: () => ({ env }) } as unknown as SettingsManager;
+}
+
 describe("resolveSessionModel", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
@@ -57,6 +61,22 @@ describe("resolveSubagentModelEnv", () => {
         CLAUDE_CODE_SUBAGENT_MODEL: "claude-sonnet-4-6",
       }),
     ).toBeUndefined();
+  });
+
+  it("returns undefined when settings.json's env block already sets the var", () => {
+    vi.stubEnv("ANTHROPIC_MODEL", "kimi-k3[1m]");
+    expect(
+      resolveSubagentModelEnv(
+        settingsManagerWithEnv({ CLAUDE_CODE_SUBAGENT_MODEL: "claude-sonnet-4-6" }),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("still pins when settings.json's env block has the var blank", () => {
+    vi.stubEnv("ANTHROPIC_MODEL", "kimi-k3[1m]");
+    expect(
+      resolveSubagentModelEnv(settingsManagerWithEnv({ CLAUDE_CODE_SUBAGENT_MODEL: "  " })),
+    ).toEqual({ CLAUDE_CODE_SUBAGENT_MODEL: "kimi-k3[1m]" });
   });
 
   it("returns undefined when no session model can be resolved", () => {
