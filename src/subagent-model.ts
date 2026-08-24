@@ -47,14 +47,21 @@ export function resolveSessionModel(settingsManager: SettingsManager): string | 
 
 /** Value to inject as `CLAUDE_CODE_SUBAGENT_MODEL` into the spawned CLI's
  *  env, or undefined when no injection should happen — either the session
- *  model can't be determined, or the var is already set by the host env or
- *  the caller's options.env (an explicit setting always wins). */
+ *  model can't be determined, or the var is already set by the host env, the
+ *  caller's options.env, or the settings.json `env` block (an explicit
+ *  setting always wins). */
 export function resolveSubagentModelEnv(
   settingsManager: SettingsManager,
   callerEnv?: Record<string, string | undefined>,
 ): Record<string, string> | undefined {
   if (process.env[SUBAGENT_MODEL_ENV]?.trim()) return undefined;
   if (callerEnv?.[SUBAGENT_MODEL_ENV]?.trim()) return undefined;
+  // settings.json's `env` block is an explicit user setting too — the editor's
+  // "Sub Agent Model" field writes it there. The CLI applies that block itself,
+  // so whether it outranks our spawn env is its own business; skipping the
+  // auto-pin here makes the user's choice win deterministically either way.
+  const fromSettings = settingsManager.getSettings().env?.[SUBAGENT_MODEL_ENV];
+  if (typeof fromSettings === "string" && fromSettings.trim()) return undefined;
   const sessionModel = resolveSessionModel(settingsManager);
   if (!sessionModel) return undefined;
   return { [SUBAGENT_MODEL_ENV]: sessionModel };
