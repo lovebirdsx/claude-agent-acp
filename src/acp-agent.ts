@@ -146,6 +146,13 @@ import {
   parseAskUserQuestionInput,
   type AskUserQuestionResult,
 } from "./interactive.js";
+import {
+  adoptAuthoritativeBreakdown,
+  buildMidturnRows,
+  clearOverlay,
+  createMidturnCostLedger,
+  recordTopLevelSnapshot,
+} from "./session-cost.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 import {
   readSubscriptionUsage,
@@ -2704,6 +2711,11 @@ export class ClaudeAcpAgent {
     let lastAssistantTotalUsage: number | null = null;
     let lastAssistantUsage: UsageSnapshot | null = null;
     let lastAssistantModel: string | null = null;
+    // Cost ledger backing the mid-turn usage_update breakdown: the last
+    // authoritative `result.modelUsage` plus this turn's unconfirmed tokens.
+    // A consumer local (not a Session field) because exactly one turn is active
+    // at a time, like the scratch above.
+    const midturnCost = createMidturnCostLedger();
     // When the Claude SDK classifies a turn as failed (e.g. rate limit, auth
     // problem, billing), it sets a categorical `error` field on the
     // `SDKAssistantMessage` that precedes the final `result` message. We capture
@@ -2734,6 +2746,13 @@ export class ClaudeAcpAgent {
     // (whose delta events don't carry it) can all be tagged with the same,
     // replay-stable id.
     let currentStreamMessageId: string | undefined;
+    // Same id, but only ever set from a TOP-LEVEL `message_start`. The cost
+    // ledger keys the overlay by message id, and `currentStreamMessageId` is
+    // deliberately not gated on `parent_tool_use_id === null` (chunk grouping
+    // wants the subagent's id too) — reusing it would file the in-flight
+    // top-level message's later deltas under a subagent's id and count that one
+    // message twice.
+    let topLevelStreamMessageId: string | undefined;
     // The text/thinking blocks that have actually streamed live as
     // `stream_event` deltas for the message the next consolidated `assistant`
     // will repeat, in stream order, each accumulated to its full streamed text.
@@ -2792,6 +2811,11 @@ export class ClaudeAcpAgent {
       // cleared when each consolidated message consumes it. #785 stopped
       // resetting the streamed-content tracking here but left this line.
       stopReason = "end_turn";
+      // The overlay holds the ACTIVE turn's unconfirmed tokens. A cancelled turn
+      // never produces the `result` that would clear it, so without this the
+      // stale tokens ride along into every later turn's readout — and stack up
+      // across repeated cancels. `base` is untouched: it stays authoritative.
+      clearOverlay(midturnCost);
       session.accumulatedUsage = {
         inputTokens: 0,
         outputTokens: 0,
@@ -4144,6 +4168,26 @@ export class ClaudeAcpAgent {
                 // ACP `usage_update` schema is fixed to {used,size,cost}, so the
                 // breakdown rides along in `_meta` like `_claude/origin` does.
                 const modelBreakdown = toModelBreakdown(message.modelUsage);
+                // Adopt it as the authoritative base for the mid-turn readout —
+                // but only when it describes a settled state. An autonomous
+                // result (task-notification followup) lands while the user's
+                // turn is still streaming, and its session-cumulative snapshot
+                // already counts that turn's finished messages, which the
+                // overlay is also holding: adopting there would double-count
+                // them mid-turn and then jump the figure DOWN when the user
+                // turn's own result cleared the overlay. Skipping it loses
+                // nothing — the autonomous cycle's own top-level messages went
+                // through the overlay, and the user turn's result reports the
+                // authoritative session total for both.
+                const userTurnInFlight = session.activeTurn != null && !session.activeTurn.settled;
+                if (!isAutonomousResult || !userTurnInFlight) {
+                  adoptAuthoritativeBreakdown(
+                    midturnCost,
+                    modelBreakdown,
+                    session.subagentStats,
+                    !isAutonomousResult,
+                  );
+                }
                 const meta: Record<string, unknown> = {};
                 if (message.origin) meta["_claude/origin"] = message.origin;
                 if (modelBreakdown.length > 0) {
@@ -4384,6 +4428,7 @@ export class ClaudeAcpAgent {
               // blocks, so it doesn't disturb the mid-message turn-activation
               // path the way resetting on turn activation would.
               if (message.parent_tool_use_id === null) {
+                topLevelStreamMessageId = currentStreamMessageId;
                 streamedBlocks.length = 0;
               }
             }
@@ -4489,12 +4534,28 @@ export class ClaudeAcpAgent {
               const nextUsage = totalTokens(lastAssistantUsage);
               if (nextUsage !== lastAssistantTotalUsage) {
                 lastAssistantTotalUsage = nextUsage;
+                // Carry the per-model breakdown mid-turn too, so the client's
+                // cost readout advances during the turn instead of freezing
+                // until the terminal `result`. Rows the running turn touched
+                // omit costUSD (only `result.modelUsage` reports it) — the
+                // client prices those from the token counts.
+                recordTopLevelSnapshot(
+                  midturnCost,
+                  topLevelStreamMessageId,
+                  lastAssistantModel ?? undefined,
+                  lastAssistantUsage,
+                  message.event.type === "message_start",
+                );
+                const midturnBreakdown = buildMidturnRows(midturnCost, session.subagentStats);
                 await sendUpdate({
                   sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "usage_update",
                     used: nextUsage,
                     size: session.contextWindowSize,
+                    ...(midturnBreakdown.length > 0 && {
+                      _meta: { "_universe/modelBreakdown": midturnBreakdown },
+                    }),
                   },
                 });
               }

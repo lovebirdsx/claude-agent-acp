@@ -6456,6 +6456,312 @@ describe("usage_update computation", () => {
     expect(usageUpdates[2].update.cost).toBeDefined();
   });
 
+  // The cost readout used to freeze for the whole duration of a turn: only the
+  // terminal `result` carried a breakdown. These lock the mid-turn rows.
+  it("mid-turn usage_update carries a breakdown with no costUSD", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createStreamEvent("message_start", {
+        id: "msg_mid_1",
+        model: "claude-opus-4-20250514",
+        usage: {
+          input_tokens: 1000,
+          output_tokens: 0,
+          cache_read_input_tokens: 200,
+          cache_creation_input_tokens: 100,
+        },
+      }),
+      createStreamEvent("message_delta", { usage: { output_tokens: 500 } }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-opus-4-20250514": {
+            inputTokens: 1000,
+            outputTokens: 500,
+            cacheReadInputTokens: 200,
+            cacheCreationInputTokens: 100,
+            webSearchRequests: 0,
+            costUSD: 0.42,
+            contextWindow: 1000000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdates).toHaveLength(3);
+    // message_start: tokens only, no costUSD — the client prices them.
+    expect(usageUpdates[0].update._meta?.["_universe/modelBreakdown"]).toEqual([
+      {
+        model: "claude-opus-4-20250514",
+        inputTokens: 1000,
+        outputTokens: 0,
+        cacheReadTokens: 200,
+        cacheCreateTokens: 100,
+      },
+    ]);
+    // message_delta's usage is cumulative for the message: 500, not 0 + 500.
+    expect(usageUpdates[1].update._meta?.["_universe/modelBreakdown"]).toEqual([
+      {
+        model: "claude-opus-4-20250514",
+        inputTokens: 1000,
+        outputTokens: 500,
+        cacheReadTokens: 200,
+        cacheCreateTokens: 100,
+      },
+    ]);
+    // The terminal result stays authoritative and carries costUSD.
+    expect(usageUpdates[2].update._meta?.["_universe/modelBreakdown"]).toEqual([
+      {
+        model: "claude-opus-4-20250514",
+        inputTokens: 1000,
+        outputTokens: 500,
+        cacheReadTokens: 200,
+        cacheCreateTokens: 100,
+        costUSD: 0.42,
+      },
+    ]);
+  });
+
+  it("mid-turn rows accumulate across the turn's messages", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createStreamEvent("message_start", {
+        id: "msg_a",
+        model: "claude-opus-4-20250514",
+        usage: {
+          input_tokens: 1000,
+          output_tokens: 500,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      }),
+      createStreamEvent("message_start", {
+        id: "msg_b",
+        model: "claude-opus-4-20250514",
+        usage: {
+          input_tokens: 200,
+          output_tokens: 100,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-opus-4-20250514": {
+            inputTokens: 1200,
+            outputTokens: 600,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.42,
+            contextWindow: 1000000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
+    // Distinct API message ids accumulate; only same-id snapshots replace.
+    expect(usageUpdates[1].update._meta?.["_universe/modelBreakdown"]).toEqual([
+      {
+        model: "claude-opus-4-20250514",
+        inputTokens: 1200,
+        outputTokens: 600,
+        cacheReadTokens: 0,
+        cacheCreateTokens: 0,
+      },
+    ]);
+    // The result confirms the same totals and adds the authoritative cost.
+    expect(usageUpdates[2].update._meta?.["_universe/modelBreakdown"]).toEqual([
+      {
+        model: "claude-opus-4-20250514",
+        inputTokens: 1200,
+        outputTokens: 600,
+        cacheReadTokens: 0,
+        cacheCreateTokens: 0,
+        costUSD: 0.42,
+      },
+    ]);
+  });
+
+  it("folds sub-agent tokens into the mid-turn rows", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      // A Task runs on Haiku. Its consolidated assistant message feeds
+      // session.subagentStats, which the mid-turn rows read as a delta against
+      // whatever the last authoritative result already folded in.
+      {
+        type: "assistant" as const,
+        parent_tool_use_id: "tool_use_1",
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          id: "msg_sub_1",
+          model: "claude-haiku-4-5-20251001",
+          content: [{ type: "text", text: "sub" }],
+          usage: {
+            input_tokens: 300,
+            output_tokens: 80,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        },
+      },
+      createStreamEvent("message_start", {
+        id: "msg_top_1",
+        model: "claude-opus-4-20250514",
+        usage: {
+          input_tokens: 1000,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-opus-4-20250514": {
+            inputTokens: 1000,
+            outputTokens: 0,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.42,
+            contextWindow: 1000000,
+            maxOutputTokens: 16384,
+          },
+          "claude-haiku-4-5-20251001": {
+            inputTokens: 300,
+            outputTokens: 80,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.03,
+            contextWindow: 200000,
+            maxOutputTokens: 8192,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
+    // Mid-turn: the Task's spend is visible while the turn is still running,
+    // which is exactly when a Task-heavy turn used to show a frozen number.
+    expect(usageUpdates[0].update._meta?.["_universe/modelBreakdown"]).toEqual([
+      {
+        model: "claude-opus-4-20250514",
+        inputTokens: 1000,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreateTokens: 0,
+      },
+      {
+        model: "claude-haiku-4-5-20251001",
+        inputTokens: 300,
+        outputTokens: 80,
+        cacheReadTokens: 0,
+        cacheCreateTokens: 0,
+      },
+    ]);
+    // The result stays authoritative: same totals, plus real costs.
+    expect(usageUpdates.at(-1).update._meta?.["_universe/modelBreakdown"]).toEqual([
+      {
+        model: "claude-opus-4-20250514",
+        inputTokens: 1000,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreateTokens: 0,
+        costUSD: 0.42,
+      },
+      {
+        model: "claude-haiku-4-5-20251001",
+        inputTokens: 300,
+        outputTokens: 80,
+        cacheReadTokens: 0,
+        cacheCreateTokens: 0,
+        costUSD: 0.03,
+      },
+    ]);
+  });
+
+  // `currentStreamMessageId` is deliberately NOT gated on
+  // `parent_tool_use_id === null` (chunk grouping wants a subagent's id too), so
+  // the cost ledger keys its overlay off a separate top-level-only id. Sharing
+  // one would file the in-flight top-level message's later deltas under the
+  // subagent's id and count that one message under two overlay keys.
+  it("a subagent message_start does not split the top-level overlay row", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createStreamEvent("message_start", {
+        id: "msg_top",
+        model: "claude-opus-4-20250514",
+        usage: {
+          input_tokens: 1000,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      }),
+      // A Task's own stream interleaves; it emits no usage_update of its own.
+      createStreamEvent(
+        "message_start",
+        {
+          id: "msg_sub",
+          model: "claude-haiku-4-5-20251001",
+          usage: {
+            input_tokens: 5,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        },
+        "tool_use_1",
+      ),
+      // Back to the top-level message: its cumulative snapshot must REPLACE the
+      // first one, not open a second row keyed under the subagent's id.
+      createStreamEvent("message_delta", { usage: { output_tokens: 500 } }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-opus-4-20250514": {
+            inputTokens: 1000,
+            outputTokens: 500,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.42,
+            contextWindow: 1000000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
+    // The last MID-TURN update (the one before the terminal result's).
+    expect(usageUpdates.at(-2).update._meta?.["_universe/modelBreakdown"]).toEqual([
+      {
+        model: "claude-opus-4-20250514",
+        inputTokens: 1000,
+        outputTokens: 500,
+        cacheReadTokens: 0,
+        cacheCreateTokens: 0,
+      },
+    ]);
+  });
+
   it("subagent stream_event does not emit usage_update", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
