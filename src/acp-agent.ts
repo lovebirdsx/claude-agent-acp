@@ -189,6 +189,7 @@ import {
 import { decodeClaudePermissionResponse } from "./permissions/response.js";
 import { SettingsManager } from "./settings.js";
 import { resolveSubagentModelEnv } from "./subagent-model.js";
+import { appendExtraModelInfos, readExtraModelsMeta } from "./extra-models.js";
 import {
   activeUsageLimitMessage,
   airSessionFailureCapabilityMeta,
@@ -1885,6 +1886,10 @@ export function computeSessionFingerprint(params: {
     ),
   );
   options.skills = normalizeSkills(options.skills as Options["skills"]);
+  // universe-editor extension: the client's extra model candidates are part of
+  // what defines the session — a reload after the user reconfigured their
+  // gateway must rebuild the picker, not reuse the stale one.
+  const extraModels = readExtraModelsMeta(params._meta) ?? [];
   return JSON.stringify(
     canonicalJson({
       cwd: params.cwd,
@@ -1895,6 +1900,7 @@ export function computeSessionFingerprint(params: {
       disableBuiltInTools: meta?.disableBuiltInTools,
       emitRawSDKMessages: meta?.claudeCode?.emitRawSDKMessages,
       options,
+      extraModels,
     }),
   );
 }
@@ -1950,6 +1956,14 @@ export type NewSessionMeta = {
     resumeModel?: string;
   };
   additionalRoots?: string[];
+  /**
+   * universe-editor extension (session/new + session/load + session/resume):
+   * model ids to APPEND to this session's catalogue, on top of the SDK's own
+   * first-party list. Lets a gateway user pick their gateway's models from the
+   * in-session picker at all — see extra-models.ts for the full rationale and
+   * why this is not `settings.availableModels`.
+   */
+  extraModels?: string[];
 };
 
 /**
@@ -11971,7 +11985,7 @@ export class ClaudeAcpAgent {
       // configured. Managed `deniedModels` drops entries the CLI would refuse.
       const settingsAvailableModels = settingsManager.getSettings().availableModels;
       const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
-      const allowedModels = Array.isArray(settingsAvailableModels)
+      const allowlistedModels = Array.isArray(settingsAvailableModels)
         ? applyAvailableModelsAllowlist(
             initializationResult.models,
             settingsAvailableModels,
@@ -11979,6 +11993,15 @@ export class ClaudeAcpAgent {
             settingsManager.getManagedDeniedModels(),
           )
         : initializationResult.models;
+      // universe-editor extension: the client's extra candidates are APPENDED
+      // after the allowlist and are exempt from its filtering, so a gateway user's
+      // models reach the picker (and pass `setSessionConfigOption` validation)
+      // without the allowlist's replace-semantics also constraining the native
+      // CLI. Order matters: filtering first, appending second.
+      const allowedModels = appendExtraModelInfos(
+        allowlistedModels,
+        readExtraModelsMeta(params._meta) ?? [],
+      );
 
       const models = await getAvailableModels(
         q,
