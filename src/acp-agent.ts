@@ -111,6 +111,7 @@ import {
 } from "./elicitation.js";
 import { SettingsManager } from "./settings.js";
 import { resolveSubagentModelEnv } from "./subagent-model.js";
+import { appendExtraModelInfos, readExtraModelsMeta } from "./extra-models.js";
 import {
   accumulateSubagentUsage,
   applyTaskCreate,
@@ -1159,12 +1160,17 @@ function disarmForceCancel(session: Session): void {
  *  detect when a loadSession/resumeSession call requires tearing down and
  *  recreating the underlying Query process.  MCP servers are sorted by name
  *  so that ordering differences don't trigger unnecessary recreations. */
-function computeSessionFingerprint(params: {
+export function computeSessionFingerprint(params: {
   cwd: string;
   mcpServers?: NewSessionRequest["mcpServers"];
+  _meta?: NewSessionRequest["_meta"];
 }): string {
   const servers = [...(params.mcpServers ?? [])].sort((a, b) => a.name.localeCompare(b.name));
-  return JSON.stringify({ cwd: params.cwd, mcpServers: servers });
+  // universe-editor extension: the client's extra model candidates are part of
+  // what defines the session — a reload after the user reconfigured their
+  // gateway must rebuild the picker, not reuse the stale one.
+  const extraModels = readExtraModelsMeta(params._meta) ?? [];
+  return JSON.stringify({ cwd: params.cwd, mcpServers: servers, extraModels });
 }
 
 export type SDKMessageFilter = {
@@ -1215,6 +1221,14 @@ export type NewSessionMeta = {
     resumeModel?: string;
   };
   additionalRoots?: string[];
+  /**
+   * universe-editor extension (session/new + session/load + session/resume):
+   * model ids to APPEND to this session's catalogue, on top of the SDK's own
+   * first-party list. Lets a gateway user pick their gateway's models from the
+   * in-session picker at all — see extra-models.ts for the full rationale and
+   * why this is not `settings.availableModels`.
+   */
+  extraModels?: string[];
 };
 
 /**
@@ -8040,13 +8054,23 @@ export class ClaudeAcpAgent {
     // consistent with what the user configured.
     const settingsAvailableModels = settingsManager.getSettings().availableModels;
     const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
-    const allowedModels = Array.isArray(settingsAvailableModels)
+    const allowlistedModels = Array.isArray(settingsAvailableModels)
       ? applyAvailableModelsAllowlist(
           initializationResult.models,
           settingsAvailableModels,
           settingsModelOverrides,
         )
       : initializationResult.models;
+
+    // universe-editor extension: the client's extra candidates are APPENDED
+    // after the allowlist and are exempt from its filtering, so a gateway user's
+    // models reach the picker (and pass `setSessionConfigOption` validation)
+    // without the allowlist's replace-semantics also constraining the native
+    // CLI. Order matters: filtering first, appending second.
+    const allowedModels = appendExtraModelInfos(
+      allowlistedModels,
+      readExtraModelsMeta(params._meta) ?? [],
+    );
 
     const modelsStart = Date.now();
     const { state: models, resumeSync } = await getAvailableModels(
