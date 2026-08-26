@@ -189,7 +189,11 @@ import {
 import { decodeClaudePermissionResponse } from "./permissions/response.js";
 import { SettingsManager } from "./settings.js";
 import { resolveSubagentModelEnv } from "./subagent-model.js";
-import { appendExtraModelInfos, readExtraModelsMeta } from "./extra-models.js";
+import {
+  appendExtraModelInfos,
+  readExtraModelEffortMeta,
+  readExtraModelsMeta,
+} from "./extra-models.js";
 import {
   activeUsageLimitMessage,
   airSessionFailureCapabilityMeta,
@@ -1890,6 +1894,9 @@ export function computeSessionFingerprint(params: {
   // what defines the session — a reload after the user reconfigured their
   // gateway must rebuild the picker, not reuse the stale one.
   const extraModels = readExtraModelsMeta(params._meta) ?? [];
+  const extraModelEffort = [...readExtraModelEffortMeta(params._meta).entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([id, levels]) => [id, [...new Set(levels)].sort()]);
   return JSON.stringify(
     canonicalJson({
       cwd: params.cwd,
@@ -1901,6 +1908,7 @@ export function computeSessionFingerprint(params: {
       emitRawSDKMessages: meta?.claudeCode?.emitRawSDKMessages,
       options,
       extraModels,
+      extraModelEffort,
     }),
   );
 }
@@ -12001,6 +12009,7 @@ export class ClaudeAcpAgent {
       const allowedModels = appendExtraModelInfos(
         allowlistedModels,
         readExtraModelsMeta(params._meta) ?? [],
+        readExtraModelEffortMeta(params._meta),
       );
 
       const models = await getAvailableModels(
