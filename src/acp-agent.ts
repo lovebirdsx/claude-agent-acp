@@ -111,7 +111,11 @@ import {
 } from "./elicitation.js";
 import { SettingsManager } from "./settings.js";
 import { resolveSubagentModelEnv } from "./subagent-model.js";
-import { appendExtraModelInfos, readExtraModelsMeta } from "./extra-models.js";
+import {
+  appendExtraModelInfos,
+  readExtraModelEffortMeta,
+  readExtraModelsMeta,
+} from "./extra-models.js";
 import {
   accumulateSubagentUsage,
   applyTaskCreate,
@@ -1170,7 +1174,10 @@ export function computeSessionFingerprint(params: {
   // what defines the session — a reload after the user reconfigured their
   // gateway must rebuild the picker, not reuse the stale one.
   const extraModels = readExtraModelsMeta(params._meta) ?? [];
-  return JSON.stringify({ cwd: params.cwd, mcpServers: servers, extraModels });
+  const extraModelEffort = [...readExtraModelEffortMeta(params._meta).entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([id, levels]) => [id, [...new Set(levels)].sort()]);
+  return JSON.stringify({ cwd: params.cwd, mcpServers: servers, extraModels, extraModelEffort });
 }
 
 export type SDKMessageFilter = {
@@ -8070,6 +8077,7 @@ export class ClaudeAcpAgent {
     const allowedModels = appendExtraModelInfos(
       allowlistedModels,
       readExtraModelsMeta(params._meta) ?? [],
+      readExtraModelEffortMeta(params._meta),
     );
 
     const modelsStart = Date.now();
