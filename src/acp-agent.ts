@@ -6494,12 +6494,18 @@ export class ClaudeAcpAgent {
   ): Promise<void> {
     if (cards.length === 0) return;
     const groups = groupSubagentCards(cards);
+    // Capture the session up front and write back to THIS object, never to
+    // whatever `this.sessions[sessionId]` holds once the awaits below resolve.
+    // A rewind tears the session down and recreates it under the same id with a
+    // fresh `subagentStats` map, and this restamp is fire-and-forget across
+    // several file IO awaits — resolving the id late would file a dead turn's
+    // card into the new ledger, where it is never pruned and has no baseline, so
+    // every later `usage_update` would fold it in again as a positive delta.
+    // Writing into the torn-down session's own map is inert: nobody reads it.
+    const session = this.sessions[sessionId];
     let subagentsDir: string;
     try {
-      const transcriptFile = await this.findTranscriptFile(
-        sessionId,
-        this.sessions[sessionId]?.cwd,
-      );
+      const transcriptFile = await this.findTranscriptFile(sessionId, session?.cwd);
       if (transcriptFile === undefined) return;
       subagentsDir = path.join(
         path.dirname(transcriptFile),
@@ -6542,6 +6548,57 @@ export class ClaudeAcpAgent {
               tally = subagentTallyFromTranscript(segment, group.agentType);
               if (tally === undefined) continue;
               this.subagentTallyCache.set(cacheKey, tally);
+            }
+            // Adopt the transcript fold as the card's tally, not just as a wire
+            // payload: the session-cost ledger builds its per-model rows from
+            // `session.subagentStats` (see buildMidturnRows), so a restamp that
+            // only reached the client left the Task card and the session cost
+            // panel reading two different ledgers. Gateways that stream a
+            // message's `output_tokens` only on its final frame (deepseek) kept
+            // the live tally's output at 0 while its input accumulated
+            // correctly, so the panel's row showed the full input against zero
+            // output — under-billing the session by exactly the sub-agents'
+            // output.
+            //
+            // REPLACE, never accumulate: the fold re-runs the same
+            // accumulateSubagentUsage over the whole segment, so it is the
+            // card's complete tally in the live entry's own units. Adding it
+            // would double the input that is already correct.
+            //
+            // On `subagentBaseline`: a baseline is captured by
+            // adoptAuthoritativeBreakdown on a `result`, and a card is restamped
+            // when its Task tool_result arrives — earlier in the turn. The write
+            // back is not strictly ordered against that, though: it lands after
+            // several file IO awaits, so a slow sidecar read can let the result
+            // baseline the still-under-reporting entry and be out-run by this
+            // correction, folding the difference in twice until the next result
+            // re-baselines from the corrected entry. Left unguarded because it
+            // needs a model that CLI reports in `modelUsage` AND that
+            // under-reports its live frames, and those are near-exclusive: the
+            // gateways with leading zero-output frames are exactly the ones CLI
+            // omits (that omission is why this row exists at all).
+            if (session !== undefined) {
+              // Keep the dedupe ledger and the totals from the SAME source. A
+              // resumed sub-agent (SendMessage) can stream another frame of a
+              // message either side already counted, and accumulateSubagentUsage
+              // subtracts that message's previous snapshot before folding the new
+              // one in — so the ledger must describe the totals it is subtracted
+              // from. Merging the live entry's ledger into the fold's totals
+              // would leave entries for messages those totals never included,
+              // and the next frame of one would deduct tokens that were never
+              // added. The fold only has a ledger when the sidecar rows carry
+              // `message.id`; without one, the live entry's is the best
+              // available and its totals are what the fold reproduced anyway.
+              //
+              // Copy rather than share: the fold is memoized in
+              // subagentTallyCache and accumulateSubagentUsage mutates
+              // `perMessage` in place, which would otherwise edit the cache.
+              const ledger =
+                tally.perMessage ?? session.subagentStats.get(card.toolCallId)?.perMessage;
+              session.subagentStats.set(card.toolCallId, {
+                ...tally,
+                ...(ledger !== undefined ? { perMessage: new Map(ledger) } : {}),
+              });
             }
             await this.client.sessionUpdate({
               sessionId,

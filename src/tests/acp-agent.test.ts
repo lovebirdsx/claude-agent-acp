@@ -25,7 +25,13 @@ import {
   toDisplayPath,
   toolUpdateFromToolResult,
   toolUpdateFromDiffToolResponse,
+  accumulateSubagentUsage,
 } from "../tools.js";
+import {
+  buildMidturnRows,
+  createMidturnCostLedger,
+  type SessionCostRow,
+} from "../session-cost.js";
 import {
   toAcpNotifications,
   promptToClaude,
@@ -14638,6 +14644,207 @@ describe("replaySessionHistory: sub-agent stats restamped from the sub-agent tra
     );
 
     expect(stats).toEqual([]);
+  });
+
+  // The restamp used to reach only the client, leaving the Task card and the
+  // session-cost panel reading two different ledgers: the panel's per-model rows
+  // come from `session.subagentStats` via buildMidturnRows. Gateways that report
+  // a message's `output_tokens` only on its final streamed frame (deepseek) kept
+  // the live entry's output at 0 while its input accumulated correctly, so the
+  // panel showed the sub-agents' full input against zero output.
+  describe("adopting the fold into session.subagentStats", () => {
+    // Mirrors the live shape that caused this: leading frames of one API message
+    // carry real input/cache but output_tokens: 0.
+    function seedUnderReportingLiveEntry(agent: unknown, toolCallId: string): void {
+      const session = (agent as any).sessions[sessionId];
+      for (const frame of [0, 0]) {
+        accumulateSubagentUsage(session.subagentStats, toolCallId, {
+          usage: {
+            input_tokens: 228,
+            output_tokens: frame,
+            cache_read_input_tokens: 66336,
+            cache_creation_input_tokens: 500,
+          },
+          model: "claude-sonnet-5",
+          subagentType: "Explore",
+          messageId: "msg_live",
+        });
+      }
+    }
+
+    function midturnRowsOf(agent: unknown): SessionCostRow[] {
+      const session = (agent as any).sessions[sessionId];
+      return buildMidturnRows(createMidturnCostLedger(), session.subagentStats);
+    }
+
+    // Real sidecars carry `message.id`, which is what lets the fold build its own
+    // dedupe ledger. The shared fixture's rows are id-less, so tests that need a
+    // fold ledger write their own sidecar here rather than relying on it.
+    async function writeKeyedSubagentTranscript(agentId: string): Promise<void> {
+      await writeMainTranscript(false, agentId);
+      await nodeFs.writeFile(
+        nodePath.join(subagentsDir, `agent-${agentId}.jsonl`),
+        JSON.stringify({
+          type: "assistant",
+          uuid: "sa1",
+          message: {
+            id: "msg_sa1",
+            role: "assistant",
+            model: "claude-sonnet-5",
+            usage: { input_tokens: 228, output_tokens: 3406, cache_read_input_tokens: 66336 },
+            content: [],
+          },
+        }) + "\n",
+        "utf8",
+      );
+    }
+
+    async function restampWithLiveSession(): Promise<{ agent: unknown }> {
+      await writeMainTranscript(false, "sub1");
+      await writeSubagentTranscript("sub1");
+      const { agent } = createRecordingAgent();
+      (agent as any).sessions[sessionId] = { cwd: projectDir, subagentStats: new Map() };
+      seedUnderReportingLiveEntry(agent, "task_1");
+
+      // Reproduces the bug: the panel's row carries the input but no output.
+      expect(midturnRowsOf(agent)).toEqual([
+        {
+          model: "claude-sonnet-5",
+          inputTokens: 228,
+          outputTokens: 0,
+          cacheReadTokens: 66336,
+          cacheCreateTokens: 500,
+        },
+      ]);
+
+      await (agent as any).restampReplayedSubagentStats(sessionId, [
+        { toolCallId: "task_1", agentId: "sub1", agentType: "Explore" },
+      ]);
+      return { agent };
+    }
+
+    it("makes the panel's per-model row carry the sub-agent's output", async () => {
+      const { agent } = await restampWithLiveSession();
+
+      // The authoritative fold REPLACES the entry rather than adding to it: the
+      // input must stay at the already-correct 228, not double to 456.
+      expect(midturnRowsOf(agent)).toEqual([
+        {
+          model: "claude-sonnet-5",
+          inputTokens: 228,
+          outputTokens: 3406,
+          cacheReadTokens: 66336,
+          cacheCreateTokens: 500,
+        },
+      ]);
+    });
+
+    it("keeps replacing, not re-adding, a live frame of a message the fold already saw", async () => {
+      await writeKeyedSubagentTranscript("keyed");
+      const { agent } = createRecordingAgent();
+      (agent as any).sessions[sessionId] = { cwd: projectDir, subagentStats: new Map() };
+      // Seed the under-reporting entry so the assertion below can only hold if the
+      // write-back actually replaced it with the fold — otherwise the live totals
+      // survive and the frame below stacks on top of them.
+      seedUnderReportingLiveEntry(agent, "task_1");
+      await (agent as any).restampReplayedSubagentStats(sessionId, [
+        { toolCallId: "task_1", agentId: "keyed", agentType: "Explore" },
+      ]);
+      const session = (agent as any).sessions[sessionId];
+
+      // A resumed sub-agent (SendMessage) re-streams a message the fold already
+      // counted. Without the fold's perMessage ledger this would re-add it.
+      accumulateSubagentUsage(session.subagentStats, "task_1", {
+        usage: { input_tokens: 228, output_tokens: 3406, cache_read_input_tokens: 66336 },
+        model: "claude-sonnet-5",
+        messageId: "msg_sa1",
+      });
+
+      expect(midturnRowsOf(agent)).toEqual([
+        {
+          model: "claude-sonnet-5",
+          inputTokens: 228,
+          outputTokens: 3406,
+          cacheReadTokens: 66336,
+          cacheCreateTokens: 0,
+        },
+      ]);
+    });
+
+    it("carries the live entry's dedupe ledger forward when the fold has none", async () => {
+      const { agent } = await restampWithLiveSession();
+      const session = (agent as any).sessions[sessionId];
+
+      // `msg_live` was only ever seen live (the fixture's sidecar rows have no
+      // `message.id`, so the fold contributes no ledger), so its ledger entry must
+      // survive the restamp — otherwise this repeat frame would be added twice.
+      accumulateSubagentUsage(session.subagentStats, "task_1", {
+        usage: {
+          input_tokens: 228,
+          output_tokens: 0,
+          cache_read_input_tokens: 66336,
+          cache_creation_input_tokens: 500,
+        },
+        model: "claude-sonnet-5",
+        messageId: "msg_live",
+      });
+
+      expect(midturnRowsOf(agent)).toEqual([
+        {
+          model: "claude-sonnet-5",
+          inputTokens: 228,
+          outputTokens: 3406,
+          cacheReadTokens: 66336,
+          cacheCreateTokens: 500,
+        },
+      ]);
+    });
+
+    it("leaves the memoized fold unmutated when a later live frame edits the entry", async () => {
+      // Needs a keyed sidecar: only then does the fold carry a `perMessage` map at
+      // all, which is the object a shared reference would let the live path edit.
+      await writeKeyedSubagentTranscript("keyed");
+      const { agent } = createRecordingAgent();
+      (agent as any).sessions[sessionId] = { cwd: projectDir, subagentStats: new Map() };
+      await (agent as any).restampReplayedSubagentStats(sessionId, [
+        { toolCallId: "task_1", agentId: "keyed", agentType: "Explore" },
+      ]);
+      const session = (agent as any).sessions[sessionId];
+      const cached = (agent as any).subagentTallyCache.get("keyed#task_1");
+      expect(cached.perMessage?.has("msg_sa1")).toBe(true);
+
+      accumulateSubagentUsage(session.subagentStats, "task_1", {
+        usage: { input_tokens: 10, output_tokens: 20 },
+        model: "claude-sonnet-5",
+        messageId: "msg_later",
+      });
+
+      expect(cached.perMessage.has("msg_later")).toBe(false);
+      expect(cached.outputTokens).toBe(3406);
+      expect(cached.inputTokens).toBe(228);
+    });
+
+    it("files the fold under the session it started on, not one a rewind swapped in", async () => {
+      await writeMainTranscript(false, "sub1");
+      await writeSubagentTranscript("sub1");
+      const { agent } = createRecordingAgent();
+      const original = { cwd: projectDir, subagentStats: new Map() };
+      (agent as any).sessions[sessionId] = original;
+
+      // A rewind tears the session down and recreates it under the same id while
+      // this fire-and-forget restamp is still reading files. Its card belongs to
+      // the turn that is gone: filing it into the fresh ledger would leave an
+      // entry nothing prunes and no baseline covers.
+      const pending = (agent as any).restampReplayedSubagentStats(sessionId, [
+        { toolCallId: "task_1", agentId: "sub1", agentType: "Explore" },
+      ]);
+      const recreated = { cwd: projectDir, subagentStats: new Map() };
+      (agent as any).sessions[sessionId] = recreated;
+      await pending;
+
+      expect(recreated.subagentStats.size).toBe(0);
+      expect(original.subagentStats.get("task_1")?.outputTokens).toBe(3406);
+    });
   });
 });
 
