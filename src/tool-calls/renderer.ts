@@ -47,6 +47,13 @@ export type ToolUpdateMeta = {
     /* Free-text the user supplied when rejecting the tool call, when the
        harness collected any. Only ever present alongside nonExecutionKind. */
     userFeedback?: string;
+    /* Set when `nonExecutionKind` is "user-rejected" but this fork never
+       denied the call on the user's behalf: the CLI synthesizes that kind for
+       any tool-queue abort whose reason isn't interrupt/end_conversation
+       (stalled streams, upstream response failures, …), so the "user" in
+       "user-rejected" is not real. Clients should present these as an
+       upstream interruption, not a human refusal. */
+    syntheticDenial?: true;
     /* The MCP server of an `mcp__*` tool, on a permission request. */
     mcpServer?: { name: string; source: string };
   };

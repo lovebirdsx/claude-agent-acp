@@ -85,6 +85,7 @@ export function mockSessionState(
     subagentStats: new Map(),
     toolUseCache: {},
     emittedToolCalls: new Set(),
+    userDeniedToolCalls: new Set(),
     liveBackgroundTasks: new Map(),
     subagentSpawns: new Map(),
     subagentResumeRedirects: new Map(),

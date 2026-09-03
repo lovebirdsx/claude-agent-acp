@@ -1478,6 +1478,12 @@ export type Session = {
     plan: string;
     mode: PermissionMode;
   };
+  /* tool_use ids this fork actually denied on the user's behalf (the
+     `behavior: "deny"` branch of canUseTool). The CLI also stamps
+     `user-rejected` on tool results it synthesizes when the tool queue is
+     aborted for an unrelated reason, so a `user-rejected` whose id is absent
+     here was never refused by a human. Ids leave the set at tool_result. */
+  userDeniedToolCalls: Set<string>;
   /** Registry of live background tasks, keyed by task id: populated at
    *  `task_started`, pruned when the task settles (a `task_notification` or
    *  a terminal `task_updated` patch), and reconciled against
@@ -7560,6 +7566,7 @@ export class ClaudeAcpAgent {
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
                 toolCallFields: toolCallFieldsOf(session),
+                userDeniedToolCalls: session.userDeniedToolCalls,
                 backgroundToolCalls: session.backgroundToolCalls,
                 messageId: currentStreamMessageId,
                 streamedToolInputs,
@@ -7969,6 +7976,7 @@ export class ClaudeAcpAgent {
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
                 toolCallFields: toolCallFieldsOf(session),
+                userDeniedToolCalls: session.userDeniedToolCalls,
                 backgroundToolCalls: session.backgroundToolCalls,
                 messageId: messageIdForGrouping(message),
                 toolUseResult: message.type === "user" ? message.tool_use_result : undefined,
@@ -10601,6 +10609,7 @@ export class ClaudeAcpAgent {
         }
         const normalized = normalizeAskUserQuestionResult(result);
         if (!normalized) {
+          session.userDeniedToolCalls.add(toolUseID);
           return { behavior: "deny", message: "The user cancelled the question" };
         }
         return {
@@ -10757,6 +10766,12 @@ export class ClaudeAcpAgent {
           toolUseId: toolUseID,
           toolResultSeen: false,
         };
+      }
+      // fork: record the ids this fork denied on the user's behalf, so a
+      // "user-rejected" tool_result can be told apart from the ones the CLI
+      // synthesizes for unrelated tool-queue aborts (see `syntheticDenial`).
+      if (permissionResult.behavior === "deny") {
+        session.userDeniedToolCalls.add(toolUseID);
       }
       return permissionResult;
     };
@@ -12262,6 +12277,7 @@ export class ClaudeAcpAgent {
         backgroundToolCalls: new Set(),
         toolUseCache: {},
         emittedToolCalls: new Set(),
+        userDeniedToolCalls: new Set(),
         eagerToolCallSessions: new Map(),
         liveBackgroundTasks: new Map(),
         subagentSpawns: new Map(),
@@ -13393,6 +13409,12 @@ export function toAcpNotifications(
     // tool_call_update carries only the fields that changed, and an update
     // with nothing new is dropped. Mutated in place.
     toolCallFields?: ToolCallFieldTracker;
+    // fork: tool_use ids this fork actually denied on the user's behalf (the
+    // `behavior: "deny"` branch of canUseTool). A "user-rejected" tool_result
+    // whose id is absent here was synthesized by the CLI for an unrelated
+    // tool-queue abort, so it is stamped `syntheticDenial: true` on its
+    // claudeCode meta. Mutated in place: ids leave the set at tool_result.
+    userDeniedToolCalls?: Set<string>;
     // Tracks sub-agent / background tool_use ids whose `tool_result` is only a
     // "running in the background" placeholder — the real completion arrives
     // later via a `task_notification`. Such a result must settle the card to
@@ -13611,7 +13633,28 @@ export function toAcpNotifications(
         // Spread into the claudeCode meta of every update emitted below; the
         // untracked-tool fallback can't carry it (claudeCode metas always
         // carry `toolName`, which is unknown there).
-        const nonExecution = toolResultMeta?.get(chunk.tool_use_id);
+        let nonExecution: {
+          nonExecutionKind: string;
+          userFeedback?: string;
+          syntheticDenial?: true;
+        } | undefined = toolResultMeta?.get(chunk.tool_use_id);
+        // fork: the CLI synthesizes "user-rejected" tool_results for any
+        // tool-queue abort whose reason isn't interrupt/end_conversation
+        // (stalled streams, upstream response failures, …) — only ids this
+        // fork recorded in its canUseTool deny branch were actually refused
+        // by a human. Consume-on-read below, like emittedToolCalls.
+        // Requires the set to exist: replay paths don't carry one, and a
+        // replayed session's real denials were recorded by the process that
+        // is now gone. No set means no evidence either way — leave unmarked
+        // rather than calling every historical denial synthetic.
+        if (
+          nonExecution?.nonExecutionKind === "user-rejected" &&
+          options?.userDeniedToolCalls !== undefined &&
+          !options.userDeniedToolCalls.has(chunk.tool_use_id)
+        ) {
+          nonExecution = { ...nonExecution, syntheticDenial: true };
+        }
+        options?.userDeniedToolCalls?.delete(chunk.tool_use_id);
         const toolUse = toolUseCache[chunk.tool_use_id];
         if (!toolUse) {
           // The permission flow may have surfaced this tool_call even though
@@ -13805,6 +13848,10 @@ export function streamEventToAcpNotifications(
     taskState?: TaskState;
     emittedToolCalls?: Set<string>;
     toolCallFields?: ToolCallFieldTracker;
+    // fork: ids this fork actually denied on the user's behalf (canUseTool's
+    // `behavior: "deny"` branch), forwarded to toAcpNotifications which stamps
+    // absent ids' "user-rejected" results with `syntheticDenial: true`.
+    userDeniedToolCalls?: Set<string>;
     backgroundToolCalls?: Set<string>;
     messageId?: string;
     streamedToolInputs?: StreamedToolInputCache;
@@ -13821,6 +13868,7 @@ export function streamEventToAcpNotifications(
     taskState: options?.taskState,
     emittedToolCalls: options?.emittedToolCalls,
     toolCallFields: options?.toolCallFields,
+    userDeniedToolCalls: options?.userDeniedToolCalls,
     backgroundToolCalls: options?.backgroundToolCalls,
     messageId: options?.messageId,
   };
