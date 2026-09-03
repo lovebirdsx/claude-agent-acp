@@ -953,6 +953,12 @@ type Session = {
    *  tool_use block streams; this set makes the two paths converge regardless of
    *  order. Pruned at `tool_result` time alongside `toolUseCache`. */
   emittedToolCalls: Set<string>;
+  /* tool_use ids this fork actually denied on the user's behalf (the
+     `behavior: "deny"` branch of canUseTool). The CLI also stamps
+     `user-rejected` on tool results it synthesizes when the tool queue is
+     aborted for an unrelated reason, so a `user-rejected` whose id is absent
+     here was never refused by a human. Ids leave the set at tool_result. */
+  userDeniedToolCalls: Set<string>;
   /** Registry of live background tasks, keyed by task id: populated at
    *  `task_started`, pruned when the task settles (a `task_notification` or
    *  a terminal `task_updated` patch), and reconciled against
@@ -1324,6 +1330,13 @@ export type ToolUpdateMeta = {
     /* Free-text the user supplied when rejecting the tool call, when the
        harness collected any. Only ever present alongside nonExecutionKind. */
     userFeedback?: string;
+    /* Set when `nonExecutionKind` is "user-rejected" but this fork never
+       denied the call on the user's behalf: the CLI synthesizes that kind for
+       any tool-queue abort whose reason isn't interrupt/end_conversation
+       (stalled streams, upstream response failures, …), so the "user" in
+       "user-rejected" is not real. Clients should present these as an
+       upstream interruption, not a human refusal. */
+    syntheticDenial?: true;
     /* Marks Agent/Task tool calls as subagent launches. ACP 1.2 has no
        standard subagent ToolKind yet, so clients that support nested
        transcripts need a namespaced marker instead of inferring from
@@ -4592,6 +4605,7 @@ export class ClaudeAcpAgent {
                 cwd: session.cwd,
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
+                userDeniedToolCalls: session.userDeniedToolCalls,
                 backgroundToolCalls: session.backgroundToolCalls,
                 messageId: currentStreamMessageId,
                 streamedToolInputs,
@@ -4909,6 +4923,7 @@ export class ClaudeAcpAgent {
                 cwd: session.cwd,
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
+                userDeniedToolCalls: session.userDeniedToolCalls,
                 backgroundToolCalls: session.backgroundToolCalls,
                 messageId: messageIdForGrouping(message),
                 toolUseResult: message.type === "user" ? message.tool_use_result : undefined,
@@ -7110,6 +7125,7 @@ export class ClaudeAcpAgent {
           updatedInput: toolInput,
         };
       } else {
+        session.userDeniedToolCalls.add(toolUseID);
         return {
           behavior: "deny",
           message: "User refused permission to run tool",
@@ -8352,6 +8368,7 @@ export class ClaudeAcpAgent {
       subagentStats: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      userDeniedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
       subagentSpawns: new Map(),
       subagentResumeRedirects: new Map(),
@@ -9828,6 +9845,12 @@ export function toAcpNotifications(
     // tool_call/update decision falls back to `toolUseCache` presence (the
     // historical single-source behavior).
     emittedToolCalls?: Set<string>;
+    // fork: tool_use ids this fork actually denied on the user's behalf (the
+    // `behavior: "deny"` branch of canUseTool). A "user-rejected" tool_result
+    // whose id is absent here was synthesized by the CLI for an unrelated
+    // tool-queue abort, so it is stamped `syntheticDenial: true` on its
+    // claudeCode meta. Mutated in place: ids leave the set at tool_result.
+    userDeniedToolCalls?: Set<string>;
     // Tracks sub-agent / background tool_use ids whose `tool_result` is only a
     // "running in the background" placeholder — the real completion arrives
     // later via a `task_notification`. Such a result must settle the card to
@@ -10051,7 +10074,28 @@ export function toAcpNotifications(
         // Spread into the claudeCode meta of every update emitted below; the
         // untracked-tool fallback can't carry it (claudeCode metas always
         // carry `toolName`, which is unknown there).
-        const nonExecution = toolResultMeta?.get(chunk.tool_use_id);
+        let nonExecution: {
+          nonExecutionKind: string;
+          userFeedback?: string;
+          syntheticDenial?: true;
+        } | undefined = toolResultMeta?.get(chunk.tool_use_id);
+        // fork: the CLI synthesizes "user-rejected" tool_results for any
+        // tool-queue abort whose reason isn't interrupt/end_conversation
+        // (stalled streams, upstream response failures, …) — only ids this
+        // fork recorded in its canUseTool deny branch were actually refused
+        // by a human. Consume-on-read below, like emittedToolCalls.
+        // Requires the set to exist: replay paths don't carry one, and a
+        // replayed session's real denials were recorded by the process that
+        // is now gone. No set means no evidence either way — leave unmarked
+        // rather than calling every historical denial synthetic.
+        if (
+          nonExecution?.nonExecutionKind === "user-rejected" &&
+          options?.userDeniedToolCalls !== undefined &&
+          !options.userDeniedToolCalls.has(chunk.tool_use_id)
+        ) {
+          nonExecution = { ...nonExecution, syntheticDenial: true };
+        }
+        options?.userDeniedToolCalls?.delete(chunk.tool_use_id);
         const toolUse = toolUseCache[chunk.tool_use_id];
         if (!toolUse) {
           // The permission flow may have surfaced this tool_call even though
@@ -10237,6 +10281,10 @@ export function streamEventToAcpNotifications(
     cwd?: string;
     taskState?: TaskState;
     emittedToolCalls?: Set<string>;
+    // fork: ids this fork actually denied on the user's behalf (canUseTool's
+    // `behavior: "deny"` branch), forwarded to toAcpNotifications which stamps
+    // absent ids' "user-rejected" results with `syntheticDenial: true`.
+    userDeniedToolCalls?: Set<string>;
     backgroundToolCalls?: Set<string>;
     messageId?: string;
     streamedToolInputs?: StreamedToolInputCache;
@@ -10251,6 +10299,7 @@ export function streamEventToAcpNotifications(
     cwd: options?.cwd,
     taskState: options?.taskState,
     emittedToolCalls: options?.emittedToolCalls,
+    userDeniedToolCalls: options?.userDeniedToolCalls,
     backgroundToolCalls: options?.backgroundToolCalls,
     messageId: options?.messageId,
   };

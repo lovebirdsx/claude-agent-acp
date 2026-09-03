@@ -2906,6 +2906,112 @@ describe("tool_result_meta non-execution stamping", () => {
       _meta: { claudeCode: { toolName: "TaskGet", nonExecutionKind: "user-rejected" } },
     });
   });
+
+  it("stamps syntheticDenial on a user-rejected result this fork never denied", () => {
+    const toolUseCache: ToolUseCache = { toolu_bash: bashToolUse };
+
+    const notifications = toAcpNotifications(
+      [deniedResult] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      {
+        userDeniedToolCalls: new Set(),
+        toolResultMeta: [{ id: "toolu_bash", non_execution_kind: "user-rejected" }],
+      },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect((notifications[0].update as any)._meta.claudeCode).toMatchObject({
+      nonExecutionKind: "user-rejected",
+      syntheticDenial: true,
+    });
+  });
+
+  it("omits syntheticDenial for a user-rejected result this fork did deny", () => {
+    const toolUseCache: ToolUseCache = { toolu_bash: bashToolUse };
+
+    const notifications = toAcpNotifications(
+      [deniedResult] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      {
+        userDeniedToolCalls: new Set(["toolu_bash"]),
+        toolResultMeta: [{ id: "toolu_bash", non_execution_kind: "user-rejected" }],
+      },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect((notifications[0].update as any)._meta.claudeCode).not.toHaveProperty(
+      "syntheticDenial",
+    );
+  });
+
+  it("leaves other non-execution kinds unmarked", () => {
+    const toolUseCache: ToolUseCache = { toolu_bash: bashToolUse };
+
+    const notifications = toAcpNotifications(
+      [deniedResult] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      {
+        userDeniedToolCalls: new Set(),
+        toolResultMeta: [{ id: "toolu_bash", non_execution_kind: "permission-rule" }],
+      },
+    );
+
+    expect(notifications).toHaveLength(1);
+    const meta = (notifications[0].update as any)._meta.claudeCode;
+    expect(meta).toMatchObject({ nonExecutionKind: "permission-rule" });
+    expect(meta).not.toHaveProperty("syntheticDenial");
+  });
+
+  it("consumes the id from userDeniedToolCalls at tool_result", () => {
+    const toolUseCache: ToolUseCache = { toolu_bash: bashToolUse };
+    const userDeniedToolCalls = new Set(["toolu_bash"]);
+
+    toAcpNotifications(
+      [deniedResult] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      {
+        userDeniedToolCalls,
+        toolResultMeta: [{ id: "toolu_bash", non_execution_kind: "user-rejected" }],
+      },
+    );
+
+    expect(userDeniedToolCalls.has("toolu_bash")).toBe(false);
+  });
+
+  it("leaves a replayed user-rejected unmarked when no deny set is carried", () => {
+    const toolUseCache: ToolUseCache = { toolu_bash: bashToolUse };
+
+    const notifications = toAcpNotifications(
+      [deniedResult] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { toolResultMeta: [{ id: "toolu_bash", non_execution_kind: "user-rejected" }] },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect((notifications[0].update as any)._meta.claudeCode).not.toHaveProperty(
+      "syntheticDenial",
+    );
+  });
 });
 
 describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
