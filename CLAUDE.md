@@ -3,44 +3,41 @@
 本仓库是 **`agentclientprotocol/claude-agent-acp` 的自维护 fork**（origin: `lovebirdsx/claude-agent-acp`，上游: `agentclientprotocol/claude-agent-acp`），作为 git submodule 嵌入 `universe-editor` 的 `vendor/claude-agent-acp`。它是 stdio ACP agent：包装 `@anthropic-ai/claude-agent-sdk`，把 ACP 请求翻译成 SDK query，再把 SDK 事件映回 ACP 客户端。
 
 > 项目结构 / 测试约定 / 运行方式 → 见 `README.md`。本文件**只讲 fork 特有的事**，不重复上述内容。
->
-> 姊妹 fork `vendor/codex-acp` 有一份同规格的 `CLAUDE.md`，可对照参考；两者维护纪律一致，差异见下文。
+> 姊妹 fork `vendor/codex-acp` 有一份同规格的 `CLAUDE.md`，可对照参考；两者维护纪律一致。
 
 ## 头号红线：保持源码 diff 最小，便于上游合并
 
 这是 fork 的生命线。上游发版频繁（当前分叉点约 `v0.55.0`，本地在其上叠了 19 个提交），且**大概率会自己实现 rewind / compaction / 标题持久化等与本地重叠的功能**，rebase 冲突成本可能一次性爆发。所有改动都要让「与上游的 diff」尽可能小、尽可能聚焦：
 
 - **本仓库有自己的 prettier/eslint 配置**（`.prettierrc.json` = `printWidth:100 + tabWidth:2`，配合 SDK/上游默认的**分号 + 双引号**；`eslint.config.js`）。这与父项目 universe-editor（**无分号 + 单引号** + 2 空格）**不同**。改 fork 源码务必沿用**本仓库自身风格**，不是父项目风格。
-- **当心父项目工具链对本目录 `.ts` 的自动格式化。** 父项目根 `.prettierrc` 是无分号 + 单引号，若被它按父项目风格重排整个文件，会瞬间产生上千行无关 diff，毁掉上游合并能力。
-  - 父项目的 `.prettierignore` **未**显式排除 `vendor/`；当前本地 `.claude/settings.local.json` 的 PostToolUse eslint 钩子已 `grep -viE vendor` 跳过本目录，但那是**本地机器状态、不随仓库传播**，且直接调 prettier 仍可能越过。
-  - 改 fork 源码时，优先用最小化的精确 `Edit`，改完**立即检查 `git -C vendor/claude-agent-acp diff`**，确认只有你预期的那几行变化；若发现整文件被重排，立刻 `git checkout` 还原后改用不触发格式化的方式。
+- **当心父项目工具链对本目录 `.ts` 的自动格式化。** 父项目根 `.prettierrc` 是无分号 + 单引号，若被它按父项目风格重排整个文件，会瞬间产生上千行无关 diff，毁掉上游合并能力。改 fork 源码时，优先用最小化的精确 `Edit`，改完**立即检查 `git -C vendor/claude-agent-acp diff`**，确认只有你预期的那几行变化；若发现整文件被重排，立刻 `git checkout` 还原后改用不触发格式化的方式。
 - **能不改源码就不改。** 优先走运行期开关 / env，或在父项目 `apps/editor` 侧解决。
 - **新功能尽量落新文件**（对齐 codex fork 的 `PathUtils` / `AcpExtensions` 模式，以及本仓库已有的 `interactive.ts` / `tools.ts`），降低对 6579 行的 `acp-agent.ts` 的集中改动——它目前已被本地改动动过约 20%，是 rebase 冲突的最大热区。
 - 真要改 `acp-agent.ts` 时：改动尽量局部、自包含、加清晰注释说明「**为什么 fork 要这么做**」，方便日后 rebase 时辨认与保留。
 
 ## fork 已有的本地改动（rebase 上游时需保留）
 
-按提交信息为中文者识别（上游均为英文）。分叉点在最后一条中文提交之下的首个上游 `(#NNN)` 提交（当前为 `3500ef7 release 0.58.1`）。逐条列出（新→旧）：
+按提交信息为中文者识别（上游均为英文）。分叉点在最后一条中文提交之下的首个上游 `(#NNN)` 提交（当前为 `3500ef7 release 0.58.1`）。逐条列出（新→旧）；标「详见」的条目，完整 bug 叙事/设计约束已拆到对应 cases 文档：
 
 | 功能 | 提交 | 落点文件 | 备注 |
 |---|---|---|---|
-| 识别 CLI 合成的假「用户拒绝」（`_meta.claudeCode.syntheticDenial`） | （待提交） | `acp-agent.ts`(六处：Session 类型 + 初始化、canUseTool 的 deny 分支、`toAcpNotifications` 与 `streamEventToAcpNotifications` 的 options 类型 + 转发、tool_result 消费处、`ToolUpdateMeta`) | CLI 的 `getAbortReason` 把**任何**非 interrupt/end_conversation 的 tool-queue abort 都兜底成 `user_interrupted`，再由 `createSyntheticErrorMessage` 合成一条 `toolDenialKind: "user-rejected"` 的 tool_result（会落进该兜底的 reason 有 `stalled`/`deadline`/`refusal-fallback-edit`/`subagent-park` 等）。子 agent 因此收到「用户拒绝，STOP and wait」而静默停住，父 Task 调用既无结果也无错误地悬着。**真假两者的 tool_result content 文案逐字相同**，从 wire 无法判别（实测本机全库 39 条 `user-rejected` 中 18 条是伪造的：距 assistant 消息仅 18~43ms、18/18 全发生在子 agent、且当时 permissionMode 为 bypassPermissions 根本没有询问路径）。唯一权威判据是 **fork 自己有没有走过 `behavior: "deny"`**，故 Session 记 `userDeniedToolCalls`（在 tool_result 处消费即删，照 `emittedToolCalls` 模式，无界增长）。两条刻意的设计约束：① **不改写 `nonExecutionKind` 原值**——它是 open set（见 `parseToolResultMeta` 上方注释），上游可能自行修正分类，篡改会让我们的改写反过来变成错的，故只叠加 `syntheticDenial?: true`；② **必须 set 存在才判定**——replay 路径不带 set，而记录历史真拒绝的那个进程已消失，无 set 即无证据，宁可不标也不能把回放里的真拒绝全标成合成。父项目 editor 侧消费点：`acpSessionUpdateMeta.ts` 的 `readSyntheticDenial` → 卡片「上游中断」徽标 + 每轮一次的 Warning 通知（字段名须与之逐字一致）。配套测试 `tests/tools.test.ts` 5 个用例 |
-| 会话模型清单注入网关模型（`_meta.extraModels`） | （待提交） | **`extra-models.ts`(新文件)** `acp-agent.ts`(三处：import、`CreateSessionOptions` 类型、createSession 接线) | SDK 的 `initializationResult.models` 是**硬编码 Anthropic 官方列表**，网关模型天然不在其中，而 `setSessionConfigOption` 对不在候选里的值**直接抛错**——网关用户的会话内 picker 完全不可用。不走 `settings.availableModels`：它是「取代」语义的 allowlist 且是**全局共享文件**，写它会连带限制原生 CLI 自己的 `/model` picker。改走顶层 `_meta.extraModels` **追加**通道（上限 64、坏载荷降级 undefined 不失败会话、逐字透传不剥 `[1m]` 上下文后缀），**顺序是 allowlist 过滤在前、extras 追加在后**（extras exempt 于过滤）。配套测试 `tests/extra-models.test.ts` |
-| 子 agent 模型 pin（`CLAUDE_CODE_SUBAGENT_MODEL`） | （待提交） | **`subagent-model.ts`(新文件)** `acp-agent.ts`(一处 env 展开) | CLI 的 first-party 家族改写会把内置 Explore 子 agent 从网关模型（如 `kimi-k3[1m]`）悄悄换成 `claude-opus-4-8[1m]` 并计费；该 env 是 CLI 自己的逃生口，也是唯一验证有效的修法（其它尝试见文件头注释）。`resolveSubagentModelEnv` 在 host env / caller `options.env` / **settings.json 的 `env` 块**三者皆未显式设置时才注入会话模型——第三条是编辑器 AI Settings 的「Sub Agent Model」入口写的位置，加它是为了让用户的显式选择确定性胜出（否则 CLI 与 spawn env 的应用顺序不确定）。配套测试 `tests/subagent-model.test.ts` |
-| usage_update 中途携带成本明细（turn 进行中就能显示开销） | （待提交） | **`session-cost.ts`(新文件)** `acp-agent.ts`(5 处接线) | `_meta._universe/modelBreakdown` 原本只挂在 turn-final 的 `case "result"`（`modelUsage` 是 `SDKResultMessage` 独有字段），编辑器钱包读数因此整个 turn 冻结、只在对话结束才跳变。修法是在 `stream_event` 既有的中途 `usage_update` 发射处补上 per-model **token 明细（无 `costUSD`）**——编辑器自己按「token × 费率」定价，不需要 fork 给钱数。账本在新文件：`base`（最近一次权威 `result.modelUsage` 会话累计快照）⊕ `overlay`（本 turn 未被 result 确认的 per-model token），发射即合并、单调不回退；`result` 到达时权威快照覆盖 `base` 并清 overlay，不重不漏。六个必须处理的语义：① `session.subagentStats` 是**会话累计且从不清理**，折入前必须减去 per-turn baseline（`adoptAuthoritativeBreakdown` 在覆盖 base 的同时重取快照）；② autonomous result（task-notification）也走 turn-final 发射，清 overlay 会让金额**回退**，故 `clearOverlay: !isAutonomousResult`；③ Anthropic 的 `message_delta.usage` 是**累计快照非增量**，同 message id 的新快照**替换**旧贡献（无 id 的网关按 `message_start` 分配合成 key，**合成 key 必须在「全零快照早退」之前分配**——kimi/Moonshot 的前导帧全 0，否则 key 永不前进、后续每条无 id 消息覆盖首条）；④ **autonomous result 在用户 turn 在途时（`activeTurn` 未 settle）完全不 adopt**：它的会话累计快照已含该 turn 已完成的消息，而 overlay 也还持有它们，adopt 会中途双计、随后用户 turn 自己的 result 清 overlay 时金额**跳低**；⑤ 账本的 overlay key **不能复用 `currentStreamMessageId`**（它刻意不受 `parent_tool_use_id === null` 门控，chunk 分组需要子 agent 的 id），另设 `topLevelStreamMessageId` 只在顶层 `message_start` 赋值，否则在途顶层消息的后续 delta 会被记到子 agent 的 id 下、同一消息计两次；⑥ turn 激活（`resetTurnScratch`）时 `clearOverlay`——被取消的 turn 永远等不到清 overlay 的 result，其未确认 token 会残留并随反复取消累积。被 overlay 触及的行剥掉 `costUSD`（tokens 已变，旧单价是谎言），未触及的 base 行原样透传——否则官方订阅会话（无任何费率表）会把上一轮的权威 ¥ 全变成「—」，比现状更差。**已知限制**：账本是 `runConsumer` 局部，reconnect / agent 重启后首个恢复 turn 的 base 为空、只报本 turn token；编辑器侧据「中途金额只增不减」判定 base 缺失并冻结金额（`acpSession.ts` 的 usage_update 分支），turn-final 带 `cost` 仍无条件替换（rewind 向下修正照常生效）。配套测试 `tests/session-cost.test.ts` + `tests/acp-agent.test.ts` 的 4 个集成用例 |
-| 官方订阅额度用量 | （待提交） | **`usage.ts`(新文件)** `acp-agent.ts` | `SUBSCRIPTION_USAGE_METHOD = "universe-editor/subscription_usage"`，编辑器用量指示器在 claude.ai OAuth 订阅下显示额度窗口百分比而非网关人民币开销。数据源是 SDK 的 `Query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET()`（即 `/usage` 的后端）——**方法名自带"可能变"警告，必须运行时特性探测**（`typeof fn !== "function"` → `supported:false`）而不能静态调用，抛错同样降级；原样透传 `rate_limits`，归一化在编辑器侧（两个 fork 各写一份必漂移）。注意 `subscription_type: null` 是**正常值**（API key 会话）不是错误，编辑器据此回退 ¥ 读数。`acp-agent.ts` 只加 `getSubscriptionUsage(sid)` + 一条 builder `.onRequest`，主体在新文件。配套测试 `tests/usage.test.ts` |
-| 移除每 turn 与 compact_boundary 的 getContextUsage 刷新 | （待提交） | `acp-agent.ts` | 每次 getContextUsage 都让 CLI 逐段重算上下文（系统提示词块/memory/工具/agent 各一次计数）；自定义网关无 `/v1/messages/count_tokens` 时 CLI 计数回退扇出成 10+ 条真实 `max_tokens:1` messages 请求。result 处 `modelUsage.contextWindow` + 本地 `resolveAutoCompactWindow` 已得出有效窗口，IPC 刷新冗余；compact_boundary 改用 used:0 近似（下一 result 自动修正），`fetchContextUsage` 随之删除。仅保留 resume reconciliation（`readResumedLiveModel`）一处低频调用（editor 捎 resumeModel 时走 reassert-override 也不触发）。rebase 时若上游在这两处重新引入该调用需再删 |
-| SendMessage 续跑子 Agent 的 live 重定向 + replay 分段回放 | （待提交） | `tools.ts` `acp-agent.ts` | SendMessage 唤醒已完成子 Agent 时，SDK 续跑 sidechain 消息的 `parent_tool_use_id` 仍是**最初 Agent 调用的 id**，内容被路由到已折叠的原始卡，续跑不可见。修法一（live）：Session 增 `subagentSpawns`（agentId→原始 tool_use id，task_started first-wins / replay 播种）与 `subagentResumeRedirects`（原始 id→活跃续跑 id，task_started 记录、task_notification/终态 task_updated 清除）；live 循环在消息处理早期（`_claude/sdkMessage` 旁路之前）用 `redirectParentToolUseId` 原地改写 `parent_tool_use_id`，使 usage 累计/stats 推送/嵌套通知都落到 SendMessage 卡。修法二（replay）：`resumedSubagentCardFromResult` 从 SendMessage tool_result 的 `resumedAgentId` + toolUseCache 的 `input.message` 识别续跑卡；`splitSubagentTranscriptByResumes` 按「coordinator 前缀行 + 包含对应 message 文本」把 sidecar 分段，`restampReplayedSubagentStats`/`replaySubagentTranscripts` 按 agentId 分组读文件一次、段 k 喂第 k 张卡（0=原始卡），tally cache key 改 `${agentId}#${toolCallId}`；`toolInfoFromToolUse` 增 SendMessage case（summary 作 title、message 作 content） |
-| resume 回放重放子代理执行过程 | （待提交） | `tools.ts` `acp-agent.ts` | 主链回放看不到子代理 sidechain，过程行活在 `<session>/subagents/agent-<id>.jsonl`。回放结束后**异步**（不阻塞 load）逐卡读侧车 transcript，经 `toAcpNotifications` 带 `parentToolUseId` 回灌成与 live 同形状的嵌套通知，客户端无需区分 live/replay；user 行只保留 tool_result（子代理初始 prompt 不进客户端 feed）；legacy 客户端沿用 strip text/thinking（只发嵌套 tool 归因）；子代理 tool_use/tool_result 用每卡独立 toolUseCache 不污染主链 |
-| 落盘 entrypoint 默认 `universe-editor` | （待提交） | `acp-agent.ts` `tests/create-session-options.test.ts` | 原生 CLI 的 `/resume`/`--continue` 选择器按 entrypoint ∈ {sdk-cli,sdk-ts,sdk-py} 过滤候选会话，SDK 在 env 未设时默认盖 `sdk-ts` 致 ACP 会话在 CLI 不可见。fork 在 query env 组装处条件注入 `CLAUDE_CODE_ENTRYPOINT=universe-editor`（host env / caller `_meta.claudeCode.options.env` 显式设置优先，与 `resolveSubagentModelEnv` 同语义）；不能用 `cli`——CLI 的 print/SDK 模式把 `cli` 强制改写为 `sdk-cli`，/resume 又过滤 sdk-*，未知值则原样透传落盘且对 /resume 可见 |
-| resume 回放恢复子代理用量 stats | （待提交） | `tools.ts` `acp-agent.ts` | 子代理 tally 只活在进程内存，进程死后 resume 回放的 Task 卡丢 token/价格。回放收集完成态 Task 卡（sidecar 的 `agentId` 定位 `<session>/subagents/agent-<id>.jsonl`），回放结束后**异步**（不阻塞 load）从子代理 transcript 逐轮累计重建（与实时 `accumulateSubagentUsage` 同算法），补发实时同形状的裸 `_meta._universe/subagentStats` tool_call_update。**勿用 sidecar 自带 `usage`/`totalTokens`——只覆盖最后一次 API 调用，低估几十倍**；文件缺失跳过不发（宁缺勿错）。行级预过滤 + agentId 级 memo；卡片收集须在 toAcpNotifications 循环之前（tool_result 处理会 prune toolUseCache） |
-| 子代理 usage 按 message.id 去重 + live Task 完成时 transcript restamp | （待提交） | `tools.ts` `acp-agent.ts` | SDK 把一条 API 消息流成多帧，每帧 `usage` 是**快照非增量**，且网关形状不一：Anthropic/deepseek 每帧带全量、Moonshot/kimi 前导帧全 0 只有末帧完整。旧逻辑逐帧累加 → deepseek 虚高 2-3x、kimi live 累计恒 0（卡片无价格，回放却正常）。修法一：`accumulateSubagentUsage` 加 `messageId`，同 id 新快照**替换**旧贡献（`perMessage` 簿记，不进 `_meta` 序列化），live 与 `subagentTallyFromTranscript`（transcript 同 id 也落 2-5 行快照）共用一处去重。修法二：live prompt 循环在 Task tool_result 到达时（同 replay 用 `replayedSubagentCardFromResult` 识别，也须在 toAcpNotifications 之前收集）`void` 调 `restampReplayedSubagentStats` 从子代理 transcript 补发权威 tally——kimi 这类流内无 usage 的网关由此在 live 收尾拿到真实价格 |
-| 会话后台活跃度通知 | （待提交） | `acp-agent.ts` | `BACKGROUND_ACTIVITY_METHOD = "_universe/background_activity"` ext-notification，params `{sessionId, backgroundTasks, autonomousTurn}`；解决 run_in_background 任务存活期间 editor 把 session 误判已结束的问题。`backgroundTasks` 数 `liveBackgroundTasks` 中未被 level 信号终结的条目；`autonomousTurn` 在 task_notification（或 autonomous origin 的 user 消息）唤醒时置位、autonomous result 清除、idle 兜底。值变化去重推送 + session/load|resume 强制补发 |
-| resume 重放恢复 Task* 计划 | （待提交） | `tools.ts` `acp-agent.ts` | headless ≥2.1.220 的 TaskCreate/TaskUpdate result content 是散文，结构化数据在消息级 `tool_use_result` sidecar；replay 调用点补传 sidecar（raw transcript 行是 camelCase `toolUseResult`）、TaskCreate 优先用 sidecar 否则散文正则兜底、TaskUpdate 对未见 taskId 建 `Task #<id>` 占位条目 |
-| resume reassert 编辑器记忆的会话模型 | （待提交） | `acp-agent.ts` | resume 从 transcript 恢复的是 API 裸模型名（丢 `[1m]` 后缀 → 有效窗口 1M 退化 200k、auto-compact 提前）。editor 在 session/load + session/resume 的 `_meta.claudeCode.resumeModel` 捎上 history 行记忆的 per-session 模型原值；`getAvailableModels` 优先级 env > resumeModel > settings.model，命中走既有 `reassert-override` 后台 setModel。列表无对应 lane 行时（tokenized 模糊匹配会落到裸行吞掉 `[1m]`）按 canonical 比较判别并**逐字跟踪原值**（合成条目拷最近 SDK 行能力标志），窗口播种按逐字 id 命中 `1m` 启发式 |
-| AskUserQuestion 选项+备注共存 | （待提交） | `elicitation.ts` | 上游是 custom-wins（自由文本吞掉已选项）；改为对齐第一方 CLI：文本作 `annotations.notes` 附在所选项上，无选择时落 `"(notes only)"` 哨兵。rebase 时若上游动了 `applyAskElicitationResponse` 需保留此语义 |
+| 识别 CLI 合成的假「用户拒绝」（`syntheticDenial`） | （待提交） | `acp-agent.ts`（6 处） | CLI 兜底合成的 `toolDenialKind:"user-rejected"` 与真拒绝 wire 逐字相同，唯一权威判据是 fork 自己走过 `behavior:"deny"`（Session 记 `userDeniedToolCalls`）。只叠加 `syntheticDenial?: true`，**不改 `nonExecutionKind`**；replay 无 set 即无证据、宁可不标。editor 消费点 `readSyntheticDenial`（字段名逐字一致）。测试 `src/tests/tools.test.ts`。详见 [cases-session.md](cases-session.md) |
+| 会话模型清单注入网关模型（`_meta.extraModels`） | （待提交） | **`extra-models.ts`(新)** `acp-agent.ts`（3 处） | SDK models 硬编码官方列表；改走 `_meta.extraModels` 追加通道（不走「取代」语义的 `settings.availableModels`）；上限 64、坏载荷降级、逐字透传；allowlist 过滤在前、extras 追加在后。测试 `src/tests/extra-models.test.ts`。详见 [cases-session.md](cases-session.md) |
+| 子 agent 模型 pin（`CLAUDE_CODE_SUBAGENT_MODEL`） | （待提交） | **`subagent-model.ts`(新)** `acp-agent.ts`（1 处） | 防 CLI first-party 家族改写把内置 Explore 换成 opus 计费；host env / caller env / settings.json `env` 块三者皆未显式设置时才注入会话模型。测试 `src/tests/subagent-model.test.ts`。详见 [cases-session.md](cases-session.md) |
+| usage_update 中途携带成本明细（turn 进行中就能显示开销） | （待提交） | **`session-cost.ts`(新)** `acp-agent.ts`（5 处） | 账本 base⊕overlay 使编辑器 turn 中途即可显开销（只带 token 明细，无 `costUSD`，编辑器自行定价）。6 个语义坑（subagentStats 会话累计、autonomous result 不回退、快照替换、在途双计、overlay key、取消清 overlay）、「剥 costUSD」策略、reconnect 后 base 为空的已知限制 → 详见 [cases-session.md](cases-session.md)。测试 `src/tests/session-cost.test.ts` + `src/tests/acp-agent.test.ts` 4 个集成用例 |
+| 官方订阅额度用量 | （待提交） | **`usage.ts`(新)** `acp-agent.ts` | `SUBSCRIPTION_USAGE_METHOD`；SDK `usage_EXPERIMENTAL...` **必须运行时特性探测**，不能静态调用；`subscription_type: null` 是**正常值**。详见 [cases-session.md](cases-session.md) |
+| 移除每 turn 与 compact_boundary 的 getContextUsage 刷新 | （待提交） | `acp-agent.ts` | result 的 `modelUsage.contextWindow` + 本地 `resolveAutoCompactWindow` 已够，IPC 刷新冗余且对网关扇出 10+ 条真实 messages 请求；仅保留 resume reconciliation 一处低频调用。**rebase 时若上游重新引入该调用需再删** |
+| SendMessage 续跑子 Agent 的 live 重定向 + replay 分段回放 | （待提交） | `tools.ts` `acp-agent.ts` | live：`redirectParentToolUseId` 原地改写 `parent_tool_use_id`；replay：`splitSubagentTranscriptByResumes` 按段分卡。详见 [cases-subagent.md](cases-subagent.md) |
+| resume 回放重放子代理执行过程 | （待提交） | `tools.ts` `acp-agent.ts` | 回放结束后**异步**（不阻塞 load）读 `<session>/subagents/agent-<id>.jsonl` 回灌成与 live 同形状嵌套通知；user 行只保留 tool_result。详见 [cases-subagent.md](cases-subagent.md) |
+| 落盘 entrypoint 默认 `universe-editor` | （待提交） | `acp-agent.ts` `src/tests/create-session-options.test.ts` | 条件注入 `CLAUDE_CODE_ENTRYPOINT=universe-editor`（显式设置优先）；**不能用 `cli`**——CLI 强制改写为 `sdk-cli` 再被 /resume 过滤 |
+| resume 回放恢复子代理用量 stats | （待提交） | `tools.ts` `acp-agent.ts` | 回放结束异步从 transcript 逐轮累计重建，补发 `_meta._universe/subagentStats`。**勿用 sidecar 自带 `usage`/`totalTokens`——只覆盖最后一次 API 调用，低估几十倍**。详见 [cases-subagent.md](cases-subagent.md) |
+| 子代理 usage 按 message.id 去重 + live Task 完成时 transcript restamp | （待提交） | `tools.ts` `acp-agent.ts` | 每帧 usage 是**快照非增量**，同 message.id 新快照替换旧贡献；kimi 等流内无 usage 的网关靠 restamp 在 live 收尾拿到真实价格。详见 [cases-subagent.md](cases-subagent.md) |
+| 会话后台活跃度通知 | （待提交） | `acp-agent.ts` | `BACKGROUND_ACTIVITY_METHOD = "_universe/background_activity"`，params `{sessionId, backgroundTasks, autonomousTurn}`；解决 run_in_background 任务存活期间 editor 误判会话已结束；值变化去重 + session/load\|resume 强制补发 |
+| resume 重放恢复 Task* 计划 | （待提交） | `tools.ts` `acp-agent.ts` | headless ≥2.1.220 的结构化数据在消息级 `tool_use_result` sidecar；TaskCreate 优先 sidecar 否则散文正则兜底；TaskUpdate 对未见 taskId 建占位条目 |
+| resume reassert 编辑器记忆的会话模型 | （待提交） | `acp-agent.ts` | transcript 恢复裸模型名丢 `[1m]` 后缀（窗口 1M 退化 200k）；editor 捎 `_meta.claudeCode.resumeModel`，`getAvailableModels` 优先级 env > resumeModel > settings.model，命中走既有 reassert-override；逐字跟踪原值防 tokenized 模糊匹配吞 `[1m]` |
+| AskUserQuestion 选项+备注共存 | （待提交） | `elicitation.ts` | 文本作 `annotations.notes` 附在所选项（对齐第一方 CLI），无选择落 `"(notes only)"` 哨兵。**rebase 时若上游动了 `applyAskElicitationResponse` 需保留此语义** |
 | 子代理用量累积并推父卡片 | `84e45ab` | `acp-agent.ts` `tools.ts` | 经 `_meta._universe/subagentStats` 推送 |
-| 恢复已压缩会话重建完整显示历史 | `b2d77dc` | `acp-agent.ts` | resume compacted session；replay 循环同时过滤 SDK resume 再平衡落的 `<synthetic>` 占位行（`isSyntheticNoResponseMessage`，text "No response requested."），与 login 占位同点 |
+| 恢复已压缩会话重建完整显示历史 | `b2d77dc` | `acp-agent.ts` | replay 循环同时过滤 SDK 再平衡落的 `<synthetic>` 占位行（`isSyntheticNoResponseMessage`） |
 | 结构化通知替代 Compacting 文本 chunk | `18f9c85` | `acp-agent.ts` | `COMPACTION_METHOD = "_universe/compaction"` ext-notification |
 | resume 时模型同步 CLI 往返移出关键路径 | `dd49937` | `acp-agent.ts` | perf |
 | reapplyRuntimeConfig 判别联合修 typecheck | `fba4954` | `acp-agent.ts` | 小修 |
@@ -57,7 +54,7 @@
 | 修 electron-builder ESM 加载 | `ed1c4c3` | `esbuild.config.mjs` | 打包适配 |
 | 工具调用错误上下文增强 | `89a0d4f` | `acp-agent.ts` | |
 | listSessions 用最后真实消息时间戳 | `68b75db` | `acp-agent.ts` | |
-| **AskUserQuestion 工具调用** | `82e69f5` | `acp-agent.ts` **`interactive.ts`(新文件)** | `ASK_USER_QUESTION_METHOD = "universe-editor/ask_user_question"` |
+| **AskUserQuestion 工具调用** | `82e69f5` | `acp-agent.ts` **`interactive.ts`(新)** | `ASK_USER_QUESTION_METHOD = "universe-editor/ask_user_question"` |
 | **esbuild 单文件构建 + 二进制 env 注入** | `d015baf` | `esbuild.config.mjs`(新) `package.json` `acp-agent.ts` | 产物 `dist/index.js` 供父项目 `ELECTRON_RUN_AS_NODE` 启动，不依赖系统 node/npx |
 
 另有 ext-notification `_claude/sdkMessage`（原始 SDK 消息旁路，供父项目重建连接快照）也是本地印章，随上述提交散落在 `acp-agent.ts`。
@@ -67,18 +64,16 @@
 
 ## rebase / 合并上游核对表
 
-1. 先在**父项目根目录**跑一次基线绿：`pnpm agent:build`（见下节），确认本地 fork dist 可构建。
-2. `git -C vendor/claude-agent-acp fetch upstream`，查看上游新增 release：`git -C vendor/claude-agent-acp log --oneline HEAD..upstream/main`。
-3. rebase / merge 上游后，对着上面「本地改动清单」**逐条核对**每项功能是否仍在、是否需随上游 API 调整：
-   - 尤其留意上游是否自行实现了 rewind / compaction / 标题持久化 —— 若上游版本与本地重叠，优先切到上游实现并删本地对应提交（减少 diff），但**必须先确认 wire 形状与父项目 editor 侧兼容**。
-4. **回归底线**：父项目侧的**跨仓契约测试**（`apps/editor/integration/scenarios/acpForkContract.integration.test.ts`）以真 fork dist 断言上列 ext-method + `_meta` 印章的 wire 形状。跑它即验证本地改动在 rebase 后未漂移：
-   - 改完 fork → `pnpm agent:build` → 跑 editor 契约测试；红即说明某个 ext-method 形状被上游/rebase 改动破坏。
-5. fork 自身单测：`npm --prefix vendor/claude-agent-acp test`（本地改动均带配套测试，见清单中带 `*.test.ts` 的提交）。
+1. 先在**父项目根目录**跑一次基线绿：`pnpm agent:build`，确认本地 fork dist 可构建。
+2. `git -C vendor/claude-agent-acp fetch upstream`，查看新增 release：`git -C vendor/claude-agent-acp log --oneline HEAD..upstream/main`。
+3. rebase / merge 上游后，对着上表**逐条核对**每项功能是否仍在、是否需随上游 API 调整。尤其留意上游是否自行实现了 rewind / compaction / 标题持久化——若重叠，优先切到上游实现并删本地对应提交（减少 diff），但**必须先确认 wire 形状与父项目 editor 侧兼容**。
+4. **回归底线**：父项目**跨仓契约测试**（`apps/editor/integration/scenarios/acpForkContract.integration.test.ts`）以真 fork dist 断言上列 ext-method + `_meta` 印章的 wire 形状——改完 fork → `pnpm agent:build` → 跑该契约测试，红即说明某形状被上游/rebase 破坏。
+5. fork 自身单测：`npm --prefix vendor/claude-agent-acp test`。
 
 ## 上游同步节奏
 
-- **每月检查一次上游 release，或上游 minor 发版时**（`@anthropic-ai/claude-agent-sdk` 或 acp adapter 版本跳变）主动同步一次，避免 diff 一次性堆积到不可 rebase。
-- 长期方向：清单中 rewind / compaction 等大块逻辑**不主动搬迁**到新文件，待下次上游 rebase 实际冲突发生时，按本核对表逐步把冲突块外移到独立文件（对齐 codex fork 的外移模式），一次外移一块。
+- **每月检查一次上游 release，或上游 minor 发版时**主动同步一次，避免 diff 一次性堆积到不可 rebase。
+- 长期方向：rewind / compaction 等大块逻辑**不主动搬迁**到新文件，待下次 rebase 实际冲突时按核对表逐步外移（一次一块，对齐 codex fork 的外移模式）。
 
 ## 配置 upstream remote
 
@@ -88,21 +83,12 @@
 node scripts/setup-vendor-remotes.mjs   # 一键为两个 fork 配 upstream
 ```
 
-或手动：
-
-```bash
-git -C vendor/claude-agent-acp remote add upstream https://github.com/agentclientprotocol/claude-agent-acp.git
-```
-
-配完 `git -C vendor/claude-agent-acp remote -v` 应含 `upstream`。
+或手动：`git -C vendor/claude-agent-acp remote add upstream https://github.com/agentclientprotocol/claude-agent-acp.git`。配完 `git -C vendor/claude-agent-acp remote -v` 应含 `upstream`。
 
 ## 构建与父项目的衔接
 
-- 本仓库**不在** universe-editor 的 pnpm workspace 内，用自带 npm 工具链独立构建。
-- 改完 fork 源码或拉取上游后，在**父项目根目录**跑 `pnpm agent:build`（= vendor-install + 本仓库 `npm run build` + prune 生产依赖），生成 `dist/` 与 `node_modules/`。也可在本目录直接 `npm run build`（= `node esbuild.config.mjs`）仅重建 `dist/index.js`。
-- `dist/` 与 `node_modules/` 均 `.gitignore`，不进 fork 提交；但父项目打包（`electron-builder.yml` 的 `extraResources`）会带上构建产物。
-- dev 与发布同一套启动：父项目 main 进程用 Electron 自带 node（`ELECTRON_RUN_AS_NODE`）跑 `dist/index.js`，不依赖系统 node/npx。
+构建 / 打包 / 启动机制（`pnpm agent:build`、`ELECTRON_RUN_AS_NODE`、`extraResources`）→ 见**根 CLAUDE.md「内置 ACP agent」节**。fork 特有：本目录 `npm run build`（= `node esbuild.config.mjs`）仅重建 `dist/index.js`；`dist/` 与 `node_modules/` 均 `.gitignore`，不进 fork 提交。
 
 ## 其它
 
-- 制作相关功能时，记得同步更新本文档与「本地改动清单」表。
+- 制作相关功能时，记得同步更新本文档与「本地改动清单」表（大叙事拆到 cases 文档）。
