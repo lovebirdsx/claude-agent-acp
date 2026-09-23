@@ -844,6 +844,80 @@ describe("tool conversions", () => {
     });
   });
 
+  it("should handle PowerShell like Bash", () => {
+    const tool_use = {
+      type: "tool_use",
+      id: "toolu_01Ps2mxUFwpBJZYd7BmbC9",
+      name: "PowerShell",
+      input: {
+        command: "Get-ChildItem -Force",
+        description: "List the repository contents",
+      },
+    };
+
+    expect(toolInfoFromToolUse(tool_use)).toStrictEqual({
+      kind: "execute",
+      title: "Get-ChildItem -Force",
+      content: [
+        {
+          content: {
+            text: "List the repository contents",
+            type: "text",
+          },
+          type: "content",
+        },
+      ],
+    });
+  });
+
+  it("should use the PowerShell command as the title when no description is provided", () => {
+    const tool_use = {
+      type: "tool_use",
+      id: "toolu_01Ps2mxUFwpBJZYd7BmbC9",
+      name: "PowerShell",
+      input: {
+        command: "rustc --version",
+      },
+    };
+
+    expect(toolInfoFromToolUse(tool_use)).toMatchObject({
+      kind: "execute",
+      title: "rustc --version",
+    });
+  });
+
+  it("should handle Skill nicely", () => {
+    const tool_use = {
+      type: "tool_use",
+      id: "toolu_01Skill",
+      name: "Skill",
+      input: {
+        skill: "nsis-installer-autoupdate",
+        args: "--dry-run",
+      },
+    };
+
+    expect(toolInfoFromToolUse(tool_use)).toStrictEqual({
+      kind: "other",
+      title: "Load skill: nsis-installer-autoupdate",
+      content: [],
+    });
+  });
+
+  it("should fall back to a bare Skill title without a skill name", () => {
+    const tool_use = {
+      type: "tool_use",
+      id: "toolu_01Skill",
+      name: "Skill",
+      input: {},
+    };
+
+    expect(toolInfoFromToolUse(tool_use)).toMatchObject({
+      kind: "other",
+      title: "Load skill",
+    });
+  });
+
   it("should handle Glob nicely", () => {
     const tool_use = {
       type: "tool_use",

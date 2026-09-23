@@ -1305,6 +1305,98 @@ describe("Bash terminal output", () => {
       });
     });
 
+    describe("PowerShell shares the Bash shell pipeline", () => {
+      // Windows surfaces the shell tool as `PowerShell`, with the same
+      // `{ command, description }` input and result shapes as `Bash`, so every
+      // Bash branch has to apply to it too.
+      const shellToolUseId = (toolName: string) => `toolu_${toolName.toLowerCase()}`;
+
+      const makeShellResult = (
+        toolName: string,
+        content: string,
+        is_error: boolean = false,
+      ): ToolResultBlockParam => ({
+        type: "tool_result",
+        tool_use_id: shellToolUseId(toolName),
+        content,
+        is_error,
+      });
+
+      const makeShellToolUse = (toolName: string) => ({
+        type: "tool_use",
+        id: shellToolUseId(toolName),
+        name: toolName,
+        input: { command: "Get-ChildItem -Force" },
+      });
+
+      it.each(["Bash", "PowerShell"])(
+        "%s formats string output as a console code block without terminal support",
+        (toolName) => {
+          const update = toolUpdateFromToolResult(
+            makeShellResult(toolName, "Cargo.lock\nCargo.toml"),
+            makeShellToolUse(toolName),
+            false,
+          );
+
+          expect(update).toEqual({
+            content: [
+              {
+                type: "content",
+                content: {
+                  type: "text",
+                  text: "```console\nCargo.lock\nCargo.toml\n```",
+                },
+              },
+            ],
+          });
+          expect(update._meta).toBeUndefined();
+        },
+      );
+
+      it.each(["Bash", "PowerShell"])(
+        "%s routes is_error through the terminal when supportsTerminalOutput is true",
+        (toolName) => {
+          const terminalId = shellToolUseId(toolName);
+          const update = toolUpdateFromToolResult(
+            makeShellResult(toolName, "command not found: bad_cmd", true),
+            makeShellToolUse(toolName),
+            true,
+          );
+
+          expect(update.content).toEqual([{ type: "terminal", terminalId }]);
+          expect(update._meta).toEqual({
+            terminal_info: { terminal_id: terminalId },
+            terminal_output: { terminal_id: terminalId, data: "command not found: bad_cmd" },
+            terminal_exit: { terminal_id: terminalId, exit_code: 1, signal: null },
+          });
+        },
+      );
+
+      it.each(["Bash", "PowerShell"])(
+        "%s prefers the structured stdout/stderr over the model-facing text",
+        (toolName) => {
+          const update = toolUpdateFromToolResult(
+            makeShellResult(toolName, "model-facing text"),
+            makeShellToolUse(toolName),
+            false,
+            { stdout: "stdout line", stderr: "stderr line", interrupted: false },
+          );
+
+          expect(update).toEqual({
+            content: [
+              {
+                type: "content",
+                content: {
+                  type: "text",
+                  text: "```console\nstdout line\nstderr line\n```",
+                },
+              },
+            ],
+          });
+        },
+      );
+    });
+
     describe("with image array tool_result (local Bash image output path)", () => {
       // The local Bash tool emits image content as
       // `[{ type: "image", source: { type: "base64", ... } }]` when a

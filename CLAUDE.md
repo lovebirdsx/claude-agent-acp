@@ -21,6 +21,7 @@
 
 | 功能 | 提交 | 落点文件 | 备注 |
 |---|---|---|---|
+| Windows `PowerShell` 与 `Bash` 同族 + `Skill` 卡（上游已实现，本仓库仅保留回归测试） | （待提交，测试） | `src/tests/tools.test.ts` `src/tests/acp-agent.test.ts` | 上游 a44c486 的 reporters/renderer 架构已原生覆盖：`reporters/index.ts` 注册 `PowerShell: bash` 与 `Skill: SkillReporter`，`renderer.toolUseMeta` 的 description / skillPath 分支同用 `Bash \|\| PowerShell` 判定——fork 不再改实现（`tools.ts` 的 `toolInfoFromToolUse`/`toolUpdateFromToolResult` 已是 `AcpToolCallRenderer` 的薄包装），本改动 rebase 后只剩测试，保留以防上游改回。 |
 | 识别 CLI 合成的假「用户拒绝」（`syntheticDenial`） | （待提交） | `acp-agent.ts`（6 处） | CLI 兜底合成的 `toolDenialKind:"user-rejected"` 与真拒绝 wire 逐字相同，唯一权威判据是 fork 自己走过 `behavior:"deny"`（Session 记 `userDeniedToolCalls`）。只叠加 `syntheticDenial?: true`，**不改 `nonExecutionKind`**；replay 无 set 即无证据、宁可不标。editor 消费点 `readSyntheticDenial`（字段名逐字一致）。测试 `src/tests/tools.test.ts`。详见 [cases-session.md](cases-session.md) |
 | 会话模型清单注入网关模型（`_meta.extraModels`） | （待提交） | **`extra-models.ts`(新)** `acp-agent.ts`（3 处） | SDK models 硬编码官方列表；改走 `_meta.extraModels` 追加通道（不走「取代」语义的 `settings.availableModels`）；上限 64、坏载荷降级、逐字透传；allowlist 过滤在前、extras 追加在后。测试 `src/tests/extra-models.test.ts`。详见 [cases-session.md](cases-session.md) |
 | 子 agent 模型 pin（`CLAUDE_CODE_SUBAGENT_MODEL`） | （待提交） | **`subagent-model.ts`(新)** `acp-agent.ts`（1 处） | 防 CLI first-party 家族改写把内置 Explore 换成 opus 计费；host env / caller env / settings.json `env` 块三者皆未显式设置时才注入会话模型。测试 `src/tests/subagent-model.test.ts`。详见 [cases-session.md](cases-session.md) |
