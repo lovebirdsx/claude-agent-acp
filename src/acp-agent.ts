@@ -564,6 +564,11 @@ export interface RawTranscriptEntry {
   parent_tool_use_id?: string | null;
   /** The generated summary user message written right after a compaction. */
   isCompactSummary?: boolean;
+  /** On `type: "user"` rows from CLI versions that stamp a harness delivery
+   *  on the message itself instead of a `queued_command` attachment: the
+   *  origin the harness recorded. Replay reads it (through
+   *  {@link isTaskNotificationRecord}) to hide the row. */
+  origin?: { kind?: SDKMessageOrigin["kind"]; subkind?: unknown };
   message?: unknown;
   /** On `type: "attachment"` rows: the attachment payload. Only
    *  `queued_command` (a mid-turn prompt the CLI folded into the running
@@ -574,6 +579,18 @@ export interface RawTranscriptEntry {
     /** The client-supplied prompt uuid (ACP `messageId`) of the queued
      *  prompt, preserved so replay can re-anchor the user turn on it. */
     source_uuid?: unknown;
+    /** How the CLI delivered this queued command: `"prompt"` for something
+     *  the user sent, `"task-notification"` for a background-task delivery
+     *  the harness folded into the running turn. */
+    commandMode?: unknown;
+    /** Set by the harness on payloads it injected on its own behalf (a peer
+     *  agent's message), never on a prompt the user typed. It sits on the
+     *  attachment — the entry-level `isMeta` is usually absent. */
+    isMeta?: unknown;
+    /** On a `"prompt"`-mode delivery: the origin the harness stamped (a peer
+     *  / coordinator / observer message rides this way). Only `kind` is
+     *  read. */
+    origin?: { kind?: SDKMessageOrigin["kind"] };
   };
 }
 
@@ -590,6 +607,32 @@ function isDisplayMessageEntry(entry: RawTranscriptEntry): boolean {
   );
 }
 
+/** True when a `queued_command` attachment is a delivery the CLI's own harness
+ *  folded into the running turn — a background task-notification, or a peer /
+ *  coordinator / observer message — rather than a prompt the user typed.
+ *
+ *  These ride the SAME `queued_command` carrier as real steering prompts
+ *  (which is the only reason they reach replay at all), but they are not the
+ *  user speaking: the live path routes them to background activity and never
+ *  puts them in the feed (see AUTONOMOUS_RESULT_ORIGINS). Replaying them
+ *  dressed one resumed session in 80+ spurious user cards.
+ *
+ *  Three stamps, because no single one covers both observed shapes: a
+ *  task-notification delivery carries neither `origin` nor `isMeta` (only
+ *  `commandMode: "task-notification"`), while a peer delivery arrives as
+ *  `commandMode: "prompt"` with the harness's `isMeta` on the attachment and a
+ *  peer `origin`. A real steering prompt — `commandMode: "prompt"`,
+ *  `origin.kind: "human"`, no `isMeta` — matches none of them, and an
+ *  attachment with no `commandMode` (older CLI spelling) is left alone. */
+function isHarnessDeliveryEntry(entry: RawTranscriptEntry): boolean {
+  const attachment = entry.attachment;
+  if (attachment === undefined) return false;
+  if (attachment.isMeta === true) return true;
+  const originKind = attachment.origin?.kind;
+  if (originKind !== undefined && AUTONOMOUS_RESULT_ORIGINS.has(originKind)) return true;
+  return attachment.commandMode === "task-notification";
+}
+
 /** A prompt sent while a turn is running is folded into the running
  *  generation by the CLI ("steering") and persisted as an
  *  `attachment/queued_command` row ON the parent chain — not as a `user`
@@ -597,14 +640,16 @@ function isDisplayMessageEntry(entry: RawTranscriptEntry): boolean {
  *  (`getSessionMessages` filters attachments out; the display-chain walk only
  *  keeps user/assistant entries), so a reloaded session lost the steering
  *  prompt entirely. Detect them so replay can surface them as the user
- *  messages they were. */
+ *  messages they were — the harness deliveries sharing this carrier are
+ *  excluded, see {@link isHarnessDeliveryEntry}. */
 export function isQueuedCommandEntry(entry: RawTranscriptEntry): boolean {
   return (
     entry.type === "attachment" &&
     entry.isSidechain !== true &&
     entry.isMeta !== true &&
     !entry.teamName &&
-    entry.attachment?.type === "queued_command"
+    entry.attachment?.type === "queued_command" &&
+    !isHarnessDeliveryEntry(entry)
   );
 }
 

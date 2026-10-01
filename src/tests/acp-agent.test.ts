@@ -86,7 +86,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { createHash, randomUUID } from "crypto";
 import { claudeConfigDir } from "../paths.js";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -24760,6 +24760,66 @@ describe("rebuildTranscriptDisplayChain (compaction-crossing history)", () => {
     expect(chain?.map((e) => e.uuid)).toEqual(["u1", "a1", "q1", "cb", "u2"]);
   });
 
+  it("drops harness deliveries folded in as queued_command attachments", () => {
+    const chain = rebuildTranscriptDisplayChain([
+      entry({ uuid: "u1", parentUuid: null, type: "user" }),
+      entry({ uuid: "a1", parentUuid: "u1", type: "assistant" }),
+      entry({
+        uuid: "n1",
+        parentUuid: "a1",
+        type: "attachment",
+        attachment: { type: "queued_command", commandMode: "task-notification" },
+      }),
+      entry({
+        uuid: "p1",
+        parentUuid: "n1",
+        type: "attachment",
+        attachment: {
+          type: "queued_command",
+          commandMode: "prompt",
+          isMeta: true,
+          origin: { kind: "peer" },
+        },
+      }),
+      entry({
+        uuid: "cb",
+        parentUuid: null,
+        logicalParentUuid: "p1",
+        type: "system",
+        subtype: "compact_boundary",
+      }),
+      entry({ uuid: "u2", parentUuid: "cb", type: "user" }),
+    ]);
+    expect(chain?.map((e) => e.uuid)).toEqual(["u1", "a1", "cb", "u2"]);
+  });
+
+  // A harness delivery stamped as a `user` row is a display entry, so it must
+  // stay one here: `backfillForkedToolResults` scans these rows for the
+  // tool_results of forked-off tool calls, and dropping a row from the scan
+  // would leave its tool card pending forever. Suppression belongs to the
+  // replay loop, not to the entry predicates.
+  it("a tail harness-delivered user row still anchors the chain", () => {
+    const chain = rebuildTranscriptDisplayChain([
+      entry({ uuid: "u1", parentUuid: null, type: "user" }),
+      entry({ uuid: "a1", parentUuid: "u1", type: "assistant" }),
+      entry({
+        uuid: "cb",
+        parentUuid: null,
+        logicalParentUuid: "a1",
+        type: "system",
+        subtype: "compact_boundary",
+      }),
+      entry({ uuid: "u2", parentUuid: "cb", type: "user" }),
+      entry({
+        uuid: "n1",
+        parentUuid: "u2",
+        type: "user",
+        origin: { kind: "task-notification" },
+      }),
+    ]);
+    expect(chain?.map((e) => e.uuid)).toEqual(["u1", "a1", "cb", "u2", "n1"]);
+  });
+
   it("crosses multiple compactions in one session", () => {
     const chain = rebuildTranscriptDisplayChain([
       entry({ uuid: "u1", parentUuid: null, type: "user" }),
@@ -24931,6 +24991,202 @@ describe("replaySessionHistory across compaction (full transcript replay)", () =
       { kind: "agent", text: "first answer" },
       { kind: "compaction", phase: "success" },
     ]);
+  });
+
+  it("replays a real steering prompt but not the harness deliveries beside it", async () => {
+    await writeCompactedTranscript();
+    // What the CLI writes for a background task finishing and for a peer
+    // agent's message: same `queued_command` carrier as a steering prompt,
+    // and on the chain (each row parents onto the previous one).
+    await appendFile(
+      transcript,
+      [
+        line({
+          type: "attachment",
+          uuid: "q1",
+          parentUuid: "a2",
+          attachment: {
+            type: "queued_command",
+            prompt: [{ type: "text", text: "STEERING_PROMPT" }],
+            source_uuid: "client-prompt-1",
+            commandMode: "prompt",
+            origin: { kind: "human" },
+          },
+        }),
+        line({
+          type: "attachment",
+          uuid: "n1",
+          parentUuid: "q1",
+          attachment: {
+            type: "queued_command",
+            prompt: [
+              {
+                type: "text",
+                text: "<task-notification>\n<task-id>t1</task-id>\n</task-notification>",
+              },
+            ],
+            commandMode: "task-notification",
+          },
+        }),
+        line({
+          type: "attachment",
+          uuid: "p1",
+          parentUuid: "n1",
+          attachment: {
+            type: "queued_command",
+            prompt: [
+              {
+                type: "text",
+                text: '<agent-message from="general-purpose">peer body</agent-message>',
+              },
+            ],
+            commandMode: "prompt",
+            isMeta: true,
+            origin: { kind: "peer", from: "general-purpose" },
+          },
+        }),
+        line({
+          type: "user",
+          uuid: "u3",
+          parentUuid: "p1",
+          message: { role: "user", content: "third question" },
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const { agent, events } = createRecordingAgent();
+
+    await (agent as any).replaySessionHistory(sessionId);
+
+    expect(events).toEqual([
+      { kind: "user", text: "first question" },
+      { kind: "agent", text: "first answer" },
+      { kind: "compaction", phase: "success" },
+      { kind: "user", text: "second question" },
+      { kind: "agent", text: "second answer" },
+      { kind: "user", text: "STEERING_PROMPT" },
+      { kind: "user", text: "third question" },
+    ]);
+  });
+
+  it("skips user rows stamped with an autonomous origin", async () => {
+    // Upstream's isTaskNotificationRecord hides the row and restores the task
+    // state from its body (see the task-notification replay suite); this
+    // pins the contract replay relies on.
+    await writeFile(
+      transcript,
+      [
+        line({
+          type: "user",
+          uuid: "u1",
+          parentUuid: null,
+          message: { role: "user", content: "real question" },
+        }),
+        line({
+          type: "assistant",
+          uuid: "a1",
+          parentUuid: "u1",
+          message: {
+            id: "msg_1",
+            role: "assistant",
+            content: [{ type: "text", text: "real answer" }],
+          },
+        }),
+        line({
+          type: "system",
+          subtype: "compact_boundary",
+          uuid: "cb",
+          parentUuid: null,
+          logicalParentUuid: "a1",
+        }),
+        line({
+          type: "user",
+          uuid: "n1",
+          parentUuid: "cb",
+          origin: { kind: "task-notification" },
+          message: {
+            role: "user",
+            content: "<task-notification>\n<task-id>t1</task-id>\n</task-notification>",
+          },
+        }),
+        line({
+          type: "user",
+          uuid: "u2",
+          parentUuid: "n1",
+          origin: { kind: "human" },
+          message: { role: "user", content: "follow-up question" },
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const { agent, events } = createRecordingAgent();
+
+    await (agent as any).replaySessionHistory(sessionId);
+
+    expect(events).toEqual([
+      { kind: "user", text: "real question" },
+      { kind: "agent", text: "real answer" },
+      { kind: "compaction", phase: "success" },
+      { kind: "user", text: "follow-up question" },
+    ]);
+  });
+
+  it("skips a text-only task-notification user row on the effective-chain fallback too", async () => {
+    // No compact_boundary: replay goes through getSessionMessages, whose rows
+    // are freshly mapped and drop `origin` (the SDK keeps a fixed field list),
+    // so upstream's origin check cannot fire — the marker strip leaves nothing
+    // behind and hides it anyway.
+    await writeFile(
+      transcript,
+      [
+        line({
+          type: "user",
+          uuid: "u1",
+          parentUuid: null,
+          message: { role: "user", content: "real question" },
+        }),
+        line({
+          type: "user",
+          uuid: "n1",
+          parentUuid: "u1",
+          origin: { kind: "task-notification" },
+          message: { role: "user", content: "<task-notification>done</task-notification>" },
+        }),
+        line({
+          type: "attachment",
+          uuid: "q1",
+          parentUuid: "n1",
+          attachment: {
+            type: "queued_command",
+            prompt: [{ type: "text", text: "<task-notification>queued</task-notification>" }],
+            commandMode: "task-notification",
+          },
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "u1",
+        session_id: "s",
+        message: { role: "user", content: "real question" },
+        parent_tool_use_id: null,
+      },
+      {
+        type: "user",
+        uuid: "n1",
+        session_id: "s",
+        message: { role: "user", content: "<task-notification>done</task-notification>" },
+        parent_tool_use_id: null,
+      },
+    ] as any);
+    const { agent, events } = createRecordingAgent();
+
+    await (agent as any).replaySessionHistory(sessionId);
+
+    expect(getSessionMessages).toHaveBeenCalledWith(sessionId);
+    expect(events).toEqual([{ kind: "user", text: "real question" }]);
   });
 
   it("falls back to getSessionMessages when the transcript has no boundary", async () => {
@@ -26233,6 +26489,91 @@ describe("isQueuedCommandEntry", () => {
     ).toBe(false);
     expect(isQueuedCommandEntry(entry({ uuid: "d", type: "user" }))).toBe(false);
   });
+
+  // The CLI folds harness deliveries into the SAME `queued_command` carrier as
+  // real steering prompts. Replaying them dressed a resumed session in 80+
+  // spurious user cards, so each observed delivery shape must be rejected
+  // while the user's own lane is kept.
+  const delivery = (uuid: string, attachment: Record<string, unknown>): RawTranscriptEntry =>
+    entry({ uuid, type: "attachment", attachment: attachment as RawTranscriptEntry["attachment"] });
+
+  it("rejects a task-notification delivery (commandMode only)", () => {
+    expect(
+      isQueuedCommandEntry(
+        delivery("n1", { type: "queued_command", commandMode: "task-notification" }),
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects a peer delivery (prompt mode, attachment-level isMeta, peer origin)", () => {
+    expect(
+      isQueuedCommandEntry(
+        delivery("p1", {
+          type: "queued_command",
+          commandMode: "prompt",
+          isMeta: true,
+          origin: { kind: "peer", from: "general-purpose" },
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps a real steering prompt (prompt mode, human origin, no isMeta)", () => {
+    expect(
+      isQueuedCommandEntry(
+        delivery("q1", {
+          type: "queued_command",
+          prompt: [{ type: "text", text: "keep going" }],
+          source_uuid: "client-prompt-1",
+          commandMode: "prompt",
+          origin: { kind: "human" },
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  // Fail-open by design: an attachment with no commandMode at all (older CLI
+  // spelling) must not be mistaken for a delivery — losing a user's mid-turn
+  // prompt is worse than showing one extra card.
+  it("keeps a commandMode-less queued_command (older CLI spelling)", () => {
+    expect(isQueuedCommandEntry(delivery("q2", { type: "queued_command" }))).toBe(true);
+  });
+
+  // The replay filter must mirror the live one: whatever AUTONOMOUS_RESULT_ORIGINS
+  // routes to background activity is a delivery, and the user's own lanes
+  // (human, and the ACP channel this adapter's prompts arrive on) stay prompts.
+  it.each(["task-notification", "peer", "coordinator", "observer", "observer-activity"])(
+    "rejects an attachment stamped with the autonomous origin %s",
+    (kind) => {
+      expect(
+        isQueuedCommandEntry(
+          delivery(`o-${kind}`, {
+            type: "queued_command",
+            commandMode: "prompt",
+            origin: { kind },
+          }),
+        ),
+      ).toBe(false);
+    },
+  );
+
+  // Fail-open on the origin arm too: `human` and the ACP `channel` are the
+  // user's own lanes, `auto-continuation` continues the user's turn, and an
+  // unknown future kind must default to the user lane rather than be dropped.
+  it.each(["human", "channel", "auto-continuation", "future-kind"])(
+    "keeps an attachment stamped with the %s origin",
+    (kind) => {
+      expect(
+        isQueuedCommandEntry(
+          delivery(`u-${kind}`, {
+            type: "queued_command",
+            commandMode: "prompt",
+            origin: { kind },
+          }),
+        ),
+      ).toBe(true);
+    },
+  );
 });
 
 describe("mergeQueuedCommandAttachments", () => {
@@ -26252,6 +26593,33 @@ describe("mergeQueuedCommandAttachments", () => {
       [queued("q1", "a1"), queued("q2", "a1"), queued("q3", "u1")],
     );
     expect(merged.map((e) => e.uuid)).toEqual(["u1", "q3", "a1", "q1", "q2", "a2"]);
+  });
+
+  it("does not merge harness deliveries into the effective chain", () => {
+    const merged = mergeQueuedCommandAttachments(
+      [{ uuid: "u1" }, { uuid: "a1" }],
+      [
+        queued("q1", "a1"),
+        entry({
+          uuid: "n1",
+          parentUuid: "a1",
+          type: "attachment",
+          attachment: { type: "queued_command", commandMode: "task-notification" },
+        }),
+        entry({
+          uuid: "p1",
+          parentUuid: "a1",
+          type: "attachment",
+          attachment: {
+            type: "queued_command",
+            commandMode: "prompt",
+            isMeta: true,
+            origin: { kind: "peer" },
+          },
+        }),
+      ],
+    );
+    expect(merged.map((e) => e.uuid)).toEqual(["u1", "a1", "q1"]);
   });
 
   it("drops attachments whose parent is off-chain or missing", () => {

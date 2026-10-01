@@ -21,6 +21,7 @@
 
 | 功能 | 提交 | 落点文件 | 备注 |
 |---|---|---|---|
+| 回放不再把 harness 投递当成用户插话（`queued_command` 载体） | （待提交） | `acp-agent.ts`（3 处） | CLI 用**同一个** `queued_command` 载体投递后台通知与 peer 消息，resume 时被渲染成 80+ 用户卡片（live 从不渲染）。三枚印章（`commandMode:"task-notification"` / attachment 级 `origin.kind ∈ AUTONOMOUS_RESULT_ORIGINS` / attachment 级 `isMeta`）任一命中即从回放排除，**fail-open 保真插话**；过滤**勿挪进 `isDisplayMessageEntry`**（会让 `backfillForkedToolResults` 漏扫 tool_result，卡片永久 pending）。`user` 行自带 entry 级 `origin` 的形态已由上游实现（见下）。测试 `src/tests/acp-agent.test.ts`。详见 [cases-session.md](cases-session.md) |
 | Windows `PowerShell` 与 `Bash` 同族 + `Skill` 卡（上游已实现，本仓库仅保留回归测试） | （待提交，测试） | `src/tests/tools.test.ts` `src/tests/acp-agent.test.ts` | 上游 a44c486 的 reporters/renderer 架构已原生覆盖：`reporters/index.ts` 注册 `PowerShell: bash` 与 `Skill: SkillReporter`，`renderer.toolUseMeta` 的 description / skillPath 分支同用 `Bash \|\| PowerShell` 判定——fork 不再改实现（`tools.ts` 的 `toolInfoFromToolUse`/`toolUpdateFromToolResult` 已是 `AcpToolCallRenderer` 的薄包装），本改动 rebase 后只剩测试，保留以防上游改回。 |
 | 识别 CLI 合成的假「用户拒绝」（`syntheticDenial`） | （待提交） | `acp-agent.ts`（6 处） | CLI 兜底合成的 `toolDenialKind:"user-rejected"` 与真拒绝 wire 逐字相同，唯一权威判据是 fork 自己走过 `behavior:"deny"`（Session 记 `userDeniedToolCalls`）。只叠加 `syntheticDenial?: true`，**不改 `nonExecutionKind`**；replay 无 set 即无证据、宁可不标。editor 消费点 `readSyntheticDenial`（字段名逐字一致）。测试 `src/tests/tools.test.ts`。详见 [cases-session.md](cases-session.md) |
 | 会话模型清单注入网关模型（`_meta.extraModels`） | （待提交） | **`extra-models.ts`(新)** `acp-agent.ts`（3 处） | SDK models 硬编码官方列表；改走 `_meta.extraModels` 追加通道（不走「取代」语义的 `settings.availableModels`）；上限 64、坏载荷降级、逐字透传；allowlist 过滤在前、extras 追加在后。测试 `src/tests/extra-models.test.ts`。详见 [cases-session.md](cases-session.md) |
@@ -59,6 +60,8 @@
 另有 ext-notification `_claude/sdkMessage`（原始 SDK 消息旁路，供父项目重建连接快照）也是本地印章，随上述提交散落在 `acp-agent.ts`。
 
 **已被上游实现、fork 不再保留的本地改动**：AskUserQuestion「选项+备注共存」。上游 a44c486 起 `applyAskElicitationResponse` 已实现同一意图——单选且已选中选项时，自由文本落 `annotations[question].notes`（原先 custom-wins 会吞掉已选项）；多选并入所选；无选择时文本即答案。fork 原有的 `"(notes only)"` 哨兵等子分支已在 rebase 时删去（源文件与测试整段切回上游）。日后 rebase 若此处再冲突，按上游语义走，勿重新加回。
+
+**回放隐藏 harness 投递的 user 行（`user` 行自带 entry 级 `origin` 的形态）**：上游 a44c486 的 replay 已自带——先经 `taskNotificationsOf`/`restoreTaskNotification` 恢复后台任务状态，再 `isTaskNotificationRecord`（`kind==="task-notification"` 且无 `subkind`）整行隐藏；无 `origin` 的纯 `<task-notification>` 文本行由 `stripLocalCommandMetadata` 的标记剥离清空隐藏（effective chain 映射丢 `origin` 也照样隐藏）。带 `subkind` 的投递（如 scheduled routine）按上游语义是**真实 prompt**，必须显示。fork 原守卫（uuid 回查原始行 + 全量 `AUTONOMOUS_RESULT_ORIGINS` 判据）在 restore 之前整行跳过，既吞任务状态恢复又误杀 subkind 投递，rebase 时已删；`queued_command` **attachment** 载体那半上游未覆盖，仍保留（见上表）。保留两条 fork 测试守护上游契约。
 
 **每 turn / compact_boundary 的 getContextUsage 刷新移除**：上游 a44c486 起自身已不在 result 处做 per-turn `getContextUsage`（改用 `modelUsage.contextWindow` + 本地 `resolveAutoCompactWindow` clamp），compact_boundary 改用 `compact_metadata.post_tokens`（比 fork 的 used:0 近似更准），`fetchContextUsage` 助手随之不存在。fork 这条改动整体被上游吸收，不再单列；唯一保留相关的是上游新增的 `refreshContextWindowInBackground`（仅在窗口非权威时后台跑一次，不等不阻塞），它不属于本改动要删的「每 turn」路径。日后 rebase 若上游又在 result / compact_boundary 处引入同步 `getContextUsage`，按本条删。
 
