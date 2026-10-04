@@ -357,9 +357,9 @@ describe("reconcileResumedSessionModel", () => {
     return sessionUpdates
       .filter((n) => n.update.sessionUpdate === "config_option_update")
       .map((n) =>
-        (n.update as { configOptions: { id: string; currentValue?: unknown }[] }).configOptions.find(
-          (o) => o.id === "model",
-        ),
+        (
+          n.update as { configOptions: { id: string; currentValue?: unknown }[] }
+        ).configOptions.find((o) => o.id === "model"),
       );
   }
 

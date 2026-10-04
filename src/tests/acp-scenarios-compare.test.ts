@@ -92,7 +92,11 @@ describe("compareWithBaseline", () => {
     });
 
     it("reports a settle without the summary of the notification", () => {
-      const bare = update({ sessionUpdate: "tool_call_update", toolCallId: "t", status: "completed" });
+      const bare = update({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "t",
+        status: "completed",
+      });
       expect(compareWithBaseline(baseline, [...baseline, bare])).toContainEqual(
         expect.stringMatching(/^origin\/main did not send /u),
       );
@@ -118,7 +122,12 @@ describe("compareWithBaseline", () => {
       sessionUpdate: "tool_call_update",
       toolCallId: "t",
       status: "completed",
-      content: [{ type: "content", content: { type: "text", text: "> Which database?\n**答案**：Postgres" } }],
+      content: [
+        {
+          type: "content",
+          content: { type: "text", text: "> Which database?\n**答案**：Postgres" },
+        },
+      ],
     });
 
     it("accepts the readable rewrite of the answers", () => {

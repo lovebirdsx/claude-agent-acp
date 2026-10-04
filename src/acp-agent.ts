@@ -2751,7 +2751,6 @@ export function isSyntheticNoResponseMessage(apiMessage: unknown): boolean {
   );
 }
 
-
 /** Origin kinds of the meta user messages `getSessionMessages` returns since
  *  SDK 0.3.284 (messages from other agents, sessions and channels). */
 const REPLAY_HIDDEN_META_ORIGIN_KINDS = new Set([
@@ -9063,9 +9062,7 @@ export class ClaudeAcpAgent {
    * The actual SDK call is experimental, so it is isolated in `usage.ts` and
    * degrades to `supported: false` rather than throwing.
    */
-  async getSubscriptionUsage(
-    params: SubscriptionUsageRequest,
-  ): Promise<SubscriptionUsageResponse> {
+  async getSubscriptionUsage(params: SubscriptionUsageRequest): Promise<SubscriptionUsageResponse> {
     const session = this.sessions[params.sessionId];
     if (!session) {
       throw RequestError.resourceNotFound(params.sessionId);
@@ -9127,10 +9124,7 @@ export class ClaudeAcpAgent {
    * one JSON object per line, each carrying a `uuid` field that equals the uuid
    * `getSessionMessages` returns; strictly append-ordered; trailing newline.
    */
-  private async truncateTranscriptBefore(
-    sessionId: string,
-    anchorUuid: string,
-  ): Promise<void> {
+  private async truncateTranscriptBefore(sessionId: string, anchorUuid: string): Promise<void> {
     try {
       const file = await findTranscript(sessionId);
       if (file === undefined) {
@@ -9265,7 +9259,8 @@ export class ClaudeAcpAgent {
    */
   private snapshotRuntimeConfig(session: Session): Array<{ configId: string; value: string }> {
     const order = [MODEL_CONFIG_ID, MODE_CONFIG_ID, EFFORT_CONFIG_ID, FAST_MODE_CONFIG_ID];
-    const snapshot: Array<{ configId: string; value: string }> = [];    for (const configId of order) {
+    const snapshot: Array<{ configId: string; value: string }> = [];
+    for (const configId of order) {
       const opt = session.configOptions.find((o) => o.id === configId);
       if (!opt) continue;
       if (typeof opt.currentValue === "boolean") {
@@ -9422,7 +9417,8 @@ export class ClaudeAcpAgent {
       : undefined;
     const sessionFailures =
       session && supportsTypedFailures
-        ? new SessionFailureController({            sessionId,
+        ? new SessionFailureController({
+            sessionId,
             state: session.sessionFailureState,
             capabilities: this.clientCapabilities,
             isCurrent: () => {
@@ -10053,9 +10049,7 @@ export class ClaudeAcpAgent {
     pendingSubagentRestamps: ReplayedSubagentCard[],
   ): Promise<void> {
     if (rawEntries === undefined) return;
-    const orphaned = new Set(
-      [...surfacedToolCalls].filter((id) => !settledToolCalls.has(id)),
-    );
+    const orphaned = new Set([...surfacedToolCalls].filter((id) => !settledToolCalls.has(id)));
     if (orphaned.size === 0) return;
 
     let backfilled = 0;
@@ -10243,9 +10237,7 @@ export class ClaudeAcpAgent {
             });
           }
         } catch (error) {
-          this.logger.log(
-            `subagent stats: skipped restamp for ${group.agentId}: ${error}`,
-          );
+          this.logger.log(`subagent stats: skipped restamp for ${group.agentId}: ${error}`);
         }
       }),
     );
@@ -11108,10 +11100,7 @@ export class ClaudeAcpAgent {
     } catch (err) {
       // Same containment as syncModelAfterRefusalFallback: stale bookkeeping
       // beats failing a session that is otherwise running fine.
-      this.logger.error(
-        `Failed to reconcile resumed session model to "${liveModel.value}":`,
-        err,
-      );
+      this.logger.error(`Failed to reconcile resumed session model to "${liveModel.value}":`, err);
     }
   }
 
@@ -12344,11 +12333,7 @@ export class ClaudeAcpAgent {
         // The resumed session's own reconciliation reads the same
         // `getContextUsage` report and adopts model, window and occupancy, so
         // the generic window refresh would only duplicate that CLI round-trip.
-        void this.reconcileResumedSessionModel(
-          sessionId,
-          resumeSync,
-          initializationResult.models,
-        );
+        void this.reconcileResumedSessionModel(sessionId, resumeSync, initializationResult.models);
       } else {
         this.refreshContextWindowInBackground(sessionId, this.sessions[sessionId]);
       }
@@ -13344,7 +13329,6 @@ function forgetForegroundToolCall(session: Session, toolCallId: string): void {
   for (const turn of session.turnQueue ?? []) turn.foregroundToolCallIds?.delete(toolCallId);
 }
 
-
 /** The sub-agent-spawning tools. Their tool_use surfaces as a top-level
  *  `tool_call` card in the client; when dispatched in the background (the SDK
  *  default) the initial tool_result is a "running in the background"
@@ -13361,7 +13345,10 @@ function toolResultText(content: unknown): string {
   if (Array.isArray(content)) {
     return content
       .map((c) =>
-        c && typeof c === "object" && "text" in c && typeof (c as { text: unknown }).text === "string"
+        c &&
+        typeof c === "object" &&
+        "text" in c &&
+        typeof (c as { text: unknown }).text === "string"
           ? (c as { text: string }).text
           : "",
       )
@@ -13678,11 +13665,13 @@ export function toAcpNotifications(
         // Spread into the claudeCode meta of every update emitted below; the
         // untracked-tool fallback can't carry it (claudeCode metas always
         // carry `toolName`, which is unknown there).
-        let nonExecution: {
-          nonExecutionKind: string;
-          userFeedback?: string;
-          syntheticDenial?: true;
-        } | undefined = toolResultMeta?.get(chunk.tool_use_id);
+        let nonExecution:
+          | {
+              nonExecutionKind: string;
+              userFeedback?: string;
+              syntheticDenial?: true;
+            }
+          | undefined = toolResultMeta?.get(chunk.tool_use_id);
         // fork: the CLI synthesizes "user-rejected" tool_results for any
         // tool-queue abort whose reason isn't interrupt/end_conversation
         // (stalled streams, upstream response failures, …) — only ids this

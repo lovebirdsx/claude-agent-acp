@@ -409,7 +409,6 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
     expect(recordedUserChunks).toContain(`/acp-session-subsystem-context ${userPrompt}`);
   }, 60000);
 
-
   // Regression test for https://github.com/agentclientprotocol/claude-agent-acp/issues/845
   // On resume the CLI restores the model the session's transcript was running,
   // so loadSession must report that live model instead of recomputing the

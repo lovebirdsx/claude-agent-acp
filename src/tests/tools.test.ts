@@ -779,8 +779,8 @@ describe("background sub-agent tool_result", () => {
   // NOT settle the card to `completed`, or the UI shows a green check while the
   // sub-agent is still running.
   const backgroundResultText =
-    'Agent dispatched. It is running in the background; ' +
-    'you will be notified when it completes.';
+    "Agent dispatched. It is running in the background; " +
+    "you will be notified when it completes.";
 
   it("keeps a backgrounded Agent tool_call in_progress (not completed)", () => {
     const toolUseCache: ToolUseCache = {
@@ -794,7 +794,14 @@ describe("background sub-agent tool_result", () => {
     const backgroundToolCalls = new Set<string>();
 
     const notifications = toAcpNotifications(
-      [{ type: "tool_result", tool_use_id: "toolu_agent", content: backgroundResultText, is_error: false }],
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_agent",
+          content: backgroundResultText,
+          is_error: false,
+        },
+      ],
       "assistant",
       "test-session",
       toolUseCache,
@@ -855,7 +862,14 @@ describe("background sub-agent tool_result", () => {
     };
 
     const notifications = toAcpNotifications(
-      [{ type: "tool_result", tool_use_id: "toolu_sync", content: "Done. Result: 42", is_error: false }],
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_sync",
+          content: "Done. Result: 42",
+          is_error: false,
+        },
+      ],
       "assistant",
       "test-session",
       toolUseCache,
@@ -883,7 +897,14 @@ describe("background sub-agent tool_result", () => {
 
     const notifications = toAcpNotifications(
       // Prose that happens to mention background must not fool a Read result.
-      [{ type: "tool_result", tool_use_id: "toolu_read", content: "line about running in the background", is_error: false }],
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_read",
+          content: "line about running in the background",
+          is_error: false,
+        },
+      ],
       "assistant",
       "test-session",
       toolUseCache,
@@ -4252,9 +4273,7 @@ describe("tool_result_meta non-execution stamping", () => {
     );
 
     expect(notifications).toHaveLength(1);
-    expect((notifications[0].update as any)._meta.claudeCode).not.toHaveProperty(
-      "syntheticDenial",
-    );
+    expect((notifications[0].update as any)._meta.claudeCode).not.toHaveProperty("syntheticDenial");
   });
 
   it("leaves other non-execution kinds unmarked", () => {
@@ -4313,9 +4332,7 @@ describe("tool_result_meta non-execution stamping", () => {
     );
 
     expect(notifications).toHaveLength(1);
-    expect((notifications[0].update as any)._meta.claudeCode).not.toHaveProperty(
-      "syntheticDenial",
-    );
+    expect((notifications[0].update as any)._meta.claudeCode).not.toHaveProperty("syntheticDenial");
   });
 });
 
@@ -5690,9 +5707,7 @@ describe("resumedSubagentCardFromResult", () => {
   });
 
   it("ignores non-SendMessage tools, missing sidecars, and empty resumedAgentId", () => {
-    expect(
-      resumedSubagentCardFromResult(resultContent("agent_1"), sidecar, cache),
-    ).toBeUndefined();
+    expect(resumedSubagentCardFromResult(resultContent("agent_1"), sidecar, cache)).toBeUndefined();
     expect(
       resumedSubagentCardFromResult(resultContent("send_1"), undefined, cache),
     ).toBeUndefined();

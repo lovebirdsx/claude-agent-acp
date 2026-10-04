@@ -514,7 +514,8 @@ export async function getAvailableModels(
   // setModel call so we don't drift from the user's intended pin.
   const sdkSawSameValue = sdkModels.some((m) => m.value === currentModel.value);
   const skipSetModel =
-    resolvedFromInput === undefined || (currentModel.value === resolvedFromInput && sdkSawSameValue);
+    resolvedFromInput === undefined ||
+    (currentModel.value === resolvedFromInput && sdkSawSameValue);
   if (!skipSetModel) {
     const setModelStartedAt = performance.now();
     try {

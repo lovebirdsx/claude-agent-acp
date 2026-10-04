@@ -31,11 +31,7 @@ import {
 } from "../tools.js";
 import { toolUpdateFromDiffToolResponse } from "../diff.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
-import {
-  buildMidturnRows,
-  createMidturnCostLedger,
-  type SessionCostRow,
-} from "../session-cost.js";
+import { buildMidturnRows, createMidturnCostLedger, type SessionCostRow } from "../session-cost.js";
 import {
   toAcpNotifications,
   promptToClaude,
@@ -509,7 +505,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
         "_universe/compaction",
         (params) => params as { id: string; phase: string; reason?: string },
         (c) => {
-          client.compactionNotifications.push(c.params)
+          client.compactionNotifications.push(c.params);
         },
       )
       .onRequest(methods.client.session.requestPermission, (c) =>
@@ -8174,7 +8170,7 @@ describe("stop reason propagation", () => {
       sessionUpdate: async (u: any) => {
         sessionUpdates.push(u);
       },
-    extNotification: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
 
@@ -11262,7 +11258,12 @@ describe("universe-editor/rewind_session (rewindSession)", () => {
     );
     expect(replay).toHaveBeenCalledWith("test-session", undefined, undefined, "sdk-uuid-7");
     // Reported as a successful rewind with no file changes.
-    expect(result).toMatchObject({ canRewind: true, filesChanged: [], insertions: 0, deletions: 0 });
+    expect(result).toMatchObject({
+      canRewind: true,
+      filesChanged: [],
+      insertions: 0,
+      deletions: 0,
+    });
   });
 
   it("dry run still previews files even when rewindFiles is false", async () => {
@@ -11322,11 +11323,19 @@ describe("universe-editor/rewind_session (rewindSession)", () => {
         supportedEffortLevels: ["low", "medium", "high"],
       },
     ];
-    const modes = { currentModeId: "default", availableModes: [{ id: "default", name: "Default", description: "" }] };
+    const modes = {
+      currentModeId: "default",
+      availableModes: [{ id: "default", name: "Default", description: "" }],
+    };
     session.models = models as any;
     session.modelInfos = modelInfos as any;
     session.modes = modes as any;
-    session.configOptions = buildConfigOptions(modes as any, models as any, modelInfos as any, "high");
+    session.configOptions = buildConfigOptions(
+      modes as any,
+      models as any,
+      modelInfos as any,
+      "high",
+    );
 
     // Isolate step 2 so we control what the recreated session looks like.
     vi.spyOn(agent as any, "teardownSession").mockResolvedValue(undefined);
@@ -11353,10 +11362,15 @@ describe("universe-editor/rewind_session (rewindSession)", () => {
         modelInfos,
         modes,
         // Rebuilt at the default effort for the default model.
-        configOptions: buildConfigOptions(modes as any, {
-          currentModelId: "claude-fable-5",
-          availableModels: models.availableModels,
-        } as any, modelInfos as any, "default"),
+        configOptions: buildConfigOptions(
+          modes as any,
+          {
+            currentModelId: "claude-fable-5",
+            availableModels: models.availableModels,
+          } as any,
+          modelInfos as any,
+          "default",
+        ),
       });
       agent.sessions["test-session"] = recreated;
       return {} as any;
@@ -11397,7 +11411,9 @@ describe("universe-editor/rewind_session (rewindSession)", () => {
       currentModelId: "claude-haiku-4-5",
       availableModels: [{ modelId: "claude-haiku-4-5", name: "Claude Haiku 4.5" }],
     };
-    const modelInfos = [{ value: "claude-haiku-4-5", displayName: "Claude Haiku 4.5", description: "" }];
+    const modelInfos = [
+      { value: "claude-haiku-4-5", displayName: "Claude Haiku 4.5", description: "" },
+    ];
     const modes = { currentModeId: "bypassPermissions", availableModes };
     session.models = models as any;
     session.modelInfos = modelInfos as any;
@@ -11472,7 +11488,10 @@ describe("universe-editor/rewind_session (rewindSession)", () => {
       { value: "claude-fable-5", displayName: "Claude Fable 5", description: "" },
       { value: "claude-opus-4-8", displayName: "Claude Opus 4.8", description: "" },
     ];
-    const modes = { currentModeId: "default", availableModes: [{ id: "default", name: "Default", description: "" }] };
+    const modes = {
+      currentModeId: "default",
+      availableModes: [{ id: "default", name: "Default", description: "" }],
+    };
     session.models = models as any;
     session.modelInfos = modelInfos as any;
     session.modes = modes as any;
@@ -11493,10 +11512,14 @@ describe("universe-editor/rewind_session (rewindSession)", () => {
         models: { currentModelId: "claude-fable-5", availableModels: models.availableModels },
         modelInfos,
         modes,
-        configOptions: buildConfigOptions(modes as any, {
-          currentModelId: "claude-fable-5",
-          availableModels: models.availableModels,
-        } as any, modelInfos as any),
+        configOptions: buildConfigOptions(
+          modes as any,
+          {
+            currentModelId: "claude-fable-5",
+            availableModels: models.availableModels,
+          } as any,
+          modelInfos as any,
+        ),
       });
       agent.sessions["test-session"] = recreated;
       return {} as any;
@@ -11681,9 +11704,21 @@ describe("unstable_forkSession fork point (excludes anchored user turn)", () => 
     session.messageIdToUuid.set("acp-user-3", "uuid-user-3");
     vi.mocked(getSessionMessages).mockResolvedValueOnce([
       { type: "user", uuid: "uuid-user-1", session_id: "s", message: {}, parent_tool_use_id: null },
-      { type: "assistant", uuid: "uuid-asst-1", session_id: "s", message: {}, parent_tool_use_id: null },
+      {
+        type: "assistant",
+        uuid: "uuid-asst-1",
+        session_id: "s",
+        message: {},
+        parent_tool_use_id: null,
+      },
       { type: "user", uuid: "uuid-user-2", session_id: "s", message: {}, parent_tool_use_id: null },
-      { type: "assistant", uuid: "uuid-asst-2", session_id: "s", message: {}, parent_tool_use_id: null },
+      {
+        type: "assistant",
+        uuid: "uuid-asst-2",
+        session_id: "s",
+        message: {},
+        parent_tool_use_id: null,
+      },
       { type: "user", uuid: "uuid-user-3", session_id: "s", message: {}, parent_tool_use_id: null },
     ] as any);
 
@@ -11720,7 +11755,13 @@ describe("unstable_forkSession fork point (excludes anchored user turn)", () => 
     session.messageIdToUuid.set("acp-user-1", "uuid-user-1");
     vi.mocked(getSessionMessages).mockResolvedValueOnce([
       { type: "user", uuid: "uuid-user-1", session_id: "s", message: {}, parent_tool_use_id: null },
-      { type: "assistant", uuid: "uuid-asst-1", session_id: "s", message: {}, parent_tool_use_id: null },
+      {
+        type: "assistant",
+        uuid: "uuid-asst-1",
+        session_id: "s",
+        message: {},
+        parent_tool_use_id: null,
+      },
     ] as any);
 
     await agent.unstable_forkSession({
@@ -15174,7 +15215,9 @@ describe("assembled assistant text fallback", () => {
           sessionId: "test-session",
           prompt: [{ type: "text", text: "/compact" }],
         });
-        expect(createSessionSpy).toHaveBeenCalledWith(expect.anything(), { resume: "test-session" });
+        expect(createSessionSpy).toHaveBeenCalledWith(expect.anything(), {
+          resume: "test-session",
+        });
 
         // The resurrection starts a fresh compaction lifecycle: the killed
         // turn's interruption guard is gone, so unlike the same-query flow a
@@ -18331,20 +18374,26 @@ describe("post-error recovery", () => {
     // The next prompt lazily resurrects the session from its transcript, so
     // swap in a healthy stand-in and let /compact land there instead.
     releaseWedge();
-    const createSessionSpy = vi.spyOn(agent as any, "createSession").mockImplementation(async () => {
-      injectGeneratorSession(agent, (input) => {
-        async function* healthy() {
-          const iter = input[Symbol.asyncIterator]();
-          const next = await iter.next();
-          if (next.done) return;
-          yield userEcho(next.value);
-          yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
-          yield { type: "system", subtype: "session_state_changed", state: "idle" };
-        }
-        return healthy();
+    const createSessionSpy = vi
+      .spyOn(agent as any, "createSession")
+      .mockImplementation(async () => {
+        injectGeneratorSession(agent, (input) => {
+          async function* healthy() {
+            const iter = input[Symbol.asyncIterator]();
+            const next = await iter.next();
+            if (next.done) return;
+            yield userEcho(next.value);
+            yield createResultMessage({
+              subtype: "success",
+              stop_reason: "end_turn",
+              is_error: false,
+            });
+            yield { type: "system", subtype: "session_state_changed", state: "idle" };
+          }
+          return healthy();
+        });
+        return { sessionId: "test-session", modes: {}, configOptions: [] } as any;
       });
-      return { sessionId: "test-session", modes: {}, configOptions: [] } as any;
-    });
     const compact = agent.prompt({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "/compact" }],
@@ -22440,10 +22489,12 @@ describe("session/cancel wedge recovery (issue #680)", () => {
     await new Promise((r) => setTimeout(r, 5));
 
     // The resurrection swaps in a healthy query via createSession({ resume }).
-    const createSessionSpy = vi.spyOn(agent as any, "createSession").mockImplementation(async () => {
-      installHealthySession(agent);
-      return { sessionId: "test-session", modes: {}, configOptions: [] } as any;
-    });
+    const createSessionSpy = vi
+      .spyOn(agent as any, "createSession")
+      .mockImplementation(async () => {
+        installHealthySession(agent);
+        return { sessionId: "test-session", modes: {}, configOptions: [] } as any;
+      });
 
     await expect(stuck).resolves.toMatchObject({ stopReason: "cancelled" });
     await expect(followUp).resolves.toMatchObject({ stopReason: "end_turn" });
@@ -22489,10 +22540,12 @@ describe("session/cancel wedge recovery (issue #680)", () => {
     expect(close).toHaveBeenCalled();
     expect(agent.sessions["test-session"].queryWedged).toBe(true);
 
-    const createSessionSpy = vi.spyOn(agent as any, "createSession").mockImplementation(async () => {
-      installHealthySession(agent);
-      return { sessionId: "test-session", modes: {}, configOptions: [] } as any;
-    });
+    const createSessionSpy = vi
+      .spyOn(agent as any, "createSession")
+      .mockImplementation(async () => {
+        installHealthySession(agent);
+        return { sessionId: "test-session", modes: {}, configOptions: [] } as any;
+      });
 
     const followUp = agent.prompt({
       sessionId: "test-session",
@@ -24864,8 +24917,7 @@ describe("rebuildTranscriptDisplayChain (compaction-crossing history)", () => {
 
 describe("replaySessionHistory across compaction (full transcript replay)", () => {
   type ReplayEvent =
-    | { kind: "user" | "agent"; text: string }
-    | { kind: "compaction"; phase: unknown };
+    { kind: "user" | "agent"; text: string } | { kind: "compaction"; phase: unknown };
 
   function createRecordingAgent() {
     const events: ReplayEvent[] = [];
@@ -24898,11 +24950,7 @@ describe("replaySessionHistory across compaction (full transcript replay)", () =
 
   beforeEach(async () => {
     sessionId = randomUUID();
-    projectDir = path.join(
-      claudeConfigDir(),
-      "projects",
-      `__compact_replay_test_${randomUUID()}`,
-    );
+    projectDir = path.join(claudeConfigDir(), "projects", `__compact_replay_test_${randomUUID()}`);
     await mkdir(projectDir, { recursive: true });
     transcript = path.join(projectDir, `${sessionId}.jsonl`);
     vi.mocked(getSessionMessages).mockClear();
@@ -24929,7 +24977,11 @@ describe("replaySessionHistory across compaction (full transcript replay)", () =
           type: "assistant",
           uuid: "a1",
           parentUuid: "u1",
-          message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "first answer" }] },
+          message: {
+            id: "msg_1",
+            role: "assistant",
+            content: [{ type: "text", text: "first answer" }],
+          },
         }),
         line({
           type: "system",
@@ -24945,7 +24997,10 @@ describe("replaySessionHistory across compaction (full transcript replay)", () =
           parentUuid: "cb",
           isCompactSummary: true,
           isVisibleInTranscriptOnly: true,
-          message: { role: "user", content: "This session is being continued from a previous conversation…" },
+          message: {
+            role: "user",
+            content: "This session is being continued from a previous conversation…",
+          },
         }),
         line({
           type: "user",
@@ -24957,7 +25012,11 @@ describe("replaySessionHistory across compaction (full transcript replay)", () =
           type: "assistant",
           uuid: "a2",
           parentUuid: "u2",
-          message: { id: "msg_2", role: "assistant", content: [{ type: "text", text: "second answer" }] },
+          message: {
+            id: "msg_2",
+            role: "assistant",
+            content: [{ type: "text", text: "second answer" }],
+          },
         }),
       ].join("\n") + "\n";
     await writeFile(transcript, content, "utf8");
@@ -25236,8 +25295,7 @@ describe("replaySessionHistory: tool_results forked off the display chain", () =
   // so the results of every EARLIER parallel use are unreachable on the chain —
   // the replayed session then leaves those tool cards pending forever.
   type ReplayEvent =
-    | { kind: "tool_call"; id: string }
-    | { kind: "tool_call_update"; id: string; status: unknown };
+    { kind: "tool_call"; id: string } | { kind: "tool_call_update"; id: string; status: unknown };
 
   function createRecordingAgent() {
     const events: ReplayEvent[] = [];
@@ -25307,13 +25365,19 @@ describe("replaySessionHistory: tool_results forked off the display chain", () =
         type: "user",
         uuid: "r1",
         parentUuid: "a1",
-        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "found head" }] },
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "t1", content: "found head" }],
+        },
       },
       {
         type: "user",
         uuid: "r2",
         parentUuid: "a2",
-        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: "found blame" }] },
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "t2", content: "found blame" }],
+        },
       },
     ];
     if (withBoundary) {
@@ -25377,7 +25441,10 @@ describe("replaySessionHistory: tool_results forked off the display chain", () =
             type: "user",
             uuid: "r2",
             session_id: "s",
-            message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: "found blame" }] },
+            message: {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: "t2", content: "found blame" }],
+            },
             parent_tool_use_id: null,
           },
         ] as any);
@@ -25515,11 +25582,7 @@ describe("replaySessionHistory: sub-agent stats restamped from the sub-agent tra
         },
       );
     }
-    await writeFile(
-      transcript,
-      rows.map((r) => JSON.stringify(r)).join("\n") + "\n",
-      "utf8",
-    );
+    await writeFile(transcript, rows.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
   }
 
   async function writeSubagentTranscript(agentId: string): Promise<void> {
@@ -25591,11 +25654,7 @@ describe("replaySessionHistory: sub-agent stats restamped from the sub-agent tra
 
   it("skips the restamp when the sidecar exceeds the file cap (never reads it into memory)", async () => {
     await writeMainTranscript(false, "big");
-    await writeFile(
-      path.join(subagentsDir, "agent-big.jsonl"),
-      "x".repeat(1024 * 1024),
-      "utf8",
-    );
+    await writeFile(path.join(subagentsDir, "agent-big.jsonl"), "x".repeat(1024 * 1024), "utf8");
 
     const { agent, stats } = createRecordingAgent();
     await (agent as any).restampReplayedSubagentStats(
@@ -25892,9 +25951,7 @@ describe("replaySessionHistory: sub-agent process replayed from the sub-agent tr
         message: {
           id: "msg_1",
           role: "assistant",
-          content: [
-            { type: "tool_use", id: "task_1", name: "Agent", input: { prompt: "go" } },
-          ],
+          content: [{ type: "tool_use", id: "task_1", name: "Agent", input: { prompt: "go" } }],
         },
       },
       {
@@ -25913,11 +25970,7 @@ describe("replaySessionHistory: sub-agent process replayed from the sub-agent tr
         },
       },
     ];
-    await writeFile(
-      transcript,
-      rows.map((r) => JSON.stringify(r)).join("\n") + "\n",
-      "utf8",
-    );
+    await writeFile(transcript, rows.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
   }
 
   async function writeSubagentProcessTranscript(agentId: string): Promise<void> {
@@ -26134,11 +26187,7 @@ describe("replaySessionHistory: main transcript replay byte cap", () => {
 
   beforeEach(async () => {
     sessionId = randomUUID();
-    projectDir = path.join(
-      claudeConfigDir(),
-      "projects",
-      `__main_replay_cap_test_${randomUUID()}`,
-    );
+    projectDir = path.join(claudeConfigDir(), "projects", `__main_replay_cap_test_${randomUUID()}`);
     await mkdir(projectDir, { recursive: true });
     transcript = path.join(projectDir, `${sessionId}.jsonl`);
     vi.mocked(getSessionMessages).mockClear();
@@ -26164,7 +26213,11 @@ describe("replaySessionHistory: main transcript replay byte cap", () => {
         type: "assistant",
         uuid: "a1",
         parentUuid: "u1",
-        message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: assistantTexts[0] }] },
+        message: {
+          id: "msg_1",
+          role: "assistant",
+          content: [{ type: "text", text: assistantTexts[0] }],
+        },
       }),
       line({
         type: "system",
@@ -26267,11 +26320,7 @@ describe("replaySessionHistory: queued_command (mid-turn steering) attachments",
 
   beforeEach(async () => {
     sessionId = randomUUID();
-    projectDir = path.join(
-      claudeConfigDir(),
-      "projects",
-      `__queued_replay_test_${randomUUID()}`,
-    );
+    projectDir = path.join(claudeConfigDir(), "projects", `__queued_replay_test_${randomUUID()}`);
     await mkdir(projectDir, { recursive: true });
     transcript = path.join(projectDir, `${sessionId}.jsonl`);
     vi.mocked(getSessionMessages).mockClear();
@@ -26408,7 +26457,11 @@ describe("replaySessionHistory: queued_command (mid-turn steering) attachments",
           type: "assistant",
           uuid: "a1",
           parentUuid: "u1",
-          message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "first answer" }] },
+          message: {
+            id: "msg_1",
+            role: "assistant",
+            content: [{ type: "text", text: "first answer" }],
+          },
         }),
         queuedCommandLine({}),
         line({
@@ -26639,7 +26692,10 @@ describe("mergeQueuedCommandAttachments", () => {
 describe("queuedCommandPromptToContent", () => {
   it("passes text blocks through", () => {
     expect(
-      queuedCommandPromptToContent([{ type: "text", text: "hello" }, { type: "text", text: "" }]),
+      queuedCommandPromptToContent([
+        { type: "text", text: "hello" },
+        { type: "text", text: "" },
+      ]),
     ).toEqual([{ type: "text", text: "hello" }]);
   });
 

@@ -96,7 +96,10 @@ describe("readExtraModelsMeta", () => {
   });
 
   it("skips non-string entries instead of failing", () => {
-    expect(readExtraModelsMeta({ extraModels: ["a", 42, null, { x: 1 }, "b"] })).toEqual(["a", "b"]);
+    expect(readExtraModelsMeta({ extraModels: ["a", 42, null, { x: 1 }, "b"] })).toEqual([
+      "a",
+      "b",
+    ]);
   });
 
   it("keeps a context-lane suffix verbatim", () => {
@@ -254,7 +257,11 @@ describe("appendExtraModelInfos", () => {
   });
 
   it("fills effort capability when the id hits the effort table", () => {
-    const out = appendExtraModelInfos([], ["deepseek-pro-v4"], new Map([["deepseek-pro-v4", ["low", "max"]]]));
+    const out = appendExtraModelInfos(
+      [],
+      ["deepseek-pro-v4"],
+      new Map([["deepseek-pro-v4", ["low", "max"]]]),
+    );
     expect(out[0]).toEqual({
       value: "deepseek-pro-v4",
       displayName: "deepseek-pro-v4",
@@ -337,10 +344,7 @@ describe("extras reach the picker (createSession's model pipeline)", () => {
 
   it("exempts extras from the settings availableModels allowlist", async () => {
     // The allowlist alone would leave only Default + sonnet.
-    const allowed = resolveAllowed(
-      { extraModels: ["deepseek-pro-v4"] },
-      ["claude-sonnet-4-6"],
-    );
+    const allowed = resolveAllowed({ extraModels: ["deepseek-pro-v4"] }, ["claude-sonnet-4-6"]);
     const { values } = await pickerOptions(allowed);
     expect(values).toContain("deepseek-pro-v4");
     expect(values).toContain("claude-sonnet-4-6");

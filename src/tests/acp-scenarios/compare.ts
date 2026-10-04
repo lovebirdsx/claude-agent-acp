@@ -314,9 +314,7 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
   const settlesLater = (toolCallId: unknown, at: number): boolean =>
     current.slice(at + 1).some((later) => {
       const update = updateOf(later);
-      return (
-        update !== undefined && backgroundSettle(update) && update.toolCallId === toolCallId
-      );
+      return update !== undefined && backgroundSettle(update) && update.toolCallId === toolCallId;
     });
 
   /** Whether `actual` carries the information of `wanted` under the rule. */

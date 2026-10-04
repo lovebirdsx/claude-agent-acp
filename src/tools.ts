@@ -341,7 +341,7 @@ export function resumedSubagentCardFromResult(
       cached.input !== null &&
       typeof cached.input === "object" &&
       typeof (cached.input as { message?: unknown }).message === "string"
-        ? ((cached.input as { message: string }).message)
+        ? (cached.input as { message: string }).message
         : "";
     if (messageText.length === 0) return undefined;
     return { toolCallId: b.tool_use_id, agentId, messageText };

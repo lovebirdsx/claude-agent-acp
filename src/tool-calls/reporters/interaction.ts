@@ -390,9 +390,7 @@ export class AgentControlReporter extends GenericReporter {
     const send = input as { summary?: unknown; message?: unknown } | undefined;
     return {
       title:
-        typeof send?.summary === "string" && send.summary.length > 0
-          ? send.summary
-          : "SendMessage",
+        typeof send?.summary === "string" && send.summary.length > 0 ? send.summary : "SendMessage",
       kind: "other",
       ...(typeof send?.message === "string" && send.message.length > 0
         ? { display: [textContent(send.message)] }

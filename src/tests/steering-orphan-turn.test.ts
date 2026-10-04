@@ -82,7 +82,8 @@ function installSession(
     { query: gen as any, input },
     agent,
     "test-session",
-  );  return input;
+  );
+  return input;
 }
 
 /** Race a prompt against a timeout; returns the resolved value or a timeout marker. */
