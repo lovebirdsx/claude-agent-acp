@@ -34,6 +34,31 @@ CLI 的 first-party 家族改写会把内置 Explore 子 agent 从网关模型�
 
 `_meta._universe/modelBreakdown` 原本只挂在 turn-final 的 `case "result"`（`modelUsage` 是 `SDKResultMessage` 独有字段），编辑器钱包读数因此整个 turn 冻结、只在对话结束才跳变。修法是在 `stream_event` 既有的中途 `usage_update` 发射处补上 per-model **token 明细（无 `costUSD`）**——编辑器自己按「token × 费率」定价，不需要 fork 给钱数。账本在新文件：`base`（最近一次权威 `result.modelUsage` 会话累计快照）⊕ `overlay`（本 turn 未被 result 确认的 per-model token），发射即合并、单调不回退；`result` 到达时权威快照覆盖 `base` 并清 overlay，不重不漏。六个必须处理的语义：① `session.subagentStats` 是**会话累计且从不清理**，折入前必须减去 per-turn baseline（`adoptAuthoritativeBreakdown` 在覆盖 base 的同时重取快照）；② autonomous result（task-notification）也走 turn-final 发射，清 overlay 会让金额**回退**，故 `clearOverlay: !isAutonomousResult`；③ Anthropic 的 `message_delta.usage` 是**累计快照非增量**，同 message id 的新快照**替换**旧贡献（无 id 的网关按 `message_start` 分配合成 key，**合成 key 必须在「全零快照早退」之前分配**——kimi/Moonshot 的前导帧全 0，否则 key 永不前进、后续每条无 id 消息覆盖首条）；④ **autonomous result 在用户 turn 在途时（`activeTurn` 未 settle）完全不 adopt**：它的会话累计快照已含该 turn 已完成的消息，而 overlay 也还持有它们，adopt 会中途双计、随后用户 turn 自己的 result 清 overlay 时金额**跳低**；⑤ 账本的 overlay key **不能复用 `currentStreamMessageId`**（它刻意不受 `parent_tool_use_id === null` 门控，chunk 分组需要子 agent 的 id），另设 `topLevelStreamMessageId` 只在顶层 `message_start` 赋值，否则在途顶层消息的后续 delta 会被记到子 agent 的 id 下、同一消息计两次；⑥ turn 激活（`resetTurnScratch`）时 `clearOverlay`——被取消的 turn 永远等不到清 overlay 的 result，其未确认 token 会残留并随反复取消累积。被 overlay 触及的行剥掉 `costUSD`（tokens 已变，旧单价是谎言），未触及的 base 行原样透传——否则官方订阅会话（无任何费率表）会把上一轮的权威 ¥ 全变成「—」，比现状更差。**已知限制**：账本是 `runConsumer` 局部，reconnect / agent 重启后首个恢复 turn 的 base 为空、只报本 turn token；编辑器侧据「中途金额只增不减」判定 base 缺失并冻结金额（`acpSession.ts` 的 usage_update 分支），turn-final 带 `cost` 仍无条件替换（rewind 向下修正照常生效）。配套测试 `tests/session-cost.test.ts` + `tests/acp-agent.test.ts` 的 4 个集成用例（rebase 注：场景 golden air/v2 随本改动重录，并在上游 `acp-scenarios/compare.ts` 的 origin-main 比对中新增「`usage_update` 携带适配器命名空间 `_meta` 键、其余字段相同即等价」一条允许。）
 
+## 上下文窗口后台刷新只在已开 turn 的会话执行（升级回归修复）
+
+（待提交）落点 `acp-agent.ts`（Session 增 `hasStartedTurn?`、`activateTurn` 置位、createSession 初始化 = `creationOpts.resume !== undefined`、`refreshContextWindowInBackground` 入口加闸）
+
+**症状**：rebase 上游 a44c486（0.64.x）后，父项目跨仓契约测试的 `session/new` → `set_config_option` 两腿（claude 与 codex）双双超 10s 默认用例超时；claude 腿实测 9~16s（旧版同机同 CLI 约 600ms）。（codex 腿的超时与本条无关，是**本机环境**：`~/.codex/auth.json` 存在时 app-server 在 `thread/start`/`model/list` 各花 ~10s/5s，删掉该文件或 CI 的干净 home 只花 ~50ms。）
+
+**根因**：**SDK 的控制请求在单条通道上串行**，而**首个 prompt turn 之前的 `getContextUsage` 不被 CLI 服务**（上游注释与 fork 旧记录一致的 issues #886/#880；CLI 2.1.220 实测要 5~8s 才返回，期间独占通道）。上游 `refreshContextWindowInBackground` 虽「不 await」，但它发起的请求同样占住通道，于是其后**第一个真实控制请求**（`setSessionConfigOption` 的 `setModel`、`applyFlagSettings` 等）排在它后面一起等——用户打开会话后立刻切模型/effort 会白等 5~8s。旧 fork 的 doctrine 正是「turn 前不发 `getContextUsage`」，本条是把该 doctrine 以最小改动恢复。
+
+**证据（独立探针，不经编辑器/契约测试；`CLAUDE_AGENT_LOGS` 分阶段日志 + stderr）**：
+
+1. 新版 dist：`newSession` 414ms（extraModels 注入本身不慢）；随后每次 `setSessionConfigOption` 5.4s / 5.3s，且**交替出现**——切回 `default` 也慢，排除「模型未知」因素。
+2. 会话建好后**等 30s** 再切换：第一次 4ms、第二次 8.0s → 说明慢的不是 `setModel` 本身，而是**上一个动作点燃的 `getContextUsage` 占住通道**（等它自己完成后再切就快；而每次模型切换又会重置窗口猜测、再点燃一次）。
+3. **隔离副本 A/B**：`/tmp` 下用旧 tip（`fork-tip-backup-wsl2`）源码重建 dist（同机、同 CLI 2.1.220、同 SDK 0.3.287、同环境变量），同序列 `setSessionConfigOption` 各 9ms → 确认系本次升级引入的回归，而非 CLI/环境。
+4. 修复后：同一探针 4ms/9ms，契约测试 claude 腿 1040ms 通过（标准 10s 超时，不加 `--testTimeout`）。
+
+**实现与保留的功能**：闸门 = 会话是否已开始过一个 turn（`activateTurn` 置位；resumed 会话创建时即为 true——它们的 transcript 已是进行中的会话，其 `getContextUsage` 本来就被服务，`reconcileResumedSessionModel` 依赖这一点）。turn 开始后（含 resumed）刷新照旧，上游「首个 result 之前用权威窗口纠正猜测」的意图保留在安全时段；首条 `result.modelUsage` 才是权威窗口，照旧写入跨会话缓存。**session/load 的「无阻塞控制往返」红线不受影响**（resumed 走 `reconcileResumedSessionModel`，本闸门只管 `refreshContextWindowInBackground` 的两个调用点）。配套测试：`tests/create-session-options.test.ts`（turn 前不发、turn 后照发）与 `tests/session-config-options.test.ts`（注入会话标 `hasStartedTurn: true` 后保持原断言）。契约测试那两条超时**不是**靠放宽超时修的，红线：契约测试必须能在默认 10s 内跑完。
+
+## 每 turn / compact_boundary 的 getContextUsage 刷新移除（上游已吸收）
+
+上游 a44c486 起自身已不在 result 处做 per-turn `getContextUsage`（改用 `modelUsage.contextWindow` + 本地 `resolveAutoCompactWindow` clamp），compact_boundary 改用 `compact_metadata.post_tokens`（比 fork 的 used:0 近似更准），`fetchContextUsage` 助手随之不存在。fork 这条改动整体被上游吸收，不再单列；唯一保留相关的是上游新增的 `refreshContextWindowInBackground`（仅在窗口非权威时后台跑一次，不等不阻塞）——它的「不阻塞」在本 CLI 上并不成立，见上一条。日后 rebase 若上游又在 result / compact_boundary 处引入同步 `getContextUsage`，按本条删。
+
+## AskUserQuestion「选项+备注共存」（上游已吸收）
+
+上游 a44c486 起 `applyAskElicitationResponse` 已实现同一意图——单选且已选中选项时，自由文本落 `annotations[question].notes`（原先 custom-wins 会吞掉已选项）；多选并入所选；无选择时文本即答案。fork 原有的 `"(notes only)"` 哨兵等子分支已在 rebase 时删去（源文件与测试整段切回上游）。日后 rebase 若此处再冲突，按上游语义走，勿重新加回。
+
 ## 官方订阅额度用量
 
 （待提交）落点 **`usage.ts`(新文件)** + `acp-agent.ts`
