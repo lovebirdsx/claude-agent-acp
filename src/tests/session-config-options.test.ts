@@ -125,6 +125,9 @@ describe("session config options", () => {
       })),
       configOptions: structuredClone(MOCK_CONFIG_OPTIONS),
       contextWindowSize: 200000,
+      // 这些会话代表已过首个 turn 的活动会话：fork 仅在此时放行后台窗口刷新
+      // （turn 前的 getContextUsage 会占住串行控制通道）。
+      hasStartedTurn: true,
       toolUseCache: {},
       emittedToolCalls: new Set(),
     };

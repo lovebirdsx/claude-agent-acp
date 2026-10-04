@@ -1007,37 +1007,74 @@ describe("createSession options merging", () => {
       return (agent as unknown as { sessions: Record<string, any> }).sessions[sessionId];
     }
 
-    it("does not wait for getContextUsage during session creation", async () => {
-      // SDK control requests are serialized and getContextUsage used to stall
-      // until the first prompt turn, so session/new only kicks it off —
-      // awaiting it inline is what regressed session/new latency in 0.59.0.
+    it("issues no getContextUsage before the session's first turn", async () => {
+      // fork 语义：SDK 控制请求单通道串行，新会话的 getContextUsage 在首个 turn
+      // 之前不被 CLI 服务（#886/#880，CLI 2.1.220 实测占通道 5~8s），其后第一个
+      // 控制请求（setModel 等）会一起排队——契约测试的 `session/new` +
+      // `set_config_option` 两腿正是因此超 10s。升级前的 fork 不在 turn 前发
+      // getContextUsage，保持该语义；权威窗口交给首条 result 的 modelUsage。
+      initModels = [
+        { value: "claude-sonnet-4-6", displayName: "Sonnet", description: "Fast" },
+        { value: "claude-opus-4-5", displayName: "Opus", description: "Capable" },
+      ];
       const ctxSpy = vi.fn(() => new Promise<never>(() => {}));
       contextUsageResult = ctxSpy;
 
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await new Promise((resolve) => setImmediate(resolve));
 
-      expect(ctxSpy).toHaveBeenCalledOnce();
+      expect(ctxSpy).not.toHaveBeenCalled();
       expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
+
+      // 首个 turn 前的模型切换同理：其 setModel 会排在卡住的请求后面。
+      await agent.setSessionConfigOption({
+        sessionId: response.sessionId,
+        configId: "model",
+        value: "claude-opus-4-5",
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(ctxSpy).not.toHaveBeenCalled();
+      expect(sessionFor(response.sessionId).models.currentModelId).toBe("claude-opus-4-5");
     });
 
-    it("refines a guessed window from getContextUsage in the background", async () => {
-      // The mock model ("claude-sonnet-4-6" / "Claude Sonnet" / "Fast") carries
-      // no "1m" token anywhere, so inference misses and the seed is the default
-      // until the background getContextUsage answers.
+    it("refines a guessed window from getContextUsage in the background once a turn has started", async () => {
+      // 已开 turn 后 CLI 会服务控制请求，刷新恢复廉价——上游的窗口纠正在安全时段保留。
+      initModels = [
+        { value: "claude-sonnet-4-6", displayName: "Sonnet", description: "Fast" },
+        { value: "claude-opus-4-5", displayName: "Opus", description: "Capable" },
+      ];
       contextUsageResult = async () => ({ rawMaxTokens: 967000 });
 
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      sessionFor(response.sessionId).hasStartedTurn = true;
+
+      await agent.setSessionConfigOption({
+        sessionId: response.sessionId,
+        configId: "model",
+        value: "claude-opus-4-5",
+      });
 
       await vi.waitFor(() => expect(sessionFor(response.sessionId).contextWindowSize).toBe(967000));
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(true);
     });
 
     it("keeps the guessed window when getContextUsage reports a non-positive size", async () => {
+      initModels = [
+        { value: "claude-sonnet-4-6", displayName: "Sonnet", description: "Fast" },
+        { value: "claude-opus-4-5", displayName: "Opus", description: "Capable" },
+      ];
       const ctxSpy = vi.fn(async () => ({ rawMaxTokens: 0 }));
       contextUsageResult = ctxSpy;
 
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      sessionFor(response.sessionId).hasStartedTurn = true;
+      await agent.setSessionConfigOption({
+        sessionId: response.sessionId,
+        configId: "model",
+        value: "claude-opus-4-5",
+      });
       await vi.waitFor(() => expect(ctxSpy).toHaveBeenCalled());
       await new Promise((resolve) => setImmediate(resolve));
 

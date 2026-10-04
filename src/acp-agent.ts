@@ -1456,9 +1456,9 @@ export type Session = {
    *  before the turn's first result message arrives. Seeded synchronously at
    *  session creation and on model switches from the per-model cache or the
    *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss), refined by a
-   *  background `getContextUsage` when that seed was a guess (see
-   *  `refreshContextWindowInBackground`), then confirmed — and the cache
-   *  populated — by each result's modelUsage. On session/load the resumed
+   *  background `getContextUsage` when that seed was a guess（仅限已开 turn 的
+   *  会话，见 `hasStartedTurn`）, then confirmed — and the cache populated — by
+   *  each result's modelUsage. On session/load the resumed
    *  session's `getContextUsage` report also corrects the model and adopts the
    *  window/occupancy from the background reconciliation
    *  (`reconcileResumedSessionModel`). No awaited IPC is on these paths (see
@@ -1472,6 +1472,10 @@ export type Session = {
    *  happens to equal DEFAULT_CONTEXT_WINDOW must not be mistaken for "unseeded"
    *  and clobbered by a "1m" text match. */
   contextWindowAuthoritative: boolean;
+  /** 本会话是否已开始过 turn：resumed 会话在创建时即为 true（其 transcript
+   *  已是进行中的对话），activateTurn 置位。缺席按「未开始」处理，即
+   *  {@link refreshContextWindowInBackground} 闸门保守的一侧。 */
+  hasStartedTurn?: boolean;
   /** Stable identifier of the LLM backend this session's query was created
    *  against, derived from the routing-relevant vars of the exact `env` handed
    *  to the SDK at query creation (see {@link providerCacheKeyFor}). The context
@@ -5020,6 +5024,7 @@ export class ClaudeAcpAgent {
      *  result isn't wrongly skipped. */
     const activateTurn = (turn: Turn) => {
       session.activeTurn = turn;
+      session.hasStartedTurn = true;
       session.cancelled = false;
       compaction.resume();
       if (turn.localCommand?.startsAtActivation) ensureLocalCommandMarkdown(turn);
@@ -11117,6 +11122,12 @@ export class ClaudeAcpAgent {
    */
   private refreshContextWindowInBackground(sessionId: string, session: Session): void {
     if (session.contextWindowAuthoritative) return;
+    // fork 闸门：SDK 控制请求单通道串行，且 turn 之前的 getContextUsage 不被
+    // CLI 服务（#886/#880，CLI 2.1.220 实测占住通道 5~8s），期间发出的控制请求
+    // （setModel / applyFlagSettings 等）都排在它后面——用户打开会话后首次切
+    // 模型 / effort 会白等。等会话已开 turn 再刷新（resumed 会话本就会被服务），
+    // 权威窗口无论如何仍由首条 result 的 modelUsage 落地。
+    if (!session.hasStartedTurn) return;
     const { query } = session;
     const modelId = session.models.currentModelId;
     const stillCurrent = () =>
@@ -12305,6 +12316,7 @@ export class ClaudeAcpAgent {
         forwardSubagentText,
         contextWindowSize: seededWindow.size,
         contextWindowAuthoritative: seededWindow.authoritative,
+        hasStartedTurn: creationOpts.resume !== undefined,
         providerCacheKey,
         taskState,
         subagentStats: new Map(),
