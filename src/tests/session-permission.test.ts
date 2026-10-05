@@ -104,3 +104,95 @@ describe("session permission updates", () => {
     ).toHaveLength(1);
   });
 });
+
+/**
+ * The `clientMayAutoApproveOnce` bit tells a non-AIR host whether it may answer
+ * a plan-mode ask with "yes, once" on the user's behalf. It is positive on
+ * purpose: a host that never sees the field keeps prompting.
+ */
+describe("permission request auto-approve marker", () => {
+  let agent: ClaudeAcpAgent;
+  let capturedPermissionRequest: any;
+
+  async function askBash(extra: Record<string, unknown> = {}): Promise<any> {
+    await (agent as any).canUseTool(SESSION_ID)(
+      "Bash",
+      { command: "ls" },
+      { signal: new AbortController().signal, toolUseID: "toolu_1", ...extra },
+    );
+    return capturedPermissionRequest;
+  }
+
+  function markerOf(request: any): unknown {
+    return request?.toolCall?._meta?.claudeCode?.clientMayAutoApproveOnce;
+  }
+
+  beforeEach(() => {
+    capturedPermissionRequest = null;
+    const client = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: any) => {
+        capturedPermissionRequest = params;
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
+      },
+    } as unknown as AcpClient;
+    agent = new ClaudeAcpAgent(client);
+    agent.sessions[SESSION_ID] = {
+      query: makeMockQuery(),
+      cwd: process.cwd(),
+      modes: { currentModeId: "plan", availableModes: [{ id: "plan", name: "Plan" }] },
+      models: { currentModelId: "opus", availableModels: [] },
+      modelInfos: [],
+      configOptions: [],
+      emittedToolCalls: new Set(["toolu_1"]),
+      contextWindowSize: 200_000,
+      toolUseCache: {},
+    } as any;
+  });
+
+  it("allows a plain ask the client never has to show", async () => {
+    const request = await askBash({ suggestions: [] });
+
+    expect(markerOf(request)).toBe(true);
+    expect(request.toolCall._meta.claudeCode).toEqual({ clientMayAutoApproveOnce: true });
+  });
+
+  it("withholds the marker when the CLI asked to open on the decline option", async () => {
+    const request = await askBash({ suggestions: [], defaultToNo: true });
+
+    expect(markerOf(request)).toBe(false);
+    expect(request.options[0].kind).toBe("reject_once");
+  });
+
+  it("withholds the marker when the durable rule is suppressed", async () => {
+    const request = await askBash({ suggestions: [], suppressAlwaysAllowRule: true });
+
+    expect(markerOf(request)).toBe(false);
+  });
+
+  it("withholds the marker and flags the user's own ask rule", async () => {
+    const request = await askBash({
+      suggestions: [],
+      matchedAskRule: { source: "projectSettings", toolName: "Bash" },
+    });
+
+    expect(markerOf(request)).toBe(false);
+    expect(request.toolCall._meta.claudeCode.matchedAskRule).toBe(true);
+  });
+
+  it("keeps the marker on an ask the CLI offered a durable rule for", async () => {
+    const request = await askBash({
+      suggestions: [
+        {
+          type: "addRules",
+          rules: [{ toolName: "Bash", ruleContent: "ls:*" }],
+          behavior: "allow",
+          destination: "localSettings",
+        },
+      ],
+    });
+
+    expect(markerOf(request)).toBe(true);
+    expect(request.options.map((option: any) => option.optionId)).toContain("allow-with-updates");
+  });
+});

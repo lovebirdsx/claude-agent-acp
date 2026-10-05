@@ -28,6 +28,10 @@
  *   adds to a `usage_update`, whose other fields are the same. The capability
  *   keys the adapter advertises on `initialize` (`universe-editor/capabilities`)
  *   are the same kind of difference, on a message that is not a session update.
+ * - A `_meta.claudeCode` key that only the adapter writes (see
+ *   {@link ADAPTER_CLAUDE_CODE_KEYS}): the auto-approve marker and the ask-rule
+ *   flag it puts on a permission request's tool call, which origin/main never
+ *   sent to a client that is not AIR.
  * - The mode catalog on a session-setup payload (`newSession` / `loadSession`)
  *   lists the `dontAsk` entry the adapter adds for the editor's read-only side
  *   tasks (see {@link ADDED_MODE_ID}). origin/main never advertised it.
@@ -60,6 +64,11 @@ export const AIR_ONLY_META_KEYS = new Set([
 
 /** The `_meta.claudeCode` keys that exist only for AIR. */
 export const AIR_ONLY_CLAUDE_CODE_KEYS = new Set(["title", "subagent", "skill", "skillPath"]);
+
+/** The `_meta.claudeCode` keys that only the adapter adds, on the tool call of
+ *  a permission request: whether a host may answer "yes, once" on the user's
+ *  behalf, and whether the user's own ask rule forced the prompt. */
+export const ADAPTER_CLAUDE_CODE_KEYS = new Set(["clientMayAutoApproveOnce", "matchedAskRule"]);
 
 /** The names of the commands that the adapter adds to `available_commands_update`. */
 export const ADAPTER_COMMANDS = new Set(["mcp"]);
@@ -119,7 +128,9 @@ export function withoutAirOnlyKeys(value: unknown): unknown {
         if (AIR_ONLY_META_KEYS.has(metaKey) || adapterMetaKey(metaKey)) continue;
         if (metaKey === "claudeCode" && metaValue && typeof metaValue === "object") {
           const claudeCode = Object.fromEntries(
-            Object.entries(metaValue as Json).filter(([k]) => !AIR_ONLY_CLAUDE_CODE_KEYS.has(k)),
+            Object.entries(metaValue as Json).filter(
+              ([k]) => !AIR_ONLY_CLAUDE_CODE_KEYS.has(k) && !ADAPTER_CLAUDE_CODE_KEYS.has(k),
+            ),
           );
           if (Object.keys(claudeCode).length > 0) meta[metaKey] = withoutAirOnlyKeys(claudeCode);
           continue;
@@ -186,6 +197,7 @@ function flatten(update: Json): Map<string, string> {
     if (adapterMetaKey(key)) continue;
     if (key === "claudeCode" && value && typeof value === "object") {
       for (const [k, v] of Object.entries(value as Json)) {
+        if (ADAPTER_CLAUDE_CODE_KEYS.has(k)) continue;
         flat.set(`_meta.claudeCode.${k}`, canonical(v));
       }
     } else {

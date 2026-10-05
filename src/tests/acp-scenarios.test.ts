@@ -513,13 +513,18 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
       }
       const [childRequest] = permissionRequests(zed("subagent-task-legacy"));
       expect(childRequest.toolCall._meta).toEqual({
-        claudeCode: { toolName: "Bash", parentToolUseId: "toolu_task" },
+        claudeCode: {
+          toolName: "Bash",
+          parentToolUseId: "toolu_task",
+          clientMayAutoApproveOnce: true,
+        },
       });
       const [mcpRequest] = permissionRequests(zed("mcp-tool"));
       expect(mcpRequest.toolCall._meta).toEqual({
         claudeCode: {
           toolName: "mcp__docs__search",
           mcpServer: { name: "docs", source: "project" },
+          clientMayAutoApproveOnce: true,
         },
       });
     });

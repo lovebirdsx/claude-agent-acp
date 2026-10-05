@@ -567,6 +567,7 @@ The client already has the rest of the tool call, because the adapter sends the 
 
 A client that is not AIR gets the upstream request `toolCall`: `toolCallId`, `name`, `status: pending`, the whole `rawInput`, `title`, `kind`, `content`, and `locations`.
 Its `_meta.claudeCode` carries `toolName`, and `parentToolUseId` for a subagent tool call, next to `mcpServer`.
+The fork also stamps `clientMayAutoApproveOnce: true` when nothing in the ask requires a human answer (no `defaultToNo`, no suppressed always-allow rule, no ask rule of the user), which is what lets a host answer `allow-once` on the user's behalf; an absent key means the host must ask. `matchedAskRule: true` rides beside it whenever the user's own `ask` rule forced the prompt. The stamping fork always writes a boolean, whatever the session mode, so a host can tell "the CLI wants a human" (`false`) from "an older build" (absent). AIR reads the same facts in `_meta.jetbrains.air.permission` and gets neither key.
 A Sandbox Network or Computer Use request without content shows its input as a JSON code block.
 
 Compact text removes control characters, collapses whitespace where it is safe, and enforces length limits.

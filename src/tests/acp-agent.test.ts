@@ -5531,7 +5531,9 @@ describe("subagent permission attribution (issue #851)", () => {
       _meta: { claudeCode: { parentToolUseId: "toolu_parent" } },
     });
     expect(requests[0].sessionId).toBe("session-1");
-    // The tool_call carries the parent. The request does not repeat it.
+    // The tool_call carries the parent. The request does not repeat it, and AIR
+    // gets neither the fork's auto-approve marker (its own `_meta` carries the
+    // hint instead).
     expect(requests[0].toolCall._meta).toBeUndefined();
   });
 
@@ -5551,7 +5553,7 @@ describe("subagent permission attribution (issue #851)", () => {
     });
   });
 
-  it("omits permission _meta for a root tool without MCP provenance", async () => {
+  it("stamps the auto-approve marker for a root tool without MCP provenance", async () => {
     const { agent, requests } = setup();
 
     await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
@@ -5560,7 +5562,9 @@ describe("subagent permission attribution (issue #851)", () => {
       toolUseID: "toolu_plain",
     } as any);
 
-    expect(requests[0].toolCall._meta).toBeUndefined();
+    expect(requests[0].toolCall._meta).toEqual({
+      claudeCode: { clientMayAutoApproveOnce: true },
+    });
   });
 
   it("forwards child elicitation to the root when native subagents were not negotiated", async () => {
@@ -5614,7 +5618,11 @@ describe("subagent permission attribution (issue #851)", () => {
       sessionUpdate: "tool_call",
       toolCallId: "toolu_sub",
     });
-    expect(requests[0].toolCall._meta).toBeUndefined();
+    // The attribution is the only thing withheld: the ask still carries the
+    // fork's auto-approve marker.
+    expect(requests[0].toolCall._meta).toEqual({
+      claudeCode: { clientMayAutoApproveOnce: true },
+    });
     // The task_id === agentID invariant is undocumented SDK behavior; a miss
     // must be observable so an SDK bump that breaks it doesn't regress silently.
     expect(log).toHaveBeenCalledWith(expect.stringContaining("agent-unknown"));

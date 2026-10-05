@@ -31,6 +31,7 @@
 - **官方订阅额度用量**（**`usage.ts`(新)** `acp-agent.ts`）：`SUBSCRIPTION_USAGE_METHOD`；SDK `usage_EXPERIMENTAL...` **必须运行时特性探测**，不能静态调用；`subscription_type: null` 是**正常值**。详见 [cases-session.md](cases-session.md)
 - **SendMessage 续跑子 Agent 的 live 重定向 + replay 分段回放**（`tools.ts` `acp-agent.ts`）：live：`redirectParentToolUseId` 原地改写 `parent_tool_use_id`；replay：`splitSubagentTranscriptByResumes` 按段分卡。详见 [cases-subagent.md](cases-subagent.md)
 - **resume 回放重放子代理执行过程**（`tools.ts` `acp-agent.ts`）：回放结束后**异步**（不阻塞 load）读 `<session>/subagents/agent-<id>.jsonl` 回灌成与 live 同形状嵌套通知；user 行只保留 tool_result。详见 [cases-subagent.md](cases-subagent.md)
+- **权限询问的自动批准标记**（`acp-agent.ts`（纯追加 17 行）`docs/air-extensions.md`）：非 AIR 的权限请求 `toolCall._meta.claudeCode` 补 `clientMayAutoApproveOnce`（肯定式：缺字段=要人回答）与 `matchedAskRule` 否决位。详见 [cases-permissions.md](cases-permissions.md)
 - **落盘 entrypoint 默认 `universe-editor`**（`acp-agent.ts` `src/tests/create-session-options.test.ts`）：条件注入 `CLAUDE_CODE_ENTRYPOINT`（显式设置优先）；**不能用 `cli`**——CLI 强制改写为 `sdk-cli` 再被 /resume 过滤
 - **resume 回放恢复子代理用量 stats**（`tools.ts` `acp-agent.ts`）：回放结束异步从 transcript 逐轮累计重建，补发 `_meta._universe/subagentStats`。**勿用 sidecar 自带 `usage`/`totalTokens`——只覆盖最后一次 API 调用，低估几十倍**。详见 [cases-subagent.md](cases-subagent.md)
 - **子代理 usage 按 message.id 去重 + live Task 完成时 transcript restamp**（`tools.ts` `acp-agent.ts`）：每帧 usage 是**快照非增量**，同 message.id 新快照替换旧贡献；kimi 等流内无 usage 的网关靠 restamp 在 live 收尾拿到真实价格。详见 [cases-subagent.md](cases-subagent.md)

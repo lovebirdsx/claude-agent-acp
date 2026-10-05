@@ -10722,6 +10722,23 @@ export class ClaudeAcpAgent {
         };
       }
 
+      // fork: a non-AIR client also gets the ask's own hints, not only the
+      // subagent/MCP provenance above. `clientMayAutoApproveOnce` is the positive
+      // form of "nothing here requires a human answer" (the CLI asked for no
+      // decline-first prompt and suppressed no always-allow rule): a host that
+      // silently answers "yes, once" while planning keys off this bit, and an
+      // absent bit keeps it prompting. AIR receives the same facts in
+      // `request._meta.jetbrains.air.permission` instead. Written as a separate
+      // merge so the block above stays byte-identical to upstream.
+      if (!airClient) {
+        const meta = presentation.toolCall._meta ?? {};
+        const claudeCode = (meta.claudeCode ?? {}) as Record<string, unknown>;
+        claudeCode.clientMayAutoApproveOnce = defaultToNo !== true && !noPersistentRule;
+        if (matchedAskRule !== undefined) claudeCode.matchedAskRule = true;
+        meta.claudeCode = claudeCode;
+        presentation.toolCall._meta = meta;
+      }
+
       const permissionOptions = buildClaudePermissionOptions({
         toolName,
         displayName,
