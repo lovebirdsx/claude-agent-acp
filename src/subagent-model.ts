@@ -9,12 +9,18 @@ import { SettingsManager } from "./settings.js";
  * sub-agent then silently runs (and bills) claude-opus-4-8[1m] instead of the
  * session model; transcripts show `resolvedModel: "claude-opus-4-8[1m]"`.
  *
- * `CLAUDE_CODE_SUBAGENT_MODEL` is the CLI's own escape hatch and the only
- * verified fix: the sub-agent model resolution order checks this env var
- * first (before any agent-definition or per-call model), and it skips the
- * built-in rewrite entirely. Setting it to the session's model id makes
- * Explore (and every other "inherit"-model sub-agent) run the same model as
- * the main loop.
+ * `CLAUDE_CODE_SUBAGENT_MODEL` is the CLI's own escape hatch: setting it to the
+ * session's model id makes Explore (and every other "inherit"-model sub-agent)
+ * run the same model as the main loop.
+ *
+ * CLI 2.1.28x moved the goalposts — resolution is now per-call `model` → the
+ * agent definition's `model` → this env → inherit the session model, and the
+ * built-in Explore/Plan definitions pin `model: "inherit"`, so the env alone
+ * reaches nothing. The companion bool `CLAUDE_CODE_SUBAGENT_MODEL_FORCE`
+ * restores the old precedence (the CLI then drops the Agent tool's `model`
+ * parameter and ignores definition models). An explicit pick therefore only
+ * takes effect together with the flag; the fallback pin below deliberately
+ * goes without it.
  *
  * Alternatives that were tried and rejected (verified against the bundled
  * CLI): pinning the agent via a PreToolUse hook `updatedInput.model`
@@ -23,16 +29,22 @@ import { SettingsManager } from "./settings.js";
  * activeAgents before initialize applies flagSettings, so the built-in
  * definition still wins and resolves to opus), and renaming the agent.
  *
- * Trade-offs of the env approach, in the CLI's semantics:
- * - The env var outranks everything for sub-agents, including an explicit
- *   per-call `model:` argument on the Agent tool — the LLM can no longer
- *   pick a different model for a specific sub-agent.
+ * Trade-offs of forcing, in the CLI's semantics:
+ * - The env var then outranks everything for sub-agents, including an
+ *   explicit per-call `model:` argument on the Agent tool and the models the
+ *   built-in agents carry themselves (claude-code-guide's haiku,
+ *   statusline-setup's sonnet) — they all run the pinned model.
  * - It is fixed at process spawn: a mid-session `setModel` does not change
  *   what sub-agents run. Acceptable because sub-agents are helpers that
  *   should simply never cost more than the session's own model.
  */
 
 const SUBAGENT_MODEL_ENV = "CLAUDE_CODE_SUBAGENT_MODEL";
+const SUBAGENT_MODEL_FORCE_ENV = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE";
+
+function isSet(value: string | undefined): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
 
 /** The model id the session will start on, read from the same sources the
  *  CLI consults (ANTHROPIC_MODEL env, then settings.json `model`). */
@@ -45,23 +57,32 @@ export function resolveSessionModel(settingsManager: SettingsManager): string | 
     : undefined;
 }
 
-/** Value to inject as `CLAUDE_CODE_SUBAGENT_MODEL` into the spawned CLI's
- *  env, or undefined when no injection should happen — either the session
- *  model can't be determined, or the var is already set by the host env, the
- *  caller's options.env, or the settings.json `env` block (an explicit
- *  setting always wins). */
+/** Env entries to inject into the spawned CLI's env: the force flag when the
+ *  sub-agent model is an explicit setting (CLI 2.1.28x lets the agent
+ *  definition win without it), or the session-model fallback pin when nothing
+ *  is configured. Undefined when neither applies. */
 export function resolveSubagentModelEnv(
   settingsManager: SettingsManager,
   callerEnv?: Record<string, string | undefined>,
 ): Record<string, string> | undefined {
-  if (process.env[SUBAGENT_MODEL_ENV]?.trim()) return undefined;
-  if (callerEnv?.[SUBAGENT_MODEL_ENV]?.trim()) return undefined;
-  // settings.json's `env` block is an explicit user setting too — the editor's
-  // "Sub Agent Model" field writes it there. The CLI applies that block itself,
-  // so whether it outranks our spawn env is its own business; skipping the
-  // auto-pin here makes the user's choice win deterministically either way.
-  const fromSettings = settingsManager.getSettings().env?.[SUBAGENT_MODEL_ENV];
-  if (typeof fromSettings === "string" && fromSettings.trim()) return undefined;
+  const settings = settingsManager.getSettings();
+  const explicit =
+    isSet(process.env[SUBAGENT_MODEL_ENV]) ||
+    isSet(callerEnv?.[SUBAGENT_MODEL_ENV]) ||
+    // settings.json's `env` block is an explicit user setting too — the
+    // editor's "Sub Agent Model" field writes it there. The CLI applies that
+    // block itself; all we add is the flag that makes it actually win.
+    isSet(settings.env?.[SUBAGENT_MODEL_ENV]);
+  const forceOverridden =
+    isSet(process.env[SUBAGENT_MODEL_FORCE_ENV]) ||
+    isSet(callerEnv?.[SUBAGENT_MODEL_FORCE_ENV]) ||
+    isSet(settings.env?.[SUBAGENT_MODEL_FORCE_ENV]);
+  if (explicit) return forceOverridden ? undefined : { [SUBAGENT_MODEL_FORCE_ENV]: "1" };
+
+  // Nothing configured: pin the session model so a gateway/custom model cannot
+  // be rewritten into a pricier first-party one. No force flag here — the
+  // built-in agents already inherit the session model, and forcing would also
+  // disable the CLI's own inherit cap.
   const sessionModel = resolveSessionModel(settingsManager);
   if (!sessionModel) return undefined;
   return { [SUBAGENT_MODEL_ENV]: sessionModel };

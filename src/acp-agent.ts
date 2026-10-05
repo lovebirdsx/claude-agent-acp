@@ -11860,9 +11860,9 @@ export class ClaudeAcpAgent {
       ...providerEnv,
       // Fork patch: pin every sub-agent to the session model so the CLI's
       // first-party-family rewrite can't switch the built-in Explore agent
-      // to "opus" (see subagent-model.ts). Only injected when a session
-      // model resolves and neither the host env nor the caller's env
-      // already sets the var — an explicit setting always wins.
+      // to "opus" (see subagent-model.ts). An explicit pick — host env, caller
+      // env or settings.json's env block — instead gets the force flag that
+      // makes it beat the agent definitions on CLI 2.1.28x.
       ...(resolveSubagentModelEnv(settingsManager, userProvidedOptions?.env) || {}),
       // Fork patch: default the entrypoint to "universe-editor" instead of the
       // SDK's "sdk-ts" so the native CLI's /resume and --continue pick up

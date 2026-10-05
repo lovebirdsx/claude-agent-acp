@@ -22,11 +22,11 @@ CLI 的 `getAbortReason` 把**任何**非 interrupt/end_conversation 的 tool-qu
 
 SDK 的 `initializationResult.models` 是**硬编码 Anthropic 官方列表**，网关模型天然不在其中，而 `setSessionConfigOption` 对不在候选里的值**直接抛错**——网关用户的会话内 picker 完全不可用。不走 `settings.availableModels`：它是「取代」语义的 allowlist 且是**全局共享文件**，写它会连带限制原生 CLI 自己的 `/model` picker。改走顶层 `_meta.extraModels` **追加**通道（上限 64、坏载荷降级 undefined 不失败会话、逐字透传不剥 `[1m]` 上下文后缀），**顺序是 allowlist 过滤在前、extras 追加在后**（extras exempt 于过滤）。配套测试 `tests/extra-models.test.ts`
 
-## 子 agent 模型 pin（`CLAUDE_CODE_SUBAGENT_MODEL`）
+## 子 agent 模型 pin（`CLAUDE_CODE_SUBAGENT_MODEL` + `_FORCE`）
 
 （待提交）落点 **`subagent-model.ts`(新文件)** + `acp-agent.ts`（一处 env 展开）
 
-CLI 的 first-party 家族改写会把内置 Explore 子 agent 从网关模型（如 `kimi-k3[1m]`）悄悄换成 `claude-opus-4-8[1m]` 并计费；该 env 是 CLI 自己的逃生口，也是唯一验证有效的修法（其它尝试见文件头注释）。`resolveSubagentModelEnv` 在 host env / caller `options.env` / **settings.json 的 `env` 块**三者皆未显式设置时才注入会话模型——第三条是编辑器 AI Settings 的「Sub Agent Model」入口写的位置，加它是为了让用户的显式选择确定性胜出（否则 CLI 与 spawn env 的应用顺序不确定）。配套测试 `tests/subagent-model.test.ts`
+CLI 的 first-party 家族改写会把内置 Explore 子 agent 从网关模型（如 `kimi-k3[1m]`）悄悄换成 `claude-opus-4-8[1m]` 并计费；该 env 是 CLI 自己的逃生口（其它尝试见文件头注释）。**CLI 2.1.28x 起解析序变了**：Agent 工具 per-call `model` → agent 定义的 `model` → 本 env → 继承会话模型，而内置 Explore/Plan 定义钉的是 `model:"inherit"`，于是**光设 env 已经够不到它们**（实测：同一会话里 `claude-code-guide` 跑它定义里的 haiku，Explore 跑会话模型）。配套 bool `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` 恢复旧优先级——置位后 CLI 从 Agent 工具 schema 里删掉 `model` 参数、并忽略定义的 model（二进制串：`CLAUDE_CODE_SUBAGENT_MODEL_FORCE ? h.omit({model:!0}) : h`）。故 fork 分两路：**任一来源显式设了 `CLAUDE_CODE_SUBAGENT_MODEL`**（host env / caller `options.env` / **settings.json 的 `env` 块**，第三条是编辑器「Sub Agent Model」写的位置）→ 补 `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`（**任一**来源已设 FORCE 就不动手，把开关留给用户）；**都没设** → 仍按老办法注入会话模型，**刻意不带 FORCE**（Explore 本就 inherit 会话模型，且置位会连 CLI 自己的 `inheritCap:"opus"` 成本阀一起关掉）。代价：置位后 env 压过一切子 agent 模型来源，`claude-code-guide`(haiku)、`statusline-setup`(sonnet) 这类自带模型的 agent 也被接管——编辑器侧因此把两个键绑成一对写/清，并在 UI 与文档写明副作用。配套测试 `tests/subagent-model.test.ts`；父项目侧写盘点 `useClaudeConfig.applyModelPick`，环境变量编辑器 `AdvancedEnvPanel` 隐藏这对键。
 
 ## usage_update 中途携带成本明细（turn 进行中就能显示开销）
 

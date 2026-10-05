@@ -26,7 +26,7 @@
 - **Windows `PowerShell` 与 `Bash` 同族 + `Skill` 卡**（`src/tests/tools.test.ts` `src/tests/acp-agent.test.ts`）：上游 a44c486 的 reporters/renderer 架构已原生覆盖（`PowerShell: bash`、`Skill: SkillReporter`），fork 不再改实现，仅保留回归测试防上游改回
 - **识别 CLI 合成的假「用户拒绝」（`syntheticDenial`）**（`acp-agent.ts`（6 处））：CLI 兜底合成的 `toolDenialKind:"user-rejected"` 与真拒绝 wire 逐字相同，唯一权威判据是 fork 自己走过 `behavior:"deny"`。只叠加 `syntheticDenial?: true`，**不改 `nonExecutionKind`**；replay 无 set 即无证据、宁可不标。详见 [cases-session.md](cases-session.md)
 - **会话模型清单注入网关模型（`_meta.extraModels`）**（**`extra-models.ts`(新)** `acp-agent.ts`（3 处））：SDK models 硬编码官方列表；改走**追加**通道（不走「取代」语义的 `settings.availableModels`）；上限 64、坏载荷降级、逐字透传（勿剥 `[1m]`）；allowlist 过滤在前、extras 追加在后。详见 [cases-session.md](cases-session.md)
-- **子 agent 模型 pin（`CLAUDE_CODE_SUBAGENT_MODEL`）**（**`subagent-model.ts`(新)** `acp-agent.ts`（1 处））：防 CLI first-party 家族改写把内置 Explore 换成 opus 计费；host env / caller env / settings.json `env` 块三者皆未显式设置时才注入会话模型。详见 [cases-session.md](cases-session.md)
+- **子 agent 模型 pin（`CLAUDE_CODE_SUBAGENT_MODEL` + `_FORCE`）**（**`subagent-model.ts`(新)** `acp-agent.ts`（1 处））：防 CLI first-party 家族改写把内置 Explore 换成 opus 计费；**2.1.28x 起内置定义钉 `model:"inherit"` 会压过该 env**，故显式来源（host env / caller env / settings.json `env` 块）改为补发 `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` 夺回优先级，未设时仍走不带 FORCE 的会话模型兜底。详见 [cases-session.md](cases-session.md)
 - **usage_update 中途携带成本明细（turn 进行中就能显示开销）**（**`session-cost.ts`(新)** `acp-agent.ts`（5 处））：账本 base⊕overlay 使编辑器 turn 中途即可显开销（只带 token 明细，无 `costUSD`）。6 个语义坑、剥 `costUSD` 策略、reconnect 限制 → 详见 [cases-session.md](cases-session.md)
 - **官方订阅额度用量**（**`usage.ts`(新)** `acp-agent.ts`）：`SUBSCRIPTION_USAGE_METHOD`；SDK `usage_EXPERIMENTAL...` **必须运行时特性探测**，不能静态调用；`subscription_type: null` 是**正常值**。详见 [cases-session.md](cases-session.md)
 - **SendMessage 续跑子 Agent 的 live 重定向 + replay 分段回放**（`tools.ts` `acp-agent.ts`）：live：`redirectParentToolUseId` 原地改写 `parent_tool_use_id`；replay：`splitSubagentTranscriptByResumes` 按段分卡。详见 [cases-subagent.md](cases-subagent.md)
@@ -42,7 +42,7 @@
 
 另有 ext-notification `_claude/sdkMessage`（原始 SDK 消息旁路，供父项目重建连接快照）也是本地印章，随上述提交散落在 `acp-agent.ts`。
 
-**已被上游实现、fork 不再保留的本地改动**（三条的完整判据与保留测试 → 详见 [cases-session.md](cases-session.md)）：
+**已被上游实现、fork 不再保留的本地改动**（判据与保留测试详见 [cases-session.md](cases-session.md)）：
 
 - AskUserQuestion「选项+备注共存」：上游 a44c486 起 `applyAskElicitationResponse` 已实现同一意图，rebase 时源文件与测试整段切回上游，勿重新加回。
 - 回放隐藏 harness 投递的 `user` 行（`user` 行自带 entry 级 `origin` 的形态）：上游已有 `taskNotificationsOf` + `isTaskNotificationRecord` 整行隐藏；带 `subkind` 的投递（如 scheduled routine）按上游语义是**真实 prompt**，必须显示。
@@ -62,18 +62,18 @@
 
 ## 上游同步节奏
 
-- **每月检查一次上游 release，或上游 minor 发版时**主动同步一次，避免 diff 一次性堆积到不可 rebase。
-- 长期方向：rewind / compaction 等大块逻辑**不主动搬迁**到新文件，待下次 rebase 实际冲突时按核对表逐步外移（一次一块，对齐 codex fork 的外移模式）。
+- **每月或上游 minor 发版时**同步一次，避免 diff 堆积到不可 rebase。
+- 长期方向：rewind / compaction 等大块逻辑**不主动搬迁**到新文件，待下次 rebase 实际冲突时按核对表逐步外移（对齐 codex fork 的外移模式）。
 
 ## 配置 upstream remote
 
-本地 clone 默认只有 `origin`（fork）。remote 是本地状态、不随仓库传播，须每个 clone 各自配一次。在**父项目根目录**跑：
+本地 clone 默认只有 `origin`（fork）；remote 是本地状态，每个 clone 须各配一次。在**父项目根目录**跑：
 
 ```bash
 node scripts/setup-vendor-remotes.mjs   # 一键为两个 fork 配 upstream
 ```
 
-或手动：`git -C vendor/claude-agent-acp remote add upstream https://github.com/agentclientprotocol/claude-agent-acp.git`。配完 `git -C vendor/claude-agent-acp remote -v` 应含 `upstream`。
+或手动：`git -C vendor/claude-agent-acp remote add upstream https://github.com/agentclientprotocol/claude-agent-acp.git`；配完 `git … remote -v` 应含 `upstream`。
 
 ## 构建与父项目的衔接
 
@@ -81,4 +81,4 @@ node scripts/setup-vendor-remotes.mjs   # 一键为两个 fork 配 upstream
 
 ## 其它
 
-- 制作相关功能时，记得同步更新本文档与「本地改动清单」表；大叙事一律拆到 cases 文档，本文受 15KB 预算约束（父项目 `scripts/check-claude-md-size.mjs` 硬校验，无豁免）。
+- 制作相关功能时记得同步本文档与「本地改动清单」表；大叙事拆到 cases 文档，本文受 15KB 预算约束（父项目 `check-claude-md-size.mjs` 硬校验）。

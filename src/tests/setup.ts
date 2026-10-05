@@ -6,3 +6,4 @@
 // round-trip restores these clean values, not the shell's.
 process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = "";
 process.env.CLAUDE_CODE_SUBAGENT_MODEL = "";
+process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = "";

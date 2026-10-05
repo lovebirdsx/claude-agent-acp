@@ -33,9 +33,10 @@ describe("resolveSessionModel", () => {
 
 describe("resolveSubagentModelEnv", () => {
   beforeEach(() => {
-    // The fork itself exports this var into the CLI env it spawns (and into
-    // dev shells dogfooding it), so tests must not inherit a real value.
+    // The fork itself exports these vars into the CLI env it spawns (and into
+    // dev shells dogfooding it), so tests must not inherit real values.
     vi.stubEnv("CLAUDE_CODE_SUBAGENT_MODEL", "");
+    vi.stubEnv("CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "");
   });
   afterEach(() => {
     vi.unstubAllEnvs();
@@ -48,26 +49,40 @@ describe("resolveSubagentModelEnv", () => {
     });
   });
 
-  it("returns undefined when the host env already sets the var", () => {
+  it("forces the host env's pick past the agent definitions", () => {
     vi.stubEnv("ANTHROPIC_MODEL", "kimi-k3[1m]");
     vi.stubEnv("CLAUDE_CODE_SUBAGENT_MODEL", "claude-sonnet-4-6");
-    expect(resolveSubagentModelEnv(settingsManagerWithModel(undefined))).toBeUndefined();
+    expect(resolveSubagentModelEnv(settingsManagerWithModel(undefined))).toEqual({
+      CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "1",
+    });
   });
 
-  it("returns undefined when the caller's env already sets the var", () => {
+  it("forces the caller's env pick past the agent definitions", () => {
     vi.stubEnv("ANTHROPIC_MODEL", "kimi-k3[1m]");
     expect(
       resolveSubagentModelEnv(settingsManagerWithModel(undefined), {
         CLAUDE_CODE_SUBAGENT_MODEL: "claude-sonnet-4-6",
       }),
-    ).toBeUndefined();
+    ).toEqual({ CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "1" });
   });
 
-  it("returns undefined when settings.json's env block already sets the var", () => {
+  it("forces a pick written into settings.json's env block", () => {
     vi.stubEnv("ANTHROPIC_MODEL", "kimi-k3[1m]");
     expect(
       resolveSubagentModelEnv(
         settingsManagerWithEnv({ CLAUDE_CODE_SUBAGENT_MODEL: "claude-sonnet-4-6" }),
+      ),
+    ).toEqual({ CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "1" });
+  });
+
+  it("leaves the force flag alone when any source already sets it", () => {
+    vi.stubEnv("ANTHROPIC_MODEL", "kimi-k3[1m]");
+    expect(
+      resolveSubagentModelEnv(
+        settingsManagerWithEnv({
+          CLAUDE_CODE_SUBAGENT_MODEL: "claude-sonnet-4-6",
+          CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "0",
+        }),
       ),
     ).toBeUndefined();
   });
