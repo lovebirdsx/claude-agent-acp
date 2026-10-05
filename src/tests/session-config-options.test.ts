@@ -1316,6 +1316,11 @@ describe("session config options", () => {
             name: "Auto",
             description: "Claude handles permission decisions",
           },
+          {
+            id: "dontAsk",
+            name: "Don't Ask",
+            description: "Automatically deny actions that would need approval",
+          },
         ],
       };
       // Reflect the seeded availableModes/availableModels in configOptions so
@@ -1369,7 +1374,7 @@ describe("session config options", () => {
       expect(modeValues).toEqual(
         expect.arrayContaining(["default", "acceptEdits", "plan", "auto"]),
       );
-      expect(modeValues).not.toContain("dontAsk");
+      expect(modeValues).toContain("dontAsk");
     });
 
     it("keeps the same mode catalog when switching from Haiku back to Opus", async () => {

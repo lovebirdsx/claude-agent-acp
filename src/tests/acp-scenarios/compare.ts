@@ -28,6 +28,9 @@
  *   adds to a `usage_update`, whose other fields are the same. The capability
  *   keys the adapter advertises on `initialize` (`universe-editor/capabilities`)
  *   are the same kind of difference, on a message that is not a session update.
+ * - The mode catalog on a session-setup payload (`newSession` / `loadSession`)
+ *   lists the `dontAsk` entry the adapter adds for the editor's read-only side
+ *   tasks (see {@link ADDED_MODE_ID}). origin/main never advertised it.
  * - A `usage_update` without a `cost` that the adapter sends while the
  *   response to `session/load` is still on its way. The adapter reports the
  *   context window of the session it restored; origin/main reported it only
@@ -127,6 +130,47 @@ export function withoutAirOnlyKeys(value: unknown): unknown {
       continue;
     }
     result[key] = withoutAirOnlyKeys(item);
+  }
+  return result;
+}
+
+/** The mode the adapter adds to the catalog for the editor's read-only side
+ *  tasks. origin/main never advertised it, so a session-setup payload carries
+ *  one entry more than the baseline (see {@link withoutAddedModeEntry}). */
+export const ADDED_MODE_ID = "dontAsk";
+
+function withoutModeId(value: unknown, key: "id" | "value"): unknown[] | undefined {
+  return Array.isArray(value)
+    ? value.filter(
+        (entry) => !(entry && typeof entry === "object" && (entry as Json)[key] === ADDED_MODE_ID),
+      )
+    : undefined;
+}
+
+/**
+ * Removes the added mode entry from a session-setup payload: the `modes`
+ * state's `availableModes` list and the `mode` select option's `options` both
+ * carry it (allowance of the file comment). Non-object payloads pass through.
+ */
+export function withoutAddedModeEntry(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const payload = value as Json;
+  const modes = payload.modes;
+  const configOptions = payload.configOptions;
+  if (!modes && !configOptions) return value;
+  const result: Json = { ...payload };
+  if (modes && typeof modes === "object" && !Array.isArray(modes)) {
+    const available = withoutModeId((modes as Json).availableModes, "id");
+    if (available) result.modes = { ...(modes as Json), availableModes: available };
+  }
+  if (Array.isArray(configOptions)) {
+    result.configOptions = configOptions.map((option) => {
+      if (!option || typeof option !== "object") return option;
+      const select = option as Json;
+      if (select.id !== "mode") return option;
+      const options = withoutModeId(select.options, "value");
+      return options ? { ...select, options } : option;
+    });
   }
   return result;
 }
@@ -326,9 +370,10 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
     if (!want || !got) {
       // A message that is not a session update (the handshake, the session
       // responses): equal once the keys of the adapter's own namespaces are
-      // out — it advertises its extensions there.
+      // out — it advertises its extensions there — and the mode entry the
+      // adapter adds is removed (see {@link ADDED_MODE_ID}).
       return (
-        canonical(withoutAirOnlyKeys(actual.payload ?? null)) ===
+        canonical(withoutAirOnlyKeys(withoutAddedModeEntry(actual.payload ?? null))) ===
         canonical(withoutAirOnlyKeys(wanted.payload ?? null))
       );
     }
@@ -390,6 +435,11 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
           ),
         );
       return other(want) === other(got);
+    }
+    if (want.sessionUpdate === "config_option_update") {
+      // The same bag, once the mode entry the adapter adds is removed from
+      // both sides (see {@link ADDED_MODE_ID}).
+      return canonical(withoutAddedModeEntry(got)) === canonical(withoutAddedModeEntry(want));
     }
     if (want.sessionUpdate === "available_commands_update") {
       return canonical(want) === canonical(withoutAdapterCommands(want, got));

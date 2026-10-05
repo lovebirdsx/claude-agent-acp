@@ -388,6 +388,17 @@ export class SessionModeManager<S extends SessionMode> {
         ...kind("full_access"),
       });
     }
+    // Fork addition: the editor pins a session to `dontAsk` when it forks a
+    // read-only side task. A value the catalog does not advertise is silently
+    // dropped by clients that validate against it, and the fork then inherits
+    // the parent's mode. It is never gated on `allowBypass`: dontAsk only
+    // denies, it never escalates.
+    modes.push({
+      id: "dontAsk",
+      name: "Don't Ask",
+      description: "Automatically deny actions that would need approval",
+      ...kind("standard"),
+    });
     return modes;
   }
 

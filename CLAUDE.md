@@ -20,6 +20,7 @@
 
 按提交信息为中文者识别（上游均为英文）；rebase 会重写哈希，故清单不记哈希。分叉点在最后一条中文提交之下的首个上游 `(#NNN)` 提交（当前分叉点为上游 `a44c486`）。逐条列出（新→旧）；标「详见」的条目，完整叙事在对应 cases 文档：
 
+- **模式目录广告 `dontAsk`**（`session-mode.ts` `buildAvailableModes`，含 `docs/air-extensions.md` 同步）：编辑器侧边任务的只读 pin（推 `dontAsk`）与 settings `permissions.defaultMode:"dontAsk"` 都依赖它进目录；缺失时按目录校验的客户端会静默丢弃 pin，会话继承父模式。不被 `allowBypass` 门控（只拒绝、不提权）
 - **上下文窗口后台刷新只在已开 turn 的会话执行**（`acp-agent.ts`（Session 增 `hasStartedTurn`、`activateTurn` 置位、`refreshContextWindowInBackground` 加闸））：升级引入的回归：SDK 控制请求单通道串行，而 **turn 之前的 `getContextUsage` 不被 CLI 服务**（CLI 2.1.220 实测占住通道 5~8s），其后第一个控制请求（模型 / effort 切换）排在它后面一起等。详见 [cases-session.md](cases-session.md)
 - **回放不再把 harness 投递当成用户插话（`queued_command` 载体）**（`acp-agent.ts`（3 处））：CLI 用**同一个** `queued_command` 载体投递后台通知与 peer 消息，resume 时被渲染成 80+ 用户卡片（live 从不渲染）。三枚印章任一命中即从回放排除，**fail-open 保真插话**；过滤**勿挪进 `isDisplayMessageEntry`**（会让 `backfillForkedToolResults` 漏扫 tool_result）。详见 [cases-session.md](cases-session.md)
 - **Windows `PowerShell` 与 `Bash` 同族 + `Skill` 卡**（`src/tests/tools.test.ts` `src/tests/acp-agent.test.ts`）：上游 a44c486 的 reporters/renderer 架构已原生覆盖（`PowerShell: bash`、`Skill: SkillReporter`），fork 不再改实现，仅保留回归测试防上游改回

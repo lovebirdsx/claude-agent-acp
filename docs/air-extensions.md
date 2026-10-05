@@ -643,10 +643,10 @@ A shell label can describe command rules, read paths, additional directories, or
 ### Permission modes
 
 The session offers the Claude modes of the current model with the Claude Code labels:
-`Manual`, `Accept edits`, `Plan`, `Auto` when available, and `Bypass permissions` when available.
-The mode ids are the Claude SDK ids: `default`, `acceptEdits`, `plan`, `auto`, and `bypassPermissions`.
+`Manual`, `Accept edits`, `Plan`, `Auto` when available, `Bypass permissions` when available, and `Don't Ask`.
+The mode ids are the Claude SDK ids: `default`, `acceptEdits`, `plan`, `auto`, `bypassPermissions`, and `dontAsk`.
 `Manual` keeps the SDK id `default`. `manual` is only a settings alias.
-The adapter accepts the internal `dontAsk` mode from settings but does not offer it.
+`Don't Ask` denies anything that would need approval; it is what a host pins a forked read-only side task to.
 
 A host removes `Bypass permissions` with `_meta.claudeCode.options.allowDangerouslySkipPermissions: false` on `session/new` and on `session/load`.
 A `bypassPermissions` settings default then falls back to `default`.
@@ -1254,6 +1254,7 @@ Each session mode and each value of the mode config option carries `_meta.jetbra
 | `plan`              | Plan               | `plan`        |
 | `auto`              | Auto               | `auto_review` |
 | `bypassPermissions` | Bypass permissions | `full_access` |
+| `dontAsk`           | Don't Ask          | `standard`    |
 
 The adapter sends the key only to an AIR client.
 

@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import { ALLOW_BYPASS } from "../permissions/modes.js";
 import { makeMockQuery } from "./helpers.js";
 
 const { querySpy } = vi.hoisted(() => ({
@@ -94,7 +95,9 @@ describe("ClaudeAcpAgent settings", () => {
 
     expect(getCapturedOptions().permissionMode).toBe("dontAsk");
     expect(getCapturedOptions().settingSources).toEqual(["user", "project", "local"]);
-    expect(response.modes.currentModeId).toBe("default");
+    // dontAsk is advertised, so init reports what the SDK actually runs
+    // instead of clamping the session to `default`.
+    expect(response.modes.currentModeId).toBe("dontAsk");
   }, 15_000);
 
   it.each([
@@ -643,7 +646,7 @@ describe("ClaudeAcpAgent settings", () => {
 
       const modeIds: string[] = response.modes.availableModes.map((m: any) => m.id);
       expect(modeIds).toEqual(expect.arrayContaining(["default", "acceptEdits", "plan", "auto"]));
-      expect(modeIds).not.toContain("dontAsk");
+      expect(modeIds).toContain("dontAsk");
     });
 
     it("includes `auto` when the resolved model has supportsAutoMode: true", async () => {
@@ -692,7 +695,12 @@ describe("ClaudeAcpAgent settings", () => {
           description: "Claude handles permission decisions",
         },
       ]);
-      const bypass = response.modes.availableModes[4];
+      // `dontAsk` sits at the end of the catalog now, so the bypass entry is no
+      // longer at a fixed index — and it only exists when the session allows it.
+      expect(modeIds.includes("bypassPermissions")).toBe(ALLOW_BYPASS);
+      const bypass = response.modes.availableModes.find(
+        (mode: any) => mode.id === "bypassPermissions",
+      );
       if (bypass) {
         expect(bypass).toEqual({
           id: "bypassPermissions",
@@ -700,7 +708,47 @@ describe("ClaudeAcpAgent settings", () => {
           description: "Accepts all permissions",
         });
       }
-      expect(modeIds).not.toContain("dontAsk");
+      expect(modeIds).toContain("dontAsk");
+    });
+
+    it("advertises and accepts dontAsk — the read-only pin the editor pushes for side tasks", async () => {
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      const { setPermissionModeSpy } = mockQueryWithModels([
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus",
+          description: "Most capable",
+          supportsAutoMode: true,
+        },
+      ]);
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      const modeIds: string[] = response.modes.availableModes.map((m: any) => m.id);
+      expect(modeIds).toContain("dontAsk");
+      const modeOption = response.configOptions.find((o: any) => o.id === "mode");
+      expect(modeOption.options.map((o: any) => o.value)).toContain("dontAsk");
+
+      // The editor pins a side task to this value through session/load →
+      // set_config_option; a catalog without it makes that push a no-op.
+      const updated = await (agent as any).setSessionConfigOption({
+        sessionId: response.sessionId,
+        configId: "mode",
+        value: "dontAsk",
+      });
+
+      const updatedMode = updated.configOptions.find((o: any) => o.id === "mode");
+      expect(updatedMode.currentValue).toBe("dontAsk");
+      expect(setPermissionModeSpy).toHaveBeenCalledWith("dontAsk");
     });
 
     it("falls back permissions.defaultMode='auto' to Accept edits on an unsupported model", async () => {
