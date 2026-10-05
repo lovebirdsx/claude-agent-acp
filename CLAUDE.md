@@ -1,15 +1,15 @@
 # CLAUDE.md — fork 维护与上游合并指南
 
-本仓库是 **`agentclientprotocol/claude-agent-acp` 的自维护 fork**（origin: `lovebirdsx/claude-agent-acp`，上游: `agentclientprotocol/claude-agent-acp`），作为 git submodule 嵌入 `universe-editor` 的 `vendor/claude-agent-acp`。它是 stdio ACP agent：包装 `@anthropic-ai/claude-agent-sdk`，把 ACP 请求翻译成 SDK query，再把 SDK 事件映回 ACP 客户端。
+本仓库是 **`agentclientprotocol/claude-agent-acp` 的自维护 fork**（origin: `lovebirdsx/claude-agent-acp`），作为 git submodule 嵌入 `universe-editor` 的 `vendor/claude-agent-acp`。它是 stdio ACP agent：包装 `@anthropic-ai/claude-agent-sdk`，把 ACP 请求翻译成 SDK query，再把 SDK 事件映回 ACP 客户端。
 
-> 项目结构 / 测试约定 / 运行方式 → `README.md`。本文件只讲 fork 特有的事：**红线、导航、一行摘要**；标「详见」条目的完整 bug 叙事、设计约束与实测数据拆在 `cases-session.md` / `cases-subagent.md`（本文件受 15KB 预算约束，新增叙事写进 cases）。
-> 姊妹 fork `vendor/codex-acp` 有同规格的 `CLAUDE.md`，可对照参考；两者维护纪律一致。
+> 项目结构 / 测试约定 / 运行方式 → `README.md`。本文件只讲 fork 特有的事：**红线、导航、一行摘要**；标「详见」条目的完整 bug 叙事、设计约束与实测数据拆在 `cases-session.md` / `cases-subagent.md`。
+> 姊妹 fork `vendor/codex-acp` 有同规格的 `CLAUDE.md`，可对照参考，维护纪律一致。
 
 ## 头号红线：保持源码 diff 最小，便于上游合并
 
 这是 fork 的生命线。上游发版频繁，且**大概率会自己实现 rewind / compaction / 标题持久化等与本地重叠的功能**，rebase 冲突成本可能一次性爆发。所有改动都要让「与上游的 diff」尽可能小、尽可能聚焦：
 
-- **本仓库有自己的 prettier/eslint 配置**（`.prettierrc.json` = `printWidth:100 + tabWidth:2`，配合 SDK/上游默认的**分号 + 双引号**；`eslint.config.js`）。与父项目 universe-editor（**无分号 + 单引号**）**不同**，改 fork 源码务必沿用本仓库自身风格。
+- **本仓库有自己的 prettier/eslint 配置**（`.prettierrc.json` = `printWidth:100 + tabWidth:2`，配合 SDK/上游默认的**分号 + 双引号**；`eslint.config.js`）。与父项目 universe-editor（**无分号 + 单引号**）不同，改 fork 源码务必沿用本仓库风格。
 - **当心父项目工具链对本目录 `.ts` 的自动格式化。** 父项目根 `.prettierrc` 是无分号 + 单引号，若被它按父项目风格重排整个文件，会瞬间产生上千行无关 diff。改 fork 源码时优先用最小化的精确 `Edit`，改完**立即检查 `git -C vendor/claude-agent-acp diff`**，确认只有预期的那几行变化；发现整文件被重排立刻 `git checkout` 还原。
 - **能不改源码就不改。** 优先走运行期开关 / env，或在父项目 `apps/editor` 侧解决。
 - **新功能尽量落新文件**（对齐 codex fork 的 `PathUtils` / `AcpExtensions` 模式，以及本仓库已有的 `interactive.ts` / `tools.ts`），降低对 6579 行的 `acp-agent.ts` 的集中改动——它目前已被本地改动动过约 20%，是 rebase 冲突的最大热区。
@@ -18,7 +18,7 @@
 
 ## fork 已有的本地改动（rebase 上游时需保留）
 
-按提交信息为中文者识别（上游均为英文）；rebase 会重写哈希，故清单不记哈希。分叉点在最后一条中文提交之下的首个上游 `(#NNN)` 提交（当前分叉点为上游 `a44c486`）。逐条列出（新→旧）；标「详见」的条目，完整叙事在对应 cases 文档：
+按提交信息为中文者识别（上游均为英文）；rebase 会重写哈希，故清单不记哈希。分叉点在最后一条中文提交之下的首个上游 `(#NNN)` 提交（当前分叉点为上游 `a44c486`）。逐条列出（新→旧）：
 
 - **模式目录广告 `dontAsk`**（`session-mode.ts` `buildAvailableModes`，含 `docs/air-extensions.md` 同步）：编辑器侧边任务的只读 pin（推 `dontAsk`）与 settings `permissions.defaultMode:"dontAsk"` 都依赖它进目录；缺失时按目录校验的客户端会静默丢弃 pin，会话继承父模式。不被 `allowBypass` 门控（只拒绝、不提权）
 - **上下文窗口后台刷新只在已开 turn 的会话执行**（`acp-agent.ts`（Session 增 `hasStartedTurn`、`activateTurn` 置位、`refreshContextWindowInBackground` 加闸））：升级引入的回归：SDK 控制请求单通道串行，而 **turn 之前的 `getContextUsage` 不被 CLI 服务**（CLI 2.1.220 实测占住通道 5~8s），其后第一个控制请求（模型 / effort 切换）排在它后面一起等。详见 [cases-session.md](cases-session.md)
@@ -38,7 +38,7 @@
 - **会话后台活跃度通知**（`acp-agent.ts`）：`BACKGROUND_ACTIVITY_METHOD = "_universe/background_activity"`，params `{sessionId, backgroundTasks, autonomousTurn}`；解决 run_in_background 任务存活期间 editor 误判会话已结束；值变化去重 + session/load\|resume 强制补发
 - _*resume 重放恢复 Task* 计划_*（`tools.ts` `acp-agent.ts`）：headless ≥2.1.220 的结构化数据在消息级 `tool_use_result` sidecar；TaskCreate 优先 sidecar 否则散文正则兜底；TaskUpdate 对未见 taskId 建占位条目
 - **resume reassert 编辑器记忆的会话模型**（`acp-agent.ts`）：transcript 恢复裸模型名丢 `[1m]` 后缀（窗口 1M 退化 200k）；editor 捎 `_meta.claudeCode.resumeModel`，优先级 env > resumeModel > settings.model，命中走既有 reassert-override
-- **其余小改（一行清单，条目按中文提交信息识别）**（`acp-agent.ts` 等）：子代理用量累积并推父卡片；恢复已压缩会话重建完整显示历史；结构化通知替代 Compacting 文本 chunk（`_universe/compaction`）；resume 模型同步 CLI 往返移出关键路径；reapplyRuntimeConfig 判别联合修 typecheck；ExitPlanMode 拒绝透传用户反馈；修 rewind 后模型/effort 丢失；修新建 session 上下文窗口计算；**rewind / fork 支持**（`universe-editor/rewind_session`，本地最大单笔 +726 行）；修 thinking_delta 空值检查；**持久化会话标题**（`universe-editor/set_session_title`，backing `renameSession`）；会话列表携带 git 分支（`SessionInfo._meta.gitBranch`）；usage_update 携带模型级成本明细（`_meta._universe/modelBreakdown`）；Explore 子代理结果持久化；修上下文计算不准确；修 electron-builder ESM 加载；工具调用错误上下文增强；listSessions 用最后真实消息时间戳；**AskUserQuestion 工具调用**（`ASK_USER_QUESTION_METHOD`，`interactive.ts`(新)）；**esbuild 单文件构建 + 二进制 env 注入**（`esbuild.config.mjs`(新)，产物 `dist/index.js` 供父项目 `ELECTRON_RUN_AS_NODE` 启动，不依赖系统 node/npx；meta 另采样本机二进制的 `cliVersion`，供父项目强制版本下限）
+- **其余小改（一行清单，条目按中文提交信息识别）**（`acp-agent.ts` 等）：子代理用量累积并推父卡片；恢复已压缩会话重建完整显示历史；结构化通知替代 Compacting 文本 chunk（`_universe/compaction`）；resume 模型同步 CLI 往返移出关键路径；reapplyRuntimeConfig 判别联合修 typecheck；ExitPlanMode 拒绝透传用户反馈；修 rewind 后模型/effort 丢失；修新建 session 上下文窗口计算；**rewind / fork 支持**（本地最大单笔 +726 行）；修 thinking_delta 空值检查；**持久化会话标题**（backing `renameSession`）；会话列表携带 git 分支（`SessionInfo._meta.gitBranch`）；usage_update 携带模型级成本明细（`_meta._universe/modelBreakdown`）；Explore 子代理结果持久化；修上下文计算不准确；修 electron-builder ESM 加载；工具调用错误上下文增强；listSessions 用最后真实消息时间戳；**AskUserQuestion 工具调用**（`ASK_USER_QUESTION_METHOD`，`interactive.ts`(新)）；**esbuild 单文件构建 + 二进制 env 注入**（`esbuild.config.mjs`(新)，产物 `dist/index.js` 供父项目 `ELECTRON_RUN_AS_NODE` 启动，不依赖系统 node/npx；meta 另采样本机二进制的 `cliVersion`，供父项目强制版本下限）
 
 另有 ext-notification `_claude/sdkMessage`（原始 SDK 消息旁路，供父项目重建连接快照）也是本地印章，随上述提交散落在 `acp-agent.ts`。
 

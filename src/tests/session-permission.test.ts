@@ -196,3 +196,199 @@ describe("permission request auto-approve marker", () => {
     expect(request.options.map((option: any) => option.optionId)).toContain("allow-with-updates");
   });
 });
+
+// 固化子 agent 网页请求的原始工具名、归属、选项和仅本次批准不写规则的契约。
+describe("web/MCP search permission contract", () => {
+  let agent: ClaudeAcpAgent;
+  let capturedPermissionRequest: any;
+  let permissionResponse: any;
+
+  const SUBAGENT_ID = "agent-web";
+
+  function makeSession(): any {
+    return {
+      query: makeMockQuery(),
+      cwd: process.cwd(),
+      modes: { currentModeId: "plan", availableModes: [{ id: "plan", name: "Plan" }] },
+      models: { currentModelId: "opus", availableModels: [] },
+      modelInfos: [],
+      configOptions: [],
+      emittedToolCalls: new Set<string>(),
+      contextWindowSize: 200_000,
+      toolUseCache: {},
+      liveBackgroundTasks: new Map([
+        [SUBAGENT_ID, { parentToolUseId: "toolu_task", isSubagent: true }],
+      ]),
+    };
+  }
+
+  async function askSubagent(
+    toolName: string,
+    input: Record<string, unknown>,
+    extra: Record<string, unknown> = {},
+  ): Promise<any> {
+    const result = await (agent as any).canUseTool(SESSION_ID)(toolName, input, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_web",
+      agentID: SUBAGENT_ID,
+      ...extra,
+    });
+    if (permissionResponse.outcome.optionId === "allow-once") {
+      expect(result).toMatchObject({ behavior: "allow" });
+      expect(result).not.toHaveProperty("updatedPermissions");
+    }
+    return capturedPermissionRequest;
+  }
+
+  const optionIds = (request: any): string[] =>
+    request.options.map((option: any) => option.optionId);
+
+  beforeEach(() => {
+    capturedPermissionRequest = null;
+    permissionResponse = { outcome: { outcome: "selected", optionId: "allow-once" } };
+    const client = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: any) => {
+        capturedPermissionRequest = params;
+        return permissionResponse;
+      },
+    } as unknown as AcpClient;
+    agent = new ClaudeAcpAgent(client);
+    agent.sessions[SESSION_ID] = makeSession();
+  });
+
+  it("stamps WebSearch's raw name and parent beside the marker, with the scoped option offered", async () => {
+    const request = await askSubagent("WebSearch", { query: "weather" });
+
+    expect(request.toolCall.kind).toBe("fetch");
+    expect(request.toolCall._meta.claudeCode).toEqual({
+      toolName: "WebSearch",
+      parentToolUseId: "toolu_task",
+      clientMayAutoApproveOnce: true,
+    });
+    expect(optionIds(request)).toEqual(["allow-once", "allow-with-updates", "reject"]);
+  });
+
+  it("stamps WebFetch's raw name on an ask for a reserved domain", async () => {
+    const request = await askSubagent("WebFetch", { url: "https://docs.example.com/" });
+
+    expect(request.toolCall.kind).toBe("fetch");
+    expect(request.toolCall._meta.claudeCode).toEqual({
+      toolName: "WebFetch",
+      parentToolUseId: "toolu_task",
+      clientMayAutoApproveOnce: true,
+    });
+    expect(optionIds(request)).toEqual(["allow-once", "allow-with-updates", "reject"]);
+  });
+
+  it("keeps the MCP name unfolded and merges the parent and server provenance", async () => {
+    const request = await askSubagent(
+      "mcp__brave-search__brave_web_search",
+      { query: "weather" },
+      { mcpServer: { name: "brave-search", source: "userSettings" } },
+    );
+
+    expect(request.toolCall.kind).toBe("other");
+    expect(request.toolCall._meta.claudeCode).toEqual({
+      toolName: "mcp__brave-search__brave_web_search",
+      parentToolUseId: "toolu_task",
+      mcpServer: { name: "brave-search", source: "userSettings" },
+      clientMayAutoApproveOnce: true,
+    });
+    // No matching provider suggestion this time: only "yes, once" + reject.
+    expect(optionIds(request)).toEqual(["allow-once", "reject"]);
+  });
+
+  it("offers the scoped option for the MCP search when the CLI has a matching rule", async () => {
+    const request = await askSubagent(
+      "mcp__brave-search__brave_web_search",
+      { query: "weather" },
+      {
+        mcpServer: { name: "brave-search", source: "userSettings" },
+        suggestions: [
+          {
+            type: "addRules",
+            rules: [{ toolName: "mcp__brave-search__brave_web_search" }],
+            behavior: "allow",
+            destination: "localSettings",
+          },
+        ],
+      },
+    );
+
+    expect(optionIds(request)).toEqual(["allow-once", "allow-with-updates", "reject"]);
+  });
+
+  it("withholds the marker and the scoped option for a suppressed WebSearch ask", async () => {
+    const request = await askSubagent(
+      "WebSearch",
+      { query: "weather" },
+      { suppressAlwaysAllowRule: true },
+    );
+
+    expect(request.toolCall._meta.claudeCode.clientMayAutoApproveOnce).toBe(false);
+    expect(optionIds(request)).toEqual(["allow-once", "reject"]);
+  });
+
+  it("returns no updatedPermissions when the host answers a WebFetch ask with allow-once", async () => {
+    permissionResponse = { outcome: { outcome: "selected", optionId: "allow-once" } };
+
+    const result = await (agent as any).canUseTool(SESSION_ID)(
+      "WebFetch",
+      { url: "https://docs.example.com/" },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_web",
+        agentID: SUBAGENT_ID,
+      },
+    );
+
+    expect(result).toMatchObject({ behavior: "allow", decisionClassification: "user_temporary" });
+    expect(result.updatedPermissions).toBeUndefined();
+  });
+
+  it("carries the domain rule only when the host answers WebFetch with allow-with-updates", async () => {
+    permissionResponse = { outcome: { outcome: "selected", optionId: "allow-with-updates" } };
+
+    const result = await (agent as any).canUseTool(SESSION_ID)(
+      "WebFetch",
+      { url: "https://docs.example.com/" },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_web",
+        agentID: SUBAGENT_ID,
+      },
+    );
+
+    expect(result.updatedPermissions).toEqual([
+      {
+        type: "addRules",
+        rules: [{ toolName: "WebFetch", ruleContent: "domain:docs.example.com" }],
+        behavior: "allow",
+        destination: "localSettings",
+      },
+    ]);
+  });
+
+  it("answers an allow-once MCP search without a durable permission update", async () => {
+    permissionResponse = { outcome: { outcome: "selected", optionId: "allow-once" } };
+
+    const result = await (agent as any).canUseTool(SESSION_ID)(
+      "mcp__brave-search__brave_web_search",
+      { query: "weather" },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_web",
+        agentID: SUBAGENT_ID,
+        mcpServer: { name: "brave-search", source: "userSettings" },
+      },
+    );
+
+    expect(result).toMatchObject({ behavior: "allow", decisionClassification: "user_temporary" });
+    expect(result.updatedPermissions).toBeUndefined();
+  });
+});
