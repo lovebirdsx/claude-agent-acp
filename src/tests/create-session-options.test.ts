@@ -713,9 +713,10 @@ describe("createSession options merging", () => {
       expect(capturedOptions!.settings).toBeUndefined();
     });
 
-    it("ignores env var when _meta provides settings", async () => {
+    it("merges _meta settings on top of env-derived settings", async () => {
       process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
         modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
       });
 
       await agent.newSession({
@@ -733,10 +734,30 @@ describe("createSession options merging", () => {
         },
       });
 
-      // _meta settings take precedence; env var is ignored entirely
+      // _meta keys win on conflict, the env-derived catalogue still rides along
       expect(capturedOptions!.settings).toEqual({
         model: "claude-sonnet-4-6",
         modelOverrides: { "claude-opus-4-6": "meta-value" },
+        availableModels: ["opus"],
+      });
+    });
+
+    it("keeps the env-derived model catalogue when _meta only adds an unrelated key", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+      });
+
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          claudeCode: { options: { settings: { useAutoModeDuringPlan: true } } },
+        },
+      });
+
+      expect(capturedOptions!.settings).toEqual({
+        useAutoModeDuringPlan: true,
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
       });
     });
 

@@ -11825,14 +11825,23 @@ export class ClaudeAcpAgent {
     // into the query.
     const resolvedProvider = this.resolveProviderConfig();
     const providerEnv = createEnvForProvider(resolvedProvider);
+    const modelConfigSettings: NonNullable<Options["settings"]> | undefined = modelConfig
+      ? {
+          ...(modelConfig.modelOverrides && { modelOverrides: modelConfig.modelOverrides }),
+          ...(modelConfig.availableModels && { availableModels: modelConfig.availableModels }),
+        }
+      : undefined;
+    // Fork patch: a caller-supplied settings OBJECT (our editor pins
+    // `useAutoModeDuringPlan` per session through `_meta.claudeCode.options`)
+    // must not shadow the model catalogue derived from CLAUDE_MODEL_CONFIG —
+    // merge the caller's keys on top so both survive. A string value is a
+    // settings-file path the SDK resolves itself, so it is passed through
+    // unchanged (caller wins, as before).
+    const callerSettings = userProvidedOptions?.settings;
     const configuredSettings =
-      userProvidedOptions?.settings ??
-      (modelConfig
-        ? {
-            ...(modelConfig.modelOverrides && { modelOverrides: modelConfig.modelOverrides }),
-            ...(modelConfig.availableModels && { availableModels: modelConfig.availableModels }),
-          }
-        : undefined);
+      callerSettings === undefined || typeof callerSettings === "string"
+        ? (callerSettings ?? modelConfigSettings)
+        : { ...modelConfigSettings, ...callerSettings };
     const configuredSettingsObject =
       typeof configuredSettings === "string"
         ? (JSON.parse(
