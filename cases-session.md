@@ -78,3 +78,18 @@ CLI 的 first-party 家族改写会把内置 Explore 子 agent 从网关模型�
 （待提交）落点 **`usage.ts`(新文件)** + `acp-agent.ts`
 
 `SUBSCRIPTION_USAGE_METHOD = "universe-editor/subscription_usage"`，编辑器用量指示器在 claude.ai OAuth 订阅下显示额度窗口百分比而非网关人民币开销。数据源是 SDK 的 `Query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET()`（即 `/usage` 的后端）——**方法名自带"可能变"警告，必须运行时特性探测**（`typeof fn !== "function"` → `supported:false`）而不能静态调用，抛错同样降级；原样透传 `rate_limits`，归一化在编辑器侧（两个 fork 各写一份必漂移）。注意 `subscription_type: null` 是**正常值**（API key 会话）不是错误，编辑器据此回退 ¥ 读数。`acp-agent.ts` 只加 `getSubscriptionUsage(sid)` + 一条 builder `.onRequest`，主体在新文件。配套测试 `tests/usage.test.ts`
+
+## fork 分叉点解析走磁盘兜底、失败即报错（休眠源会话曾静默整份复制）
+
+`unstable_forkSession` 的 `_meta.rewindTo`（编辑器「Fork from here」按钮）分叉点解析原实现只查 live `messageIdToUuid`——那是 **agent 进程内存**表，而 fork 走临时租约、**常落在新 spawn 的进程**（源会话被空闲回收成 dormant / 编辑器重启过；`AcpSession.poolResume.integration.test.ts` 已有用例证明该路径确实新起进程）。映射为空 → 省略 `upToMessageId` → SDK 文档 "If omitted, full copy" **静默整份复制**（用户实测：fork 文件每行都带 `forkedFrom`，1:1 覆盖源会话全部消息记录）。这与 fork 的设计前提直接矛盾——`ForkTipFooter` 明确写着「fork 读磁盘而非 live 会话，无需唤醒源会话」。
+
+修法（`acp-agent.ts`，`unstable_forkSession` 分支 + 新 helper `forkSliceBefore` / `foldedPromptForkPoint`）：
+
+1. **磁盘为唯一真相**：live 映射未命中时读 `getSessionMessages(sid, {dir})`（与 `messageIdBefore` 同一次读取，不增 IO），用 `messageIdForGrouping` / `uuid` 双判据匹配锚点——user 轮的 uuid **就是**发给 client 的 messageId（`prompt()` 把 `_meta.messageId` 盖成 `SDKMessage.uuid`），assistant 轮按 API id 归类。对齐 AIR 路径（`fork-session.ts` 的 `loadFullSessionHistory`）与 codex 侧（`SessionFork.ts` 从持久化 thread 解析，故其无此 bug）。
+2. **解析不到即 `RequestError.invalidParams`**，绝不静默退回整份复制（对齐 fork 自己的 rewind 失败形态）。锚点是**首条消息**同样报错——`upToMessageId` inclusive 且 SDK 无法表达"空历史"，而该锚点可达（粘性条右键菜单），不能给整份副本。
+3. **折叠（steered）prompt 兜底**：turn 运行中发的 prompt 被 CLI 折叠进该 turn，落盘为 `queued_command` **attachment 行**，`getSessionMessages` 会过滤它 → 该 messageId 在有效链上无行可锚（resident 时 live 表也只是把它映射到自己）。此时用 `readTranscriptEntries`（读原始行）找 `isQueuedCommandEntry(entry) && entry.attachment.source_uuid === messageId`，取其 `parentUuid` 作切点；**该 parent 必须仍在有效链上**（`chain.some`），否则视为未知——rewind 留下的孤儿 attachment 不得复活已删轮次。没有这层兜底，修复会把"静默整份复制"变成"硬报错"，属可见回归。
+4. **空 `cwd` 退化为全项目搜索**：helper 用 `dir !== undefined && dir.length > 0 ? { dir } : {}`——SDK 省略 `dir` 时"searches all projects"，传空串则匹配不到任何项目。
+
+不传 `_meta.rewindTo` 的调用（tip fork / 命令面板 / `forkSideTask`）保持整份复制，语义不变。**勿改回"不唤醒源会话就静默复制"**：唤醒的代价是 spawn + 整会话 replay（长会话数十秒），且违背该路径的既有设计。
+
+配套测试 `tests/acp-agent.test.ts` 的 `describe("unstable_forkSession fork point (excludes anchored user turn)")`：resident 命中（live 表）／非 resident 磁盘兜底／折叠 prompt 命中／两个 reject（锚点不存在、锚点为首条）各一例，reject 用例额外断言 `forkSession` 未被调用。

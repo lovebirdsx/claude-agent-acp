@@ -11757,7 +11757,133 @@ describe("unstable_forkSession fork point (excludes anchored user turn)", () => 
     expect(forkSession).toHaveBeenCalledWith("test-session", { dir: "/proj" });
   });
 
-  it("omits upToMessageId when the anchor is the first message (no predecessor)", async () => {
+  it("resolves the fork point from disk when the source session is not resident", async () => {
+    // A fork runs on a temp lease that is often a FRESH process — the idle
+    // reaper released the source's pooled process, or the editor restarted —
+    // so the live `messageIdToUuid` table is empty. The anchor must still be
+    // resolved, from the on-disk transcript, instead of silently degrading to
+    // a full copy of the session.
+    const agent = createMockAgent();
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      { type: "user", uuid: "uuid-user-1", session_id: "s", message: {}, parent_tool_use_id: null },
+      {
+        type: "assistant",
+        uuid: "uuid-asst-1",
+        session_id: "s",
+        message: {},
+        parent_tool_use_id: null,
+      },
+      { type: "user", uuid: "uuid-user-2", session_id: "s", message: {}, parent_tool_use_id: null },
+      {
+        type: "assistant",
+        uuid: "uuid-asst-2",
+        session_id: "s",
+        message: {},
+        parent_tool_use_id: null,
+      },
+      { type: "user", uuid: "uuid-user-3", session_id: "s", message: {}, parent_tool_use_id: null },
+    ] as any);
+
+    await agent.unstable_forkSession({
+      sessionId: "test-session",
+      cwd: "/proj",
+      _meta: { rewindTo: "uuid-user-3" },
+    } as any);
+
+    expect(forkSession).toHaveBeenCalledWith("test-session", {
+      dir: "/proj",
+      upToMessageId: "uuid-asst-2",
+    });
+  });
+
+  it("rejects when the fork point cannot be located in the session", async () => {
+    const agent = createMockAgent();
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      { type: "user", uuid: "uuid-user-1", session_id: "s", message: {}, parent_tool_use_id: null },
+    ] as any);
+    vi.spyOn(agent as any, "readTranscriptEntries").mockResolvedValue(undefined);
+
+    await expect(
+      agent.unstable_forkSession({
+        sessionId: "test-session",
+        cwd: "/proj",
+        _meta: { rewindTo: "uuid-that-does-not-exist" },
+      } as any),
+    ).rejects.toThrow(/not found/i);
+    expect(forkSession).not.toHaveBeenCalled();
+  });
+
+  it("resolves a folded (steered) prompt to the message it was delivered under", async () => {
+    // A prompt sent while a turn was running is folded INTO that turn and
+    // persisted as a `queued_command` attachment row, which
+    // `getSessionMessages` filters out — so the messageId the client holds has
+    // no chain row to anchor on. The row's `attachment.source_uuid` keeps that
+    // messageId, and its `parentUuid` is the message the delivery hung off:
+    // slicing there keeps the folded prompt (and everything after it) out.
+    const agent = createMockAgent();
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      { type: "user", uuid: "uuid-user-1", session_id: "s", message: {}, parent_tool_use_id: null },
+      {
+        type: "assistant",
+        uuid: "uuid-asst-1",
+        session_id: "s",
+        message: {},
+        parent_tool_use_id: null,
+      },
+    ] as any);
+    vi.spyOn(agent as any, "readTranscriptEntries").mockResolvedValue([
+      { type: "assistant", uuid: "uuid-asst-1", parentUuid: "uuid-user-1" },
+      {
+        type: "attachment",
+        uuid: "uuid-attachment-1",
+        parentUuid: "uuid-asst-1",
+        attachment: { type: "queued_command", source_uuid: "acp-steered-1" },
+      },
+    ] as any);
+
+    await agent.unstable_forkSession({
+      sessionId: "test-session",
+      cwd: "/proj",
+      _meta: { rewindTo: "acp-steered-1" },
+    } as any);
+
+    expect(forkSession).toHaveBeenCalledWith("test-session", {
+      dir: "/proj",
+      upToMessageId: "uuid-asst-1",
+    });
+  });
+
+  it("rejects when a folded prompt was hung off a message no longer on the chain", async () => {
+    // An attachment row survives a rewind that removed its parent from the
+    // effective chain; anchoring on the orphaned parent would resurrect a turn
+    // the session no longer has.
+    const agent = createMockAgent();
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      { type: "user", uuid: "uuid-user-1", session_id: "s", message: {}, parent_tool_use_id: null },
+    ] as any);
+    vi.spyOn(agent as any, "readTranscriptEntries").mockResolvedValue([
+      {
+        type: "attachment",
+        uuid: "uuid-attachment-1",
+        parentUuid: "uuid-rewound-away",
+        attachment: { type: "queued_command", source_uuid: "acp-steered-1" },
+      },
+    ] as any);
+
+    await expect(
+      agent.unstable_forkSession({
+        sessionId: "test-session",
+        cwd: "/proj",
+        _meta: { rewindTo: "acp-steered-1" },
+      } as any),
+    ).rejects.toThrow(/not found/i);
+    expect(forkSession).not.toHaveBeenCalled();
+  });
+
+  it("rejects when the anchor is the first message (nothing precedes it)", async () => {
+    // `upToMessageId` is inclusive and the SDK has no way to express an empty
+    // history as a fork point, so a fork before the first turn is refused
+    // instead of silently forking the whole session.
     const agent = createMockAgent();
     injectGeneratorSession(agent, async function* () {});
     const session = agent.sessions["test-session"]!;
@@ -11773,13 +11899,14 @@ describe("unstable_forkSession fork point (excludes anchored user turn)", () => 
       },
     ] as any);
 
-    await agent.unstable_forkSession({
-      sessionId: "test-session",
-      cwd: "/proj",
-      _meta: { rewindTo: "acp-user-1" },
-    } as any);
-
-    expect(forkSession).toHaveBeenCalledWith("test-session", { dir: "/proj" });
+    await expect(
+      agent.unstable_forkSession({
+        sessionId: "test-session",
+        cwd: "/proj",
+        _meta: { rewindTo: "acp-user-1" },
+      } as any),
+    ).rejects.toThrow(/first message/i);
+    expect(forkSession).not.toHaveBeenCalled();
   });
 });
 

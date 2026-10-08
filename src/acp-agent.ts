@@ -3523,22 +3523,18 @@ export class ClaudeAcpAgent {
     // `forkSession({upToMessageId})` slices the transcript up to and INCLUDING
     // that uuid, but a fork "from message X" must contain everything BEFORE X
     // and not X itself — so we key on the predecessor of the anchored user turn.
-    // When X is the very first message there is no predecessor and the fork
-    // degenerates to an empty history, which the editor does not expose.
+    // A fork point that cannot be resolved is an error (see `forkSliceBefore`),
+    // never a silent fold back to a full copy of the session.
     const rewindTo = (params._meta as { rewindTo?: unknown } | undefined)?.rewindTo;
     if (typeof rewindTo === "string") {
-      const anchorUuid = this.resolveMessageUuid(params.sessionId, rewindTo);
-      const upToMessageId =
-        anchorUuid !== undefined
-          ? await this.messageUuidBefore(params.sessionId, anchorUuid, params.cwd)
-          : undefined;
+      const upToMessageId = await this.forkSliceBefore(params.sessionId, rewindTo, params.cwd);
       // Do NOT create a resident session here: the client loads the fork next
       // (session/load), which resumes it from disk and replays its history. A
       // resident in-memory session would make getOrCreateSession short-circuit
       // and skip that disk-backed replay.
       const { sessionId } = await sdkForkSession(params.sessionId, {
         dir: params.cwd,
-        ...(upToMessageId !== undefined ? { upToMessageId } : {}),
+        upToMessageId,
       });
       return { sessionId };
     }
@@ -9105,6 +9101,99 @@ export class ClaudeAcpAgent {
     const idx = messages.findIndex((m) => m.uuid === targetUuid);
     if (idx <= 0) return undefined;
     return messages[idx - 1]?.uuid;
+  }
+
+  /**
+   * Resolve the uuid a client-anchored fork (`_meta.rewindTo`) must be sliced up
+   * to: the message BEFORE the anchor turn, because the SDK's
+   * `forkSession({upToMessageId})` is inclusive of the id it is given.
+   *
+   * The anchor is an ACP messageId. The live `messageIdToUuid` table only exists
+   * on the process that has the source session resident — and a fork runs on a
+   * temp lease that is routinely a FRESH process (the idle reaper released the
+   * source's pooled process; the editor restarted), so resolving against the
+   * live table alone made those forks silently fall back to copying the WHOLE
+   * session. Read the on-disk transcript instead when the live table misses —
+   * the same source of truth the AIR fork path reads (`fork-session.ts`). A user
+   * turn's uuid IS the messageId we hand clients (`prompt()` stamps
+   * `_meta.messageId` onto the message), and assistant turns are keyed by their
+   * API id via `messageIdForGrouping`.
+   *
+   * A fork point that cannot be located — or that is the first message, which
+   * has no predecessor and cannot be expressed as an (inclusive) slice point —
+   * is an invalid request: the client asked for a truncated session and must not
+   * be handed a full copy of the source instead.
+   */
+  private async forkSliceBefore(
+    sessionId: string,
+    messageId: string,
+    dir?: string,
+  ): Promise<string> {
+    const timing = new SessionTiming(this.logger, "fork", sessionId);
+    const liveUuid = this.resolveMessageUuid(sessionId, messageId);
+    // An empty dir must be dropped, not passed through: the SDK reads a missing
+    // `dir` as "search every project", while an empty one matches nothing.
+    const messages = await getSessionMessages(
+      sessionId,
+      dir !== undefined && dir.length > 0 ? { dir } : {},
+    );
+    const anchorUuid =
+      liveUuid ?? messages.find((message) => messageIdForGrouping(message) === messageId)?.uuid;
+    const index =
+      anchorUuid !== undefined ? messages.findIndex((message) => message.uuid === anchorUuid) : -1;
+    // The resolution source is the first thing a "why is my fork wrong?" report
+    // needs, and this path used to fail silently (full copy) — so log it. The
+    // vocabulary matches the AIR path's (`resolution=live|active|...`).
+    let resolution: "live" | "active" | "folded" = liveUuid !== undefined ? "live" : "active";
+    let upToMessageId = index > 0 ? messages[index - 1]?.uuid : undefined;
+    if (upToMessageId === undefined) {
+      if (index === 0) {
+        throw RequestError.invalidParams(
+          { messageId },
+          `Fork point message ${messageId} is the first message of session ${sessionId}; there is no history to fork before it`,
+        );
+      }
+      upToMessageId = await this.foldedPromptForkPoint(sessionId, messageId, messages);
+      resolution = "folded";
+      if (upToMessageId === undefined) {
+        throw RequestError.invalidParams(
+          { messageId },
+          `Fork point message ${messageId} was not found in session ${sessionId}`,
+        );
+      }
+    }
+    timing.phase(
+      "fork-point",
+      ` resolution=${resolution} anchor=${messageId} upTo=${upToMessageId}`,
+    );
+    return upToMessageId;
+  }
+
+  /**
+   * The fork point for a prompt the CLI folded into an already-running turn
+   * ("steering"): it is persisted as a `queued_command` ATTACHMENT row, which
+   * `getSessionMessages` filters out — so the id the client holds has no uuid on
+   * the effective chain to anchor on, even when the source session is resident
+   * (the live table maps it to itself, not to a row that exists). The row's
+   * `attachment.source_uuid` preserves the client's messageId and its
+   * `parentUuid` is the message the delivery was hung off: slicing there keeps
+   * the folded prompt and everything after it out of the fork. Returns undefined
+   * when nothing matches, or when the parent is no longer on the effective chain
+   * (an attachment left behind by a rewind must not resurrect that turn).
+   */
+  private async foldedPromptForkPoint(
+    sessionId: string,
+    messageId: string,
+    chain: readonly { uuid: string }[],
+  ): Promise<string | undefined> {
+    const entries = await this.readTranscriptEntries(sessionId);
+    const folded = entries?.find(
+      (entry) => isQueuedCommandEntry(entry) && entry.attachment?.source_uuid === messageId,
+    );
+    const parent = typeof folded?.parentUuid === "string" ? folded.parentUuid : undefined;
+    return parent !== undefined && chain.some((message) => message.uuid === parent)
+      ? parent
+      : undefined;
   }
 
   /**
