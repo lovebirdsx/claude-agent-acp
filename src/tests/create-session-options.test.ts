@@ -387,6 +387,55 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.env?.CLAUDE_CODE_ENTRYPOINT).toBe("sdk-ts");
   });
 
+  it("opts into the task-list tools by default", async () => {
+    vi.stubEnv("CLAUDE_CODE_ENABLE_TODO_TOOLS", "");
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect(capturedOptions!.env?.CLAUDE_CODE_ENABLE_TODO_TOOLS).toBe("1");
+  });
+
+  it("respects a caller-provided CLAUDE_CODE_ENABLE_TODO_TOOLS", async () => {
+    vi.stubEnv("CLAUDE_CODE_ENABLE_TODO_TOOLS", "");
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            env: {
+              CLAUDE_CODE_ENABLE_TODO_TOOLS: "0",
+            },
+          },
+        },
+      },
+    });
+
+    expect(capturedOptions!.env?.CLAUDE_CODE_ENABLE_TODO_TOOLS).toBe("0");
+  });
+
+  it("respects a host-provided CLAUDE_CODE_ENABLE_TODO_TOOLS", async () => {
+    vi.stubEnv("CLAUDE_CODE_ENABLE_TODO_TOOLS", "0");
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect(capturedOptions!.env?.CLAUDE_CODE_ENABLE_TODO_TOOLS).toBe("0");
+  });
+
+  it("respects a CLAUDE_CODE_ENABLE_TODO_TOOLS the user set in settings.json", async () => {
+    vi.stubEnv("CLAUDE_CODE_ENABLE_TODO_TOOLS", "");
+    const userSettings = path.join(emptyConfigDir, "settings.json");
+    fs.writeFileSync(
+      userSettings,
+      JSON.stringify({ env: { CLAUDE_CODE_ENABLE_TODO_TOOLS: "0" } }),
+    );
+    try {
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(capturedOptions!.env?.CLAUDE_CODE_ENABLE_TODO_TOOLS).toBeFalsy();
+    } finally {
+      fs.rmSync(userSettings, { force: true });
+    }
+  });
+
   it("inherits HOME and PATH from process.env when no env is provided", async () => {
     await agent.newSession({
       cwd: process.cwd(),

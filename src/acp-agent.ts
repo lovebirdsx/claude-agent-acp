@@ -10982,6 +10982,20 @@ export class ClaudeAcpAgent {
       !userProvidedOptions?.env?.CLAUDE_CODE_ENTRYPOINT?.trim()
         ? { CLAUDE_CODE_ENTRYPOINT: "universe-editor" }
         : {}),
+      // Fork patch: CLI 2.1.287 gates the plan tools — TaskCreate/TaskUpdate/
+      // TaskList/TaskGet, plus TodoWrite once `CLAUDE_CODE_ENABLE_TASKS=false` —
+      // behind `CLAUDE_CODE_ENABLE_TODO_TOOLS` whenever the main-loop model is
+      // not a first-party canonical name, which is the normal case under
+      // gateway routing. Without the tools the model never produces the plan
+      // updates the session editor's plan card renders. The value goes through
+      // the CLI's bool schema, so 1/true/yes/on all enable. Any explicit
+      // host/caller/settings.json setting wins (settings.json's `env` block is
+      // an explicit user setting too — see resolveSubagentModelEnv).
+      ...(!process.env.CLAUDE_CODE_ENABLE_TODO_TOOLS?.trim() &&
+      !userProvidedOptions?.env?.CLAUDE_CODE_ENABLE_TODO_TOOLS?.trim() &&
+      !settingsManager.getSettings().env?.CLAUDE_CODE_ENABLE_TODO_TOOLS?.trim()
+        ? { CLAUDE_CODE_ENABLE_TODO_TOOLS: "1" }
+        : {}),
       // Opt-in to session state events like when the agent is idle
       CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
     };
