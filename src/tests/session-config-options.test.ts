@@ -1311,6 +1311,8 @@ describe("session config options", () => {
 
       // The switch resolved without waiting for getContextUsage.
       expect(session.query.getContextUsage).toHaveBeenCalledOnce();
+      // `summary` 明细：默认 `full` 会按分类各发一次 messages/count_tokens。
+      expect(session.query.getContextUsage).toHaveBeenCalledWith({ detail: "summary" });
       expect(session.contextWindowSize).toBe(200000);
 
       answer({ rawMaxTokens: 967000 });

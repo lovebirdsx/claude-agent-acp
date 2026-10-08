@@ -31,7 +31,11 @@ export interface ToolUseFacts {
 /** The output of a command, for the terminal channel. */
 export interface CommandOutput {
   output: string;
-  exitCode: number;
+  /** 命令的退出码，仅当 tool result 明确给出时才有值；不给时缺省（失败但未点名
+   *  退出码、被中断或转后台的命令、被 Claude Code 判为成功的非零码）。 */
+  exitCode?: number;
+  /** 命令在结束前被中断。 */
+  interrupted?: boolean;
 }
 
 /**

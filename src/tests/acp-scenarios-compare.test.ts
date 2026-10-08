@@ -103,6 +103,43 @@ describe("compareWithBaseline", () => {
     });
   });
 
+  describe("terminal_exit unknown code", () => {
+    const call = update({
+      sessionUpdate: "tool_call",
+      toolCallId: "t",
+      title: "Bash",
+      status: "pending",
+      _meta: { claudeCode: { toolName: "Bash" } },
+    });
+    const exit = (exitCode: number | null) =>
+      update({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "t",
+        status: "completed",
+        _meta: { terminal_exit: { exit_code: exitCode } },
+      });
+    // 同一张卡片、在 exit 报告之前到达的 adapter 专属行。
+    const adapterTally = update({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "t",
+      _meta: { "_universe/tally": 1 },
+    });
+
+    it("accepts a null exit code where origin/main sent a code", () => {
+      expect(compareWithBaseline([call, exit(1)], [call, exit(null)])).toEqual([]);
+    });
+
+    it("accepts the null exit code when an adapter line precedes it", () => {
+      expect(compareWithBaseline([call, exit(1)], [call, adapterTally, exit(null)])).toEqual([]);
+    });
+
+    it("still reports a different exit code", () => {
+      expect(compareWithBaseline([call, exit(1)], [call, exit(0)])).toContainEqual(
+        expect.stringMatching(/^origin\/main sent .*but the adapter sent /u),
+      );
+    });
+  });
+
   describe("AskUserQuestion result", () => {
     const askCall = update({
       sessionUpdate: "tool_call",

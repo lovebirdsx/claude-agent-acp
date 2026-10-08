@@ -787,11 +787,12 @@ describe("Bash terminal output", () => {
       });
     });
 
-    it("should route failed commands through the terminal when supportsTerminalOutput is true", () => {
+    it("should route failed commands through the terminal with the code their text names", () => {
+      // Claude Code 以 `Exit code N` 开头那种失败命令的文本。
       const toolResult: ToolResultBlockParam = {
         type: "tool_result",
         tool_use_id: "toolu_bash",
-        content: "some error output",
+        content: "Exit code 2\nsome error output",
         is_error: true,
       };
       const update = toolUpdateFromToolResult(toolResult, bashToolUse, true);
@@ -799,8 +800,8 @@ describe("Bash terminal output", () => {
       expect(update.content).toEqual([{ type: "terminal", terminalId: "toolu_bash" }]);
       expect(update._meta).toEqual({
         terminal_info: { terminal_id: "toolu_bash" },
-        terminal_output: { terminal_id: "toolu_bash", data: "some error output" },
-        terminal_exit: { terminal_id: "toolu_bash", exit_code: 1, signal: null },
+        terminal_output: { terminal_id: "toolu_bash", data: "Exit code 2\nsome error output" },
+        terminal_exit: { terminal_id: "toolu_bash", exit_code: 2, signal: null },
       });
     });
 
@@ -955,13 +956,13 @@ describe("Bash terminal output", () => {
         const update = toolUpdateFromToolResult(toolResult, bashToolUse, true);
 
         // Failed Bash commands skip the early error return and reach the Bash
-        // case so the client receives terminal output with a non-zero exit code
-        // instead of plain markdown details.
+        // case so the client receives terminal output instead of plain
+        // markdown details. A failure whose text names no exit code has none.
         expect(update.content).toEqual([{ type: "terminal", terminalId: "toolu_bash" }]);
         expect(update._meta).toEqual({
           terminal_info: { terminal_id: "toolu_bash" },
           terminal_output: { terminal_id: "toolu_bash", data: "command not found: bad_cmd" },
-          terminal_exit: { terminal_id: "toolu_bash", exit_code: 1, signal: null },
+          terminal_exit: { terminal_id: "toolu_bash", exit_code: null, signal: null },
         });
       });
 
@@ -1088,7 +1089,7 @@ describe("Bash terminal output", () => {
           expect(update._meta).toEqual({
             terminal_info: { terminal_id: terminalId },
             terminal_output: { terminal_id: terminalId, data: "command not found: bad_cmd" },
-            terminal_exit: { terminal_id: terminalId, exit_code: 1, signal: null },
+            terminal_exit: { terminal_id: terminalId, exit_code: null, signal: null },
           });
         },
       );
@@ -2372,7 +2373,7 @@ describe("PowerShell terminal output", () => {
       _meta: {
         terminal_exit: {
           terminal_id: id,
-          exit_code: 1,
+          exit_code: null,
           signal: null,
         },
       },
@@ -4209,7 +4210,7 @@ describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
       ]);
     });
 
-    it("re-establishes the abort notice and a failing exit code for interrupted commands", () => {
+    it("re-establishes the abort notice and no exit code for interrupted commands", () => {
       const update = toolUpdateFromToolResult(rawWithHint, bashToolUse, true, {
         ...structured,
         stdout: "partial output",
@@ -4222,7 +4223,7 @@ describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
       });
       expect(update._meta?.terminal_exit).toEqual({
         terminal_id: "toolu_bash",
-        exit_code: 1,
+        exit_code: null,
         signal: null,
       });
     });
@@ -4238,6 +4239,50 @@ describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
       expect(update._meta?.terminal_output).toEqual({
         terminal_id: "toolu_bash",
         data: "clipped stdout\n[Output truncated (38100 bytes total): full output saved to /tmp/tool-results/abc.txt]",
+      });
+    });
+
+    describe("exit codes", () => {
+      const text = (content: string, is_error = false): ToolResultBlockParam => ({
+        type: "tool_result",
+        tool_use_id: "toolu_bash",
+        content,
+        is_error,
+      });
+      const exitCode = (result: ToolResultBlockParam, toolUseResult?: unknown) =>
+        toolUpdateFromToolResult(result, bashToolUse, true, toolUseResult)._meta?.terminal_exit
+          ?.exit_code;
+
+      // 命令、结果、未知退出码时终端拿到的码（未知为 null）。
+      it.each<[string, ToolResultBlockParam, unknown, number | null]>([
+        ["a success", text("pushed ok"), structured, 0],
+        ["a failure that names its code", text("Exit code 2\nboom", true), undefined, 2],
+        [
+          "a failure that names no code",
+          text("Permission to use Bash has been denied.", true),
+          undefined,
+          null,
+        ],
+        [
+          "an interrupted command",
+          text("partial"),
+          { ...structured, stdout: "partial", interrupted: true },
+          null,
+        ],
+        [
+          "a backgrounded command",
+          text("Command running in background with ID: bash_1."),
+          { ...structured, stdout: "", backgroundTaskId: "bash_1" },
+          null,
+        ],
+        [
+          "a non-zero code that Claude Code accepted as a success",
+          text("No matches found"),
+          { ...structured, stdout: "", returnCodeInterpretation: "No matches found" },
+          null,
+        ],
+      ])("%s", (_name, result, toolUseResult, expected) => {
+        expect(exitCode(result, toolUseResult)).toBe(expected);
       });
     });
   });

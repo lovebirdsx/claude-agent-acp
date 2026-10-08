@@ -91,7 +91,6 @@ import {
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
 import {
   AUTONOMOUS_RESULT_ORIGINS,
-  findFoldedPromptParent,
   isCompactBoundaryEntry,
   isDisplayMessageEntry,
   isQueuedCommandEntry,
@@ -99,6 +98,8 @@ import {
   rebuildTranscriptDisplayChain,
   type RawTranscriptEntry,
 } from "./transcript-history.js";
+import { resolveForkAnchor } from "./session-anchor.js";
+import { releaseQueryResources } from "./query-resources.js";
 import {
   AcpSessionNotification,
   asSdkSessionNotification,
@@ -1202,6 +1203,11 @@ export type Session = {
    *  tool_use block streams; this set makes the two paths converge regardless of
    *  order. Pruned at `tool_result` time alongside `toolUseCache`. */
   emittedToolCalls: Set<string>;
+  /** Claude Code 真正派发给工具运行器的 tool call：完整 assistant 消息里的
+   *  `tool_use`，或权限请求问过的调用。只流到 `content_block_start`、从未进入
+   *  完整消息的 tool_use 不在这里——Claude 在它运行前就放弃了（如 steering）。
+   *  调用结束即删；最旧的条目会被丢弃。 */
+  dispatchedToolCalls?: Set<string>;
   /** The fields that the client holds for each open tool call, so that a
    *  `tool_call_update` resends only the fields that changed. Created lazily
    *  by {@link toolCallFieldsOf}. */
@@ -4296,6 +4302,7 @@ export class ClaudeAcpAgent {
         (update.status === "completed" || update.status === "failed")
       ) {
         session.eagerToolCallSessions?.delete(toolCallId);
+        session.dispatchedToolCalls?.delete(toolCallId);
       }
     };
     // toAcpNotifications registers deferred tool hooks that publish through
@@ -4614,6 +4621,41 @@ export class ClaudeAcpAgent {
      *  the autonomous stretch-close guard. */
     const firstUnsettledQueuedTurn = () => (session.turnQueue ?? []).find((t) => !t.settled);
 
+    /** 该结果是否在作答一个仍在等待的 prompt。
+     *
+     *  Claude Code 会自行起一轮（如后台任务完成）。若该轮运行中用户发了
+     *  prompt，CLI 把 prompt 折进这一轮：结果仍标 task-notification origin，
+     *  但在 `user_message_uuids` 里列出被作答的 prompt uuid。只按 origin 判
+     *  会把它当自主结果跳过，`session/prompt` 永远得不到应答、客户端一直
+     *  停在 running（上游 #1233）。为它保留的子 agent 轮已拿到自己的结果，
+     *  点名它不算作答。 */
+    const answersPendingPrompt = (message: {
+      user_message_uuid?: string;
+      user_message_uuids?: string[];
+    }): boolean => {
+      // 新 CLI 列出本轮作答的所有 prompt；旧 CLI 只给最后一个。
+      let answeredPromptUuids: string[] = [];
+      if (Array.isArray(message.user_message_uuids)) {
+        answeredPromptUuids = message.user_message_uuids;
+      } else if (typeof message.user_message_uuid === "string") {
+        answeredPromptUuids = [message.user_message_uuid];
+      }
+
+      for (const promptUuid of answeredPromptUuids) {
+        const turn = findUnsettledTurn(promptUuid);
+        if (turn === undefined) {
+          // 不是本会话的 prompt，或已经被作答。
+          continue;
+        }
+        if (isHeldOpen(turn)) {
+          // 该轮已有结果，只是在等它的子 agent。
+          continue;
+        }
+        return true;
+      }
+      return false;
+    };
+
     /** Claim the structured replacement for the turn currently producing a
      * local-command output. Undefined means this is not a structured
      * local-command turn (or its request failed), null means another SDK
@@ -4746,39 +4788,53 @@ export class ClaudeAcpAgent {
         const unfinished = [...(turn.foregroundToolCallIds ?? [])].filter(
           (id) => session.emittedToolCalls.has(id) && !backgroundTools.has(id),
         );
-        if (unfinished.length > 0) {
-          const message = `Claude ended the turn without returning results for tool calls: ${unfinished.join(", ")}`;
+        /** 把一个 tool call 收尾为失败。轮已结束则返回 false。 */
+        const failToolCall = async (toolCallId: string, text: string): Promise<boolean> => {
+          // 迟到的 hook 不能覆盖我们即将发出的失败。
+          unregisterHookCallback(toolCallId);
+          session.emittedToolCalls.delete(toolCallId);
+          delete session.toolUseCache[toolCallId];
+          session.toolCallFields?.delete(toolCallId);
+          session.dispatchedToolCalls?.delete(toolCallId);
+          await sendUpdate({
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId,
+              status: "failed",
+              content: [{ type: "content", content: { type: "text", text } }],
+            },
+          });
+          // await 客户端更新期间可能到达取消。
+          if (turn.settled || session.activeTurn !== turn) return false;
+          if (session.cancelled) {
+            await settleActive({ ...result, stopReason: "cancelled" });
+            return false;
+          }
+          return true;
+        };
+        // 从未进入完整 assistant 消息的流式 tool_use 根本没运行：Claude 放弃了它
+        // （如 steering）。这不是该轮的失败，按中性文案收尾即可。
+        const abandoned = unfinished.filter((id) => !session.dispatchedToolCalls?.has(id));
+        const stuck = unfinished.filter((id) => session.dispatchedToolCalls?.has(id));
+        for (const toolCallId of abandoned) {
+          if (!(await failToolCall(toolCallId, "Claude stopped this tool call before it ran."))) {
+            return;
+          }
+        }
+        if (stuck.length > 0) {
+          const message = `Claude ended the turn without returning results for tool calls: ${stuck.join(", ")}`;
           this.logger.error(
             `Session ${params.sessionId}, turn ${turn.promptUuid}, stopReason=${result.stopReason}: ${message}`,
           );
           // Fail every unfinished tool before reporting one error for the prompt.
-          for (const toolCallId of unfinished) {
-            // A late hook must not overwrite the failure we are about to send.
-            unregisterHookCallback(toolCallId);
-            session.emittedToolCalls.delete(toolCallId);
-            delete session.toolUseCache[toolCallId];
-            session.toolCallFields?.delete(toolCallId);
-            await sendUpdate({
-              sessionId: params.sessionId,
-              update: {
-                sessionUpdate: "tool_call_update",
+          for (const toolCallId of stuck) {
+            if (
+              !(await failToolCall(
                 toolCallId,
-                status: "failed",
-                content: [
-                  {
-                    type: "content",
-                    content: {
-                      type: "text",
-                      text: "Claude ended the turn without returning a result for this tool.",
-                    },
-                  },
-                ],
-              },
-            });
-            // Cancellation can arrive while we await the client update.
-            if (turn.settled || session.activeTurn !== turn) return;
-            if (session.cancelled) {
-              await settleActive({ ...result, stopReason: "cancelled" });
+                "Claude ended the turn without returning a result for this tool.",
+              ))
+            ) {
               return;
             }
           }
@@ -6007,8 +6063,12 @@ export class ClaudeAcpAgent {
             // the user's prompt's. Autonomous results must never touch the
             // user-turn lifecycle (stop reason, settles, failActive,
             // slash-command output forwarding), though their cost is real.
-            const isAutonomousResult =
+            // 例外：用户 prompt 在该轮运行中被折进来时，结果会在
+            // user_message_uuids 点名它，即该 prompt 的作答（见
+            // answersPendingPrompt）。
+            const startedByClaudeCode =
               message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
+            const isAutonomousResult = startedByClaudeCode && !answersPendingPrompt(message);
             const pendingExitPlanModeInterruption = session.pendingExitPlanModeInterruption;
             const pendingExitPlanContextReset = session.pendingExitPlanContextReset;
             try {
@@ -6855,6 +6915,8 @@ export class ClaudeAcpAgent {
           }
           case "user":
           case "assistant": {
+            if (message.type === "assistant")
+              recordDispatchedToolUses(session, message.message.content);
             // Record the ACP messageId -> SDK uuid mapping for this message
             // (including replays). The consolidated message carries both ids, so
             // this is where we learn the uuid the SDK's rewind/resume APIs key on
@@ -7840,9 +7902,10 @@ export class ClaudeAcpAgent {
   }
 
   /** Mark a session's SDK query stream as permanently ended and release the
-   *  resources tied to it: drop the consumer handle, dispose the settings
-   *  watchers, end the input stream, and close the query (which terminates the
-   *  subprocess). The query iterator is not revivable, so `prompt()`/`cancel()`
+   *  query-side resources tied to it (drop the consumer handle, dispose the
+   *  settings watchers, end the input stream, close the query — see
+   *  `query-resources.ts` for the released set and its ordering). The query
+   *  iterator is not revivable, so `prompt()`/`cancel()`
    *  consult `queryClosed` and fail/short-circuit instead of acting on a dead
    *  stream. Idempotent (guarded by `queryClosed`), so the consumer's done/error
    *  paths and a later `teardownSession` can all call it without double-releasing.
@@ -7859,19 +7922,7 @@ export class ClaudeAcpAgent {
    *  on the next closeSession/deleteSession or when the connection's `dispose()`
    *  runs. */
   private closeQueryStream(session: Session): void {
-    if (session.queryClosed) {
-      return;
-    }
-    session.queryClosed = true;
-    session.consumer = undefined;
-    session.contextCompaction = undefined;
-    if (session.orphanQueuedTurnTimer) {
-      clearTimeout(session.orphanQueuedTurnTimer);
-      session.orphanQueuedTurnTimer = undefined;
-    }
-    session.settingsManager.dispose();
-    session.input.end();
-    session.query.close();
+    releaseQueryResources(session);
   }
 
   /** Wedged-session resurrections in flight, keyed by session id. The
@@ -8277,24 +8328,12 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * Resolve the uuid a client-anchored fork (`_meta.rewindTo`) must be sliced up
-   * to: the message BEFORE the anchor turn, because the SDK's
-   * `forkSession({upToMessageId})` is inclusive of the id it is given.
+   * 生产调用点：解析客户端锚点（`_meta.rewindTo`）对应的 fork 切点。
    *
-   * The anchor is an ACP messageId. The live `messageIdToUuid` table only exists
-   * on the process that has the source session resident — and a fork runs on a
-   * temp lease that is routinely a FRESH process (the idle reaper released the
-   * source's pooled process; the editor restarted), so resolving against the
-   * live table alone made those forks silently fall back to copying the WHOLE
-   * session. Read the on-disk transcript instead when the live table misses. A user
-   * turn's uuid IS the messageId we hand clients (`prompt()` stamps
-   * `_meta.messageId` onto the message), and assistant turns are keyed by their
-   * API id via `messageIdForGrouping`.
-   *
-   * A fork point that cannot be located — or that is the first message, which
-   * has no predecessor and cannot be expressed as an (inclusive) slice point —
-   * is an invalid request: the client asked for a truncated session and must not
-   * be handed a full copy of the source instead.
+   * 窄决策已迁到 `session-anchor.ts`（`resolveForkAnchor`）；这里只负责注入真实
+   * 依赖（live 表、有效链读取器、原始 transcript 读取器、分组分类器）并保留
+   * `SessionTiming` 起止与日志——它记录「这个 fork 到底按哪条来源解析的」，是
+   * 「为什么我的 fork 不对」报告的第一现场。
    */
   private async forkSliceBefore(
     sessionId: string,
@@ -8302,63 +8341,21 @@ export class ClaudeAcpAgent {
     dir?: string,
   ): Promise<string> {
     const timing = new SessionTiming(this.logger, "fork", sessionId);
-    const liveUuid = this.resolveMessageUuid(sessionId, messageId);
-    // An empty dir must be dropped, not passed through: the SDK reads a missing
-    // `dir` as "search every project", while an empty one matches nothing.
-    const messages = await getSessionMessages(
+    const { upToMessageId, resolution } = await resolveForkAnchor({
       sessionId,
-      dir !== undefined && dir.length > 0 ? { dir } : {},
-    );
-    const anchorUuid =
-      liveUuid ?? messages.find((message) => messageIdForGrouping(message) === messageId)?.uuid;
-    const index =
-      anchorUuid !== undefined ? messages.findIndex((message) => message.uuid === anchorUuid) : -1;
-    // The resolution source is the first thing a "why is my fork wrong?" report
-    // needs, and this path used to fail silently (full copy) — so log it.
-    let resolution: "live" | "active" | "folded" = liveUuid !== undefined ? "live" : "active";
-    let upToMessageId = index > 0 ? messages[index - 1]?.uuid : undefined;
-    if (upToMessageId === undefined) {
-      if (index === 0) {
-        throw RequestError.invalidParams(
-          { messageId },
-          `Fork point message ${messageId} is the first message of session ${sessionId}; there is no history to fork before it`,
-        );
-      }
-      upToMessageId = await this.foldedPromptForkPoint(sessionId, messageId, messages);
-      resolution = "folded";
-      if (upToMessageId === undefined) {
-        throw RequestError.invalidParams(
-          { messageId },
-          `Fork point message ${messageId} was not found in session ${sessionId}`,
-        );
-      }
-    }
+      messageId,
+      liveUuid: this.resolveMessageUuid(sessionId, messageId),
+      dir,
+      readChain: (chainDir) =>
+        getSessionMessages(sessionId, chainDir !== undefined ? { dir: chainDir } : {}),
+      readRawEntries: () => this.readTranscriptEntries(sessionId),
+      messageIdForGrouping,
+    });
     timing.phase(
       "fork-point",
       ` resolution=${resolution} anchor=${messageId} upTo=${upToMessageId}`,
     );
     return upToMessageId;
-  }
-
-  /**
-   * The fork point for a prompt the CLI folded into an already-running turn
-   * ("steering"): it is persisted as a `queued_command` ATTACHMENT row, which
-   * `getSessionMessages` filters out — so the id the client holds has no uuid on
-   * the effective chain to anchor on, even when the source session is resident
-   * (the live table maps it to itself, not to a row that exists). The row's
-   * `attachment.source_uuid` preserves the client's messageId and its
-   * `parentUuid` is the message the delivery was hung off: slicing there keeps
-   * the folded prompt and everything after it out of the fork. Returns undefined
-   * when nothing matches, or when the parent is no longer on the effective chain
-   * (an attachment left behind by a rewind must not resurrect that turn).
-   */
-  private async foldedPromptForkPoint(
-    sessionId: string,
-    messageId: string,
-    chain: readonly { uuid: string }[],
-  ): Promise<string | undefined> {
-    const entries = await this.readTranscriptEntries(sessionId);
-    return findFoldedPromptParent(entries, messageId, chain);
   }
 
   /**
@@ -9665,6 +9662,8 @@ export class ClaudeAcpAgent {
         toolCallFieldsOf(session).pinContent(toolCallId, previewContent);
       }
     };
+    // 权限请求只会为即将运行的 tool call 发来。
+    recordDispatchedToolCall(session, toolCallId);
     if (session.emittedToolCalls.has(toolCallId)) {
       pinPreview();
       return;
@@ -10271,8 +10270,11 @@ export class ClaudeAcpAgent {
    * result's modelUsage. Never awaited: SDK control requests are serialized,
    * so an awaited call would delay session/new or a model switch (before the
    * first turn it took ~15s on older CLIs, issues #886/#880; ~0.5s on 2.1.283).
-   * Not written to `contextWindowCache` — that stays keyed to the
-   * `result.modelUsage` spellings — and a result still overwrites it.
+   * 请求 `summary` 明细而非默认 `full`：`full` 会按分类各发一次
+   * `messages/count_tokens`（空会话约 18 次），每次切模型都触发限流；`summary`
+   * 本地作答且 `rawMaxTokens` 相同。Not written to `contextWindowCache` — that
+   * stays keyed to the `result.modelUsage` spellings — and a result still
+   * overwrites it.
    */
   private refreshContextWindowInBackground(sessionId: string, session: Session): void {
     if (session.contextWindowAuthoritative) return;
@@ -10290,7 +10292,7 @@ export class ClaudeAcpAgent {
       session.models.currentModelId === modelId;
     // A synchronous throw must not fail the caller either.
     Promise.resolve()
-      .then(() => query.getContextUsage())
+      .then(() => query.getContextUsage({ detail: "summary" }))
       .then(
         (usage) => {
           if (!stillCurrent() || session.contextWindowAuthoritative) return;
@@ -12348,6 +12350,34 @@ function isTaskTool(toolName: string): boolean {
  *  resolved explicitly at tool_result time. */
 function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName);
+}
+
+const MAX_DISPATCHED_TOOL_CALLS = 1000;
+
+/** 记录 Claude Code 已派发给工具运行器的 tool call。 */
+function recordDispatchedToolCall(session: Session, toolCallId: string): void {
+  const calls = (session.dispatchedToolCalls ??= new Set());
+  calls.delete(toolCallId);
+  calls.add(toolCallId);
+  if (calls.size > MAX_DISPATCHED_TOOL_CALLS) {
+    const oldest = calls.values().next().value;
+    if (oldest !== undefined) calls.delete(oldest);
+  }
+}
+
+/** 记录一条完整 assistant 消息里的 tool_use 块。 */
+function recordDispatchedToolUses(session: Session, content: unknown): void {
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    if (
+      (block?.type === "tool_use" ||
+        block?.type === "server_tool_use" ||
+        block?.type === "mcp_tool_use") &&
+      typeof block.id === "string"
+    ) {
+      recordDispatchedToolCall(session, block.id);
+    }
+  }
 }
 
 /** Streamed and permission-surfaced tools can precede the SDK's user echo. */

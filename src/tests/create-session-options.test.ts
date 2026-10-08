@@ -14,6 +14,8 @@ import * as path from "node:path";
 
 let capturedOptions: Options | undefined;
 let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
+/** 每次后台 `getContextUsage` 调用携带的选项，按顺序。 */
+let contextUsageCalls: Array<{ detail?: "summary" | "full" } | undefined> = [];
 let sessionMessages: Record<string, unknown>[];
 let sessionMessagesResult: () => Promise<Record<string, unknown>[]>;
 let initModels: Record<string, unknown>[] | undefined;
@@ -47,8 +49,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
           return initializationResponse();
         },
         setModel: (model: string) => (setModelImpl ? setModelImpl(model) : Promise.resolve()),
-        getContextUsage: () =>
-          contextUsageResult ? contextUsageResult() : Promise.resolve(DEFAULT_CONTEXT_USAGE),
+        getContextUsage: (opts?: { detail?: "summary" | "full" }) => {
+          contextUsageCalls.push(opts);
+          return contextUsageResult ? contextUsageResult() : Promise.resolve(DEFAULT_CONTEXT_USAGE);
+        },
         mcpServerStatus: () => mcpServerStatusResult(),
         mcpAuthenticate: (serverName: string) => mcpAuthenticateImpl(serverName),
       });
@@ -95,6 +99,7 @@ describe("createSession options merging", () => {
   beforeEach(async () => {
     capturedOptions = undefined;
     contextUsageResult = undefined;
+    contextUsageCalls = [];
     sessionMessages = [];
     sessionMessagesResult = async () => sessionMessages;
     vi.mocked(getSessionMessages).mockClear();
@@ -1079,6 +1084,31 @@ describe("createSession options merging", () => {
 
       await vi.waitFor(() => expect(sessionFor(response.sessionId).contextWindowSize).toBe(967000));
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(true);
+      // `summary` 明细：默认 `full` 会按分类各发一次 messages/count_tokens，切模型
+      // 即触发限流；此处的本地位置只需要 rawMaxTokens。
+      expect(contextUsageCalls).toEqual([{ detail: "summary" }]);
+    });
+
+    it("asks for the summary context usage only once a turn has started", async () => {
+      // 与上游不同：fork 在首个 turn 之前不发 getContextUsage（控制请求单通道
+      // 串行，turn 前不被服务），故 summary 明细只出现在已开 turn 的刷新里。
+      initModels = [
+        { value: "claude-sonnet-4-6", displayName: "Sonnet", description: "Fast" },
+        { value: "claude-opus-4-5", displayName: "Opus", description: "Capable" },
+      ];
+      contextUsageResult = async () => ({ rawMaxTokens: 967000 });
+
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(contextUsageCalls).toEqual([]);
+
+      sessionFor(response.sessionId).hasStartedTurn = true;
+      await agent.setSessionConfigOption({
+        sessionId: response.sessionId,
+        configId: "model",
+        value: "claude-opus-4-5",
+      });
+      await vi.waitFor(() => expect(contextUsageCalls).toEqual([{ detail: "summary" }]));
     });
 
     it("keeps the guessed window when getContextUsage reports a non-positive size", async () => {

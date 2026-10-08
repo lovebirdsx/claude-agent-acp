@@ -81,9 +81,9 @@ CLI 的 first-party 家族改写会把内置 Explore 子 agent 从网关模型�
 
 ## fork 分叉点解析走磁盘兜底、失败即报错（休眠源会话曾静默整份复制）
 
-`unstable_forkSession` 的 `_meta.rewindTo`（编辑器「Fork from here」按钮）分叉点解析原实现只查 live `messageIdToUuid`——那是 **agent 进程内存**表，而 fork 走临时租约、**常落在新 spawn 的进程**（源会话被空闲回收成 dormant / 编辑器重启过；`AcpSession.poolResume.integration.test.ts` 已有用例证明该路径确实新起进程）。映射为空 → 省略 `upToMessageId` → SDK 文档 "If omitted, full copy" **静默整份复制**（用户实测：fork 文件每行都带 `forkedFrom`，1:1 覆盖源会话全部消息记录）。这与 fork 的设计前提直接矛盾——`ForkTipFooter` 明确写着「fork 读磁盘而非 live 会话，无需唤醒源会话」。
+`unstable_forkSession` 的 `_meta.rewindTo`（编辑器「Fork from here」按钮）分叉点解析原实现只查 live `messageIdToUuid`——那是 **agent 进程内存**表，而 fork 走临时租约、**常落在新 spawn 的进程**（源会话被空闲回收成 dormant / 编辑器重启过；`AcpSession.poolResume.integration.test.ts` 已有用例证明该路径确实新起进程）。映射为空 → 省略 `upToMessageId` → SDK 文档 "If omitted, full copy" **静默整份复制**（用户实测：fork 文件 1:1 覆盖源会话全部消息记录——注意「每行都带 `forkedFrom`」**不是**整份复制的判据，锚定 fork 的每行同样带；判据是覆盖了**全部**消息）。这与 fork 的设计前提直接矛盾——`ForkTipFooter` 明确写着「fork 读磁盘而非 live 会话，无需唤醒源会话」。
 
-修法（`acp-agent.ts`，`unstable_forkSession` 分支 + 新 helper `forkSliceBefore` / `foldedPromptForkPoint`）：
+修法（`unstable_forkSession` 分支；窄决策现已迁到 `session-anchor.ts` 的 `resolveForkAnchor`，`acp-agent.ts` 的 `forkSliceBefore` 只剩注入真实依赖的薄壳，folded 判定复用 `transcript-history.ts` 的 `findFoldedPromptParent`）：
 
 1. **磁盘为唯一真相**：live 映射未命中时读 `getSessionMessages(sid, {dir})`（与 `messageIdBefore` 同一次读取，不增 IO），用 `messageIdForGrouping` / `uuid` 双判据匹配锚点——user 轮的 uuid **就是**发给 client 的 messageId（`prompt()` 把 `_meta.messageId` 盖成 `SDKMessage.uuid`），assistant 轮按 API id 归类。（AIR 锚点路径的 `fork-session.ts` 的 `loadFullSessionHistory` 已随 AIR 退役删除，tip fork 现只剩 SDK `forkSession`。）对齐 codex 侧（`SessionFork.ts` 从持久化 thread 解析，故其无此 bug）。
 2. **解析不到即 `RequestError.invalidParams`**，绝不静默退回整份复制（对齐 fork 自己的 rewind 失败形态）。锚点是**首条消息**同样报错——`upToMessageId` inclusive 且 SDK 无法表达"空历史"，而该锚点可达（粘性条右键菜单），不能给整份副本。
@@ -93,3 +93,5 @@ CLI 的 first-party 家族改写会把内置 Explore 子 agent 从网关模型�
 不传 `_meta.rewindTo` 的调用（tip fork / 命令面板 / `forkSideTask`）保持整份复制，语义不变。**勿改回"不唤醒源会话就静默复制"**：唤醒的代价是 spawn + 整会话 replay（长会话数十秒），且违背该路径的既有设计。
 
 配套测试 `tests/acp-agent.test.ts` 的 `describe("unstable_forkSession fork point (excludes anchored user turn)")`：resident 命中（live 表）／非 resident 磁盘兜底／折叠 prompt 命中／两个 reject（锚点不存在、锚点为首条）各一例，reject 用例额外断言 `forkSession` 未被调用。
+
+**真实 SDK 行为（`tests/fork-session-sdk.test.ts`，真实 `forkSession` / `getSessionMessages` 文件操作，8/8 通过）**：`forkSession` 把保留行的 `uuid` / `parentUuid` 重映射为新 uuid（parent 链不悬挂）、丢弃 progress / sidechain 行；但 **folded attachment 行本身、以及它的 `attachment.source_uuid`（客户端 prompt id）原样保留**——回放正是靠这个 id 重新锚定。`compact_boundary` 的 `logicalParentUuid` 也重映射到新的压缩前 uuid，显示链因此穿过边界。**勿把这里写成「raw uuid / `source_uuid` 全被重映射」**——`source_uuid` 恰恰被保留。

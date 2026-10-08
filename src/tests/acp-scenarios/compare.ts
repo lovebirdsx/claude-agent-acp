@@ -21,6 +21,9 @@
  * - An `available_commands_update` also lists the `mcp` command of the
  *   adapter (see {@link ADAPTER_COMMANDS}), when origin/main did not list
  *   `mcp`. The adapter replaces the text of `/mcp` for every client.
+ * - origin/main 对「未点名退出码的失败 / 被中断的命令」在 `terminal_exit` 里发 1、
+ *   对转后台的命令发 0；这些地方 adapter 改发 `null` 退出码（见
+ *   `CommandOutput.exitCode`）。
  * - An `extNotification` of the adapter's own extension namespace
  *   (see {@link ADAPTER_NOTIFICATION_PREFIX}): the structured report that
  *   the adapter sends instead of the text chunk origin/main streamed.
@@ -302,6 +305,32 @@ function isAppended(key: string): boolean {
   return APPENDED_META_KEYS.has(key.slice("_meta.".length));
 }
 
+/**
+ * 当 origin/main 在同一个 tool call 的 `terminal_exit` 里发了退出码、而 `actual`
+ * 的退出码未知时，返回把 `wanted` 的退出码替换为未知的副本。
+ */
+function withUnknownExitCode(wanted: Recorded, actual: Recorded | undefined): Recorded {
+  const want = updateOf(wanted);
+  const got = actual ? updateOf(actual) : undefined;
+  const wantExit = (want?._meta as Json | undefined)?.terminal_exit as Json | undefined;
+  const gotExit = (got?._meta as Json | undefined)?.terminal_exit as Json | undefined;
+  if (
+    !want ||
+    !wantExit ||
+    !gotExit ||
+    got?.toolCallId !== want.toolCallId ||
+    typeof wantExit.exit_code !== "number" ||
+    gotExit.exit_code !== null
+  ) {
+    return wanted;
+  }
+  const update = {
+    ...want,
+    _meta: { ...(want._meta as Json), terminal_exit: { ...wantExit, exit_code: null } },
+  };
+  return { ...wanted, payload: { ...(wanted.payload as Json), update } } as Recorded;
+}
+
 /** Whether a client must get the key on every report, because ACP does not merge it. */
 function isMeta(key: string): boolean {
   return key.startsWith("_meta.");
@@ -490,8 +519,14 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
     return true;
   };
 
-  for (const wanted of expected) {
-    while (additional(current[next], next) && !matches(wanted, current[next], next)) next++;
+  for (const recorded of expected) {
+    let wanted = withUnknownExitCode(recorded, current[next]);
+    while (additional(current[next], next) && !matches(wanted, current[next], next)) {
+      next++;
+      // 循环跳过 adapter 自己的行时 `wanted` 也在前移，故其未知退出码要按实际
+      // 落到的行重新推导。
+      wanted = withUnknownExitCode(recorded, current[next]);
+    }
     if (matches(wanted, current[next], next)) {
       remember(updateOf(wanted));
       next++;

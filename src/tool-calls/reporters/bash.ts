@@ -36,7 +36,10 @@ export class BashReporter implements ToolReporter {
     // 4. Array content: text blocks for stdout, or image blocks when the
     //    command produces an image.
     let output = "";
-    let exitCode = isError ? 1 : 0;
+    // Claude Code 只在带 `returnCodeInterpretation`（grep 的 "No matches found"）
+    // 时把非零码判为成功，故未带此字段的成功就是 0。
+    let exitCode: number | undefined = isError ? undefined : 0;
+    let interrupted = false;
 
     const structuredBash = structuredResult<BashOutput>(structured);
     if (
@@ -47,12 +50,13 @@ export class BashReporter implements ToolReporter {
       structuredBash.backgroundTaskId === undefined
     ) {
       output = [structuredBash.stdout, structuredBash.stderr].filter(Boolean).join("\n");
-      // The CLI appends its abort marker only to the model-facing text, and an
-      // aborted command is not a success.
+      // CLI 只把中断标记加到面模型文本上，结果本身不带被中断命令的退出码。
       if (structuredBash.interrupted) {
         output = [output, "[Command was aborted before completion]"].filter(Boolean).join("\n");
-        exitCode = 1;
+        exitCode = undefined;
+        interrupted = true;
       }
+      if (structuredBash.returnCodeInterpretation !== undefined) exitCode = undefined;
       // Structured stdout is clipped when the full output was persisted to
       // disk. Without this note the clip is silent.
       if (typeof structuredBash.persistedOutputPath === "string") {
@@ -89,6 +93,24 @@ export class BashReporter implements ToolReporter {
       }
       output = content.map((c: any) => c.text).join("\n");
     }
-    return { command: { output, exitCode } };
+    if (isError && exitCode === undefined) exitCode = failureExitCode(output);
+    // 转后台的命令仍在运行：结果只是宣告它已转后台。
+    if (structuredBash?.backgroundTaskId !== undefined) exitCode = undefined;
+    return {
+      command: {
+        output,
+        ...(exitCode !== undefined ? { exitCode } : {}),
+        ...(interrupted ? { interrupted } : {}),
+      },
+    };
   }
+}
+
+/**
+ * 失败命令文本里点名的退出码。Claude Code 以 `Exit code N` 开头那种命令的文本；
+ * 其它失败（拒绝、起不来）不点名任何退出码。
+ */
+function failureExitCode(text: string): number | undefined {
+  const match = /^Exit code (\d+)(?:\n|$)/.exec(text);
+  return match ? Number(match[1]) : undefined;
 }

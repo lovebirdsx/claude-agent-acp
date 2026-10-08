@@ -216,7 +216,11 @@ export function rebuildTranscriptDisplayChain(
  *  (the result is skipped, its trailing idle absorbed as owed, so the
  *  #825 detector can't fire); misrouting an autonomous result into the
  *  user lane is the bounded misattribution class this set exists to
- *  reduce. */
+ *  reduce.
+ *
+ *  例外：这些 origin 的结果若在 `user_message_uuids` 里点名了仍在等待的
+ *  prompt，说明用户插话被折进了该自主周期，它应当作答该 prompt，回到用户
+ *  lane（见 acp-agent.ts 结果分支的 answersPendingPrompt）。 */
 export const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = new Set([
   "task-notification",
   "peer",
