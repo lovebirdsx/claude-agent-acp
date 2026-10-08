@@ -1,13 +1,11 @@
 import type { RequestPermissionRequest, ToolCallContent } from "@agentclientprotocol/sdk";
-import { AIR_PERMISSION_KEY, withAirMeta } from "../air-extension.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
 
 /**
  * A permission request as the agent builds it. For a v2 client it also
  * carries the heading and the explanation of the prompt, which ACP v2 sends as
- * the request's `title` and `description`. v1 has no field for them; AIR gets
- * them in `_meta`.
+ * the request's `title` and `description`. v1 has no field for them.
  */
 export type AcpPermissionRequest = RequestPermissionRequest & {
   /** The heading of the prompt. It is not the title of the tool call. */
@@ -64,8 +62,8 @@ function compactText(value: unknown): string | undefined {
  * holds the rest. The request adds only what it shows new: the exact preview
  * patch, and the blocked path when the tool call has no such location.
  *
- * The heading and the explanation of the prompt go to AIR in `_meta`, and to a
- * v2 client as `title` and `description`.
+ * The heading and the explanation of the prompt go to a v2 client as `title`
+ * and `description`.
  */
 export function buildClaudePermissionPresentation(
   value: ClaudePermissionPresentationInput,
@@ -118,20 +116,7 @@ export function buildClaudePermissionPresentation(
             ]
           : undefined,
     }),
-    // Only AIR gets the permission presentation.
-    ...(title && capabilities.air.client
-      ? {
-          _meta: withAirMeta(undefined, AIR_PERMISSION_KEY, {
-            version: 1,
-            title,
-            ...(description ? { description } : {}),
-            // The CLI's own hint, forwarded so a client that can pre-select
-            // an option keeps the decline focused; the option order already
-            // leads with the reject options when this is set.
-            ...(value.defaultToNo === true ? { defaultToNo: true } : {}),
-          }),
-        }
-      : {}),
+    // Only a v2 client gets the permission heading and explanation.
     ...(capabilities.v2 ? { title, ...(description ? { description } : {}) } : {}),
   };
 }

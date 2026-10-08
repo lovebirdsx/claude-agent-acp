@@ -1,13 +1,15 @@
 /**
- * Compares the outbound ACP traffic of a client that is not AIR with the
- * traffic that origin/main sent for the same scenario.
+ * Compares the outbound ACP traffic of the adapter with the traffic that
+ * origin/main sent for the same scenario.
  *
- * The rule: a client that is not AIR gets the same information in the same
- * fields as on origin/main. {@link compareWithBaseline} allows only these
- * differences, and returns every other difference as a violation:
+ * The rule: a client gets the same information in the same fields as on
+ * origin/main. {@link compareWithBaseline} allows only these differences, and
+ * returns every other difference as a violation:
  *
- * - A key that exists only for AIR is gone (see {@link AIR_ONLY_META_KEYS}).
- *   A `session_info_update` that carried only such a key is not sent.
+ * - The `_meta` keys that upstream wrote for AIR alone are gone (see
+ *   {@link UPSTREAM_AIR_META_KEYS}); the adapter has no AIR support, so no
+ *   client receives them. A `session_info_update` that carried only such a key
+ *   is not sent.
  * - A `tool_call_update` leaves out a top-level field whose value did not
  *   change since the previous report of the same tool call. An update with
  *   nothing new is not sent. ACP does not merge `_meta` keys, so every
@@ -52,8 +54,8 @@
  */
 import type { Recorded } from "./harness.js";
 
-/** The top-level `_meta` keys that exist only for AIR. */
-export const AIR_ONLY_META_KEYS = new Set([
+/** The upstream top-level `_meta` keys that only AIR ever read. */
+export const UPSTREAM_AIR_META_KEYS = new Set([
   "jetbrains",
   "goal",
   "contextCompaction",
@@ -62,8 +64,8 @@ export const AIR_ONLY_META_KEYS = new Set([
   "_askUserQuestionCustomAnswer",
 ]);
 
-/** The `_meta.claudeCode` keys that exist only for AIR. */
-export const AIR_ONLY_CLAUDE_CODE_KEYS = new Set(["title", "subagent", "skill", "skillPath"]);
+/** The upstream `_meta.claudeCode` keys that only AIR ever read. */
+export const UPSTREAM_AIR_CLAUDE_CODE_KEYS = new Set(["title", "subagent", "skill", "skillPath"]);
 
 /** The `_meta.claudeCode` keys that only the adapter adds, on the tool call of
  *  a permission request: whether a host may answer "yes, once" on the user's
@@ -116,31 +118,32 @@ export function canonical(value: unknown): string {
   );
 }
 
-/** Removes the keys that exist only for AIR and the adapter's own, recursively. */
-export function withoutAirOnlyKeys(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(withoutAirOnlyKeys);
+/** Removes the upstream AIR keys and the adapter's own, recursively. */
+export function withoutUpstreamAirKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutUpstreamAirKeys);
   if (!value || typeof value !== "object") return value;
   const result: Json = {};
   for (const [key, item] of Object.entries(value as Json)) {
     if (key === "_meta" && item && typeof item === "object" && !Array.isArray(item)) {
       const meta: Json = {};
       for (const [metaKey, metaValue] of Object.entries(item as Json)) {
-        if (AIR_ONLY_META_KEYS.has(metaKey) || adapterMetaKey(metaKey)) continue;
+        if (UPSTREAM_AIR_META_KEYS.has(metaKey) || adapterMetaKey(metaKey)) continue;
         if (metaKey === "claudeCode" && metaValue && typeof metaValue === "object") {
           const claudeCode = Object.fromEntries(
             Object.entries(metaValue as Json).filter(
-              ([k]) => !AIR_ONLY_CLAUDE_CODE_KEYS.has(k) && !ADAPTER_CLAUDE_CODE_KEYS.has(k),
+              ([k]) => !UPSTREAM_AIR_CLAUDE_CODE_KEYS.has(k) && !ADAPTER_CLAUDE_CODE_KEYS.has(k),
             ),
           );
-          if (Object.keys(claudeCode).length > 0) meta[metaKey] = withoutAirOnlyKeys(claudeCode);
+          if (Object.keys(claudeCode).length > 0)
+            meta[metaKey] = withoutUpstreamAirKeys(claudeCode);
           continue;
         }
-        meta[metaKey] = withoutAirOnlyKeys(metaValue);
+        meta[metaKey] = withoutUpstreamAirKeys(metaValue);
       }
       if (Object.keys(meta).length > 0) result[key] = meta;
       continue;
     }
-    result[key] = withoutAirOnlyKeys(item);
+    result[key] = withoutUpstreamAirKeys(item);
   }
   return result;
 }
@@ -310,7 +313,7 @@ function isMeta(key: string): boolean {
  */
 export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): string[] {
   const expected = baseline
-    .map((record) => withoutAirOnlyKeys(record) as Recorded)
+    .map((record) => withoutUpstreamAirKeys(record) as Recorded)
     .filter((record) => {
       const update = updateOf(record);
       return !(update?.sessionUpdate === "session_info_update" && Object.keys(update).length === 1);
@@ -385,8 +388,8 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
       // out — it advertises its extensions there — and the mode entry the
       // adapter adds is removed (see {@link ADDED_MODE_ID}).
       return (
-        canonical(withoutAirOnlyKeys(withoutAddedModeEntry(actual.payload ?? null))) ===
-        canonical(withoutAirOnlyKeys(wanted.payload ?? null))
+        canonical(withoutUpstreamAirKeys(withoutAddedModeEntry(actual.payload ?? null))) ===
+        canonical(withoutUpstreamAirKeys(wanted.payload ?? null))
       );
     }
     if (want.sessionUpdate !== got.sessionUpdate) return false;
@@ -466,7 +469,7 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
     if (want.sessionUpdate === "usage_update") {
       // Same report plus a `_meta` key of the adapter's namespace: the
       // mid-turn cost breakdown rides along on the same usage_update.
-      return canonical(withoutAirOnlyKeys(actual)) === canonical(wanted);
+      return canonical(withoutUpstreamAirKeys(actual)) === canonical(wanted);
     }
     return false;
   };

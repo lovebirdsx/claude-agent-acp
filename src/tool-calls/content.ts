@@ -269,26 +269,3 @@ export function resultText(result: { content?: unknown; is_error?: boolean | nul
 } {
   return toAcpContentUpdate(result.content, result.is_error === true);
 }
-
-/**
- * The marker fields of a PostToolUse `tool_response` that clients read.
- *
- * The full `tool_response` repeats the tool output. A Read holds the whole
- * file, a Bash holds stdout and stderr, and a Write holds the content. The
- * tool-call content already carries that output. JetBrains AIR reads
- * `status` and `isAsync` to detect an async subagent launch, so only those
- * fields stay. Returns undefined when neither field is present.
- */
-export function toolResponseMarkers(
-  toolResponse: unknown,
-): { status?: string; isAsync?: boolean } | undefined {
-  if (!toolResponse || typeof toolResponse !== "object" || Array.isArray(toolResponse)) {
-    return undefined;
-  }
-  const { status, isAsync } = toolResponse as { status?: unknown; isAsync?: unknown };
-  const markers = {
-    ...(typeof status === "string" ? { status } : {}),
-    ...(typeof isAsync === "boolean" ? { isAsync } : {}),
-  };
-  return Object.keys(markers).length > 0 ? markers : undefined;
-}

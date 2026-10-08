@@ -1,29 +1,14 @@
-import type {
-  FileEditInput,
-  FileWriteInput,
-  NotebookEditInput,
-} from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
-import type { ToolCallContent } from "@agentclientprotocol/sdk";
-import {
-  patchUpdateFromDiffToolResponse,
-  toolUpdateFromDiffToolResponse,
-  v2UpdateFromDiffToolResponse,
-} from "../../diff.js";
-import { markdownEscape, resultText, textContent, toDisplayPath } from "../content.js";
-import type {
-  ToolReporter,
-  ToolResultContext,
-  ToolResultFacts,
-  ToolUseContext,
-  ToolUseFacts,
-} from "../facts.js";
+import type { FileEditInput, FileWriteInput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
+import { toolUpdateFromDiffToolResponse, v2UpdateFromDiffToolResponse } from "../../diff.js";
+import { textContent, toDisplayPath } from "../content.js";
+import type { ToolReporter, ToolResultFacts, ToolUseContext, ToolUseFacts } from "../facts.js";
 
 /**
  * Write: the diff holds the file text. The PostToolUse hook sends the final
  * diff, so the result text is only a confirmation.
  */
 export class WriteReporter implements ToolReporter {
-  toolUse(input: unknown, { cwd, capabilities, replay }: ToolUseContext): ToolUseFacts {
+  toolUse(input: unknown, { cwd, capabilities }: ToolUseContext): ToolUseFacts {
     const write = normalizeWriteInput(input);
     const displayPath = write?.file_path ? toDisplayPath(write.file_path, cwd) : undefined;
     const facts: ToolUseFacts = {
@@ -32,14 +17,11 @@ export class WriteReporter implements ToolReporter {
       locations: write?.file_path ? [{ path: write.file_path }] : [],
     };
     if (write?.file_path) {
-      // A negotiated client and a v2 client get the exact patch from the
-      // approval preview or from the PostToolUse hook. The input does not tell
-      // whether the file exists, so the live tool call shows no diff: a diff
-      // without the old text would claim a creation. The adapter reads the
-      // file only for the preview. A replay has no preview and no hook, so it
-      // keeps the diff, except for a v2 client: a v2 diff names the operation,
-      // which the input does not tell.
-      const inputDiff = capabilities.v2 ? false : !capabilities.diffPatch || replay;
+      // A v2 client gets the exact patch from the PostToolUse hook. The input
+      // does not tell whether the file exists, so the live tool call shows no
+      // diff: a diff without the old text would claim a creation. A v2 diff
+      // names the operation, which the input does not tell either.
+      const inputDiff = !capabilities.v2;
       if (inputDiff) {
         facts.change = [
           {
@@ -51,8 +33,6 @@ export class WriteReporter implements ToolReporter {
           },
         ];
       }
-      // The patch holds the file text, so rawInput does not.
-      if (write.contentKey) facts.fileTextKeys = [write.contentKey];
     } else if (write?.content) {
       facts.display = [textContent(write.content)];
     }
@@ -68,8 +48,8 @@ export class WriteReporter implements ToolReporter {
   }
 }
 
-/** A Write input with the canonical keys, and the input key that holds the file text. */
-type NormalizedWriteInput = Partial<FileWriteInput> & { contentKey?: string };
+/** A Write input with the canonical keys. */
+type NormalizedWriteInput = Partial<FileWriteInput>;
 
 const WRITE_CONTENT_KEYS = ["content", "file_text", "file_content"] as const;
 
@@ -90,7 +70,7 @@ export function normalizeWriteInput(input: unknown): NormalizedWriteInput | unde
         : undefined;
   const contentKey = WRITE_CONTENT_KEYS.find((key) => raw[key] !== undefined && raw[key] !== null);
   const content = contentKey ? (raw[contentKey] as string) : undefined;
-  return { file_path: filePath, content, contentKey };
+  return { file_path: filePath, content };
 }
 
 /** Edit: the diff holds the old and the new text. */
@@ -103,10 +83,10 @@ export class EditReporter implements ToolReporter {
       kind: "edit",
       locations: edit?.file_path ? [{ path: edit.file_path }] : [],
     };
-    // The standard diff, also for a client that negotiated patches: the input
-    // holds a snippet, not the file, so a patch would need line numbers that
-    // the adapter does not know here. A v2 diff cannot hold a snippet, so a v2
-    // client gets the patch from the PostToolUse hook alone.
+    // The standard diff: the input holds a snippet, not the file, so a patch
+    // would need line numbers that the adapter does not know here. A v2 diff
+    // cannot hold a snippet, so a v2 client gets the patch from the
+    // PostToolUse hook alone.
     if (edit?.file_path && (edit.old_string || edit.new_string) && !capabilities.v2) {
       facts.change = [
         {
@@ -116,7 +96,6 @@ export class EditReporter implements ToolReporter {
           newText: edit.new_string ?? "",
         },
       ];
-      facts.fileTextKeys = ["old_string", "new_string"];
     }
     return facts;
   }
@@ -133,88 +112,13 @@ export class EditReporter implements ToolReporter {
 /**
  * The final change of an Edit or a Write, from the structuredPatch of the
  * PostToolUse `tool_response`. For Write it replaces the optimistic creation
- * diff with the real diff of an updated file. A negotiated client gets an
- * exact git patch built from the written file, or the standard diff when none
- * can be built. A v2 client gets a v2 diff.
+ * diff with the real diff of an updated file. A v2 client gets a v2 diff.
  */
 async function finalChange(
   toolResponse: unknown,
   { capabilities }: ToolUseContext,
 ): Promise<ToolResultFacts> {
-  if (capabilities.v2) return v2UpdateFromDiffToolResponse(toolResponse);
-  if (!capabilities.diffPatch) return toolUpdateFromDiffToolResponse(toolResponse);
-  const patch = await patchUpdateFromDiffToolResponse(toolResponse, "air");
-  if (patch) return patch;
-  const created = createdFileDiff(toolResponse);
-  return created ?? toolUpdateFromDiffToolResponse(toolResponse);
-}
-
-/**
- * The standard diff of a file that a Write created, when it cannot have an
- * exact patch. The Write tool call of a client with diffPatch shows no diff,
- * so without it the client would never see the created file.
- */
-function createdFileDiff(toolResponse: unknown): ToolResultFacts | undefined {
-  const response = toolResponse as { type?: unknown; filePath?: unknown; content?: unknown } | null;
-  if (
-    response?.type !== "create" ||
-    typeof response.filePath !== "string" ||
-    typeof response.content !== "string"
-  ) {
-    return undefined;
-  }
-  return {
-    content: [{ type: "diff", path: response.filePath, oldText: null, newText: response.content }],
-    locations: [{ path: response.filePath }],
-  };
-}
-
-/**
- * NotebookEdit: the new cell source is input. ACP has no notebook diff, and a
- * `diff` block would name the `.ipynb` file with cell text instead of file
- * text, so the source stays in `rawInput` and gets a display copy.
- *
- * Only AIR gets this rendering. Every other client gets the generic rendering
- * of the upstream adapter.
- */
-export class NotebookEditReporter implements ToolReporter {
-  toolUse(input: unknown, { cwd, capabilities }: ToolUseContext): ToolUseFacts {
-    if (!capabilities.air.client) return { title: "NotebookEdit", kind: "other" };
-    const notebook = input as Partial<NotebookEditInput> | undefined;
-    const displayPath = notebook?.notebook_path
-      ? toDisplayPath(notebook.notebook_path, cwd)
-      : undefined;
-    const cell = notebook?.cell_id ? ` ${notebook.cell_id}` : "";
-    const verb =
-      notebook?.edit_mode === "insert"
-        ? "Insert"
-        : notebook?.edit_mode === "delete"
-          ? "Delete"
-          : "Edit";
-    const source = notebookSource(notebook);
-    return {
-      title: displayPath ? `${verb} cell${cell} in ${displayPath}` : "Edit notebook",
-      kind: "edit",
-      locations: notebook?.notebook_path ? [{ path: notebook.notebook_path }] : [],
-      ...(source ? { display: source } : {}),
-    };
-  }
-
-  /**
-   * The result text repeats the new cell source, which the input holds. A
-   * cell deletion has no source, so its result text is the result to show.
-   */
-  toolResult(context: ToolResultContext): ToolResultFacts {
-    return context.capabilities.air.client &&
-      notebookSource(context.toolUse.input as Partial<NotebookEditInput>)
-      ? { rawOutput: undefined }
-      : resultText(context.result);
-  }
-}
-
-function notebookSource(
-  input: Partial<NotebookEditInput> | undefined,
-): ToolCallContent[] | undefined {
-  if (input?.edit_mode === "delete" || typeof input?.new_source !== "string") return undefined;
-  return [textContent(markdownEscape(input.new_source))];
+  return capabilities.v2
+    ? v2UpdateFromDiffToolResponse(toolResponse)
+    : toolUpdateFromDiffToolResponse(toolResponse);
 }

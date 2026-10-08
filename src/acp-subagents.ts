@@ -3,12 +3,6 @@ import type {
   SessionCapabilities,
   SessionNotification,
 } from "@agentclientprotocol/sdk";
-import {
-  AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
-  clientSupportsAirCapability,
-} from "./air-extension.js";
-
-export { AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY } from "./air-extension.js";
 
 /**
  * Temporary typed surface for agentclientprotocol/agent-client-protocol#1992.
@@ -48,54 +42,8 @@ export type SubagentStateUpdate = {
   _meta?: Record<string, unknown> | null;
 };
 
-export type AsyncTaskState = "running" | "paused" | "completed" | "failed" | "stopped";
-
-export type AsyncTaskSpawnedUpdate = {
-  sessionUpdate: "async_task_spawned";
-  asyncTaskId: string;
-  name: string;
-  taskType: string;
-  description: string;
-  showInTranscript: boolean;
-  canStop: boolean;
-  outputFilePath?: string;
-  toolCallId?: string;
-  _meta?: Record<string, unknown> | null;
-};
-
-export type AsyncTaskProgressUpdate = {
-  sessionUpdate: "async_task_progress";
-  asyncTaskId: string;
-  description?: string;
-  summary?: string;
-  lastToolName?: string;
-  usage?: { totalTokens: number; toolUses: number; durationMs: number };
-  /** Latest durable task log path. May arrive after spawn. */
-  outputFilePath?: string;
-  /** Originating tool call, when correlation becomes known after spawn. */
-  toolCallId?: string;
-  _meta?: Record<string, unknown> | null;
-};
-
-export type AsyncTaskStateUpdate = {
-  sessionUpdate: "async_task_state_update";
-  asyncTaskId: string;
-  state: AsyncTaskState;
-  summary?: string;
-  /** Latest durable task log path, including terminal-only SDK reports. */
-  outputFilePath?: string;
-  /** Originating tool call, including terminal-only late correlation. */
-  toolCallId?: string;
-  _meta?: Record<string, unknown> | null;
-};
-
 export type AcpSessionUpdate =
-  | SessionNotification["update"]
-  | SubagentSpawnedUpdate
-  | SubagentStateUpdate
-  | AsyncTaskSpawnedUpdate
-  | AsyncTaskProgressUpdate
-  | AsyncTaskStateUpdate;
+  SessionNotification["update"] | SubagentSpawnedUpdate | SubagentStateUpdate;
 
 export type AcpSessionNotification = Omit<SessionNotification, "update"> & {
   update: AcpSessionUpdate;
@@ -109,11 +57,7 @@ export function clientSupportsSubagents(capabilities?: ClientCapabilities | null
   const subagents = (
     capabilities as (ClientCapabilities & { subagents?: unknown }) | null | undefined
   )?.subagents;
-  if (typeof subagents === "object" && subagents !== null && !Array.isArray(subagents)) {
-    return true;
-  }
-
-  return clientSupportsAirCapability(capabilities, AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY);
+  return typeof subagents === "object" && subagents !== null && !Array.isArray(subagents);
 }
 
 /** The only cast needed until the TypeScript SDK publishes PR #1992. */

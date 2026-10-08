@@ -16,7 +16,6 @@ import {
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
 import { buildClaudePermissionPresentation } from "../permissions/presentation.js";
 import { toolInfoFromToolUse } from "../tools.js";
-import { WriteReporter } from "../tool-calls/reporters/file-edit.js";
 
 const tempDirectories: string[] = [];
 
@@ -37,12 +36,9 @@ async function temporaryFile(content?: string | Buffer, name = "file.ts"): Promi
 function patchText(content: unknown): string {
   const block = Array.isArray(content) ? content[0] : content;
   if (!block || block.type !== "diff") throw new Error("Expected diff content");
-  return (block._meta as any).jetbrains.air.diffPatch.text;
-}
-
-/** The header name that git writes for an absolute path. */
-function gitName(filePath: string): string {
-  return filePath.replace(/^\/+/u, "");
+  const text = (block as { patch?: { text?: string } }).patch?.text;
+  if (!text) throw new Error("Expected a git patch");
+  return text;
 }
 
 describe("approval patch previews", () => {
@@ -55,12 +51,15 @@ describe("approval patch previews", () => {
       new_string: "changed line\n",
     });
 
-    expect(content?.[0]).toMatchObject({ type: "diff", oldText: null, newText: "" });
+    expect(content?.[0]).toMatchObject({
+      type: "diff",
+      changes: [{ operation: "modify", path: filePath, fileType: "text" }],
+    });
     expect(patchText(content)).toBe(
       [
-        `diff --git a/${gitName(filePath)} b/${gitName(filePath)}`,
-        `--- a/${gitName(filePath)}`,
-        `+++ b/${gitName(filePath)}`,
+        `diff --git ${filePath} ${filePath}`,
+        `--- ${filePath}`,
+        `+++ ${filePath}`,
         "@@ -5997,7 +5997,7 @@",
         " line 5997",
         " line 5998",
@@ -104,10 +103,10 @@ describe("approval patch previews", () => {
     expect(update).toContain("-before\n+after\n");
     expect(creation).toBe(
       [
-        `diff --git a/${gitName(missing)} b/${gitName(missing)}`,
+        `diff --git ${missing} ${missing}`,
         "new file mode 100644",
         "--- /dev/null",
-        `+++ b/${gitName(missing)}`,
+        `+++ ${missing}`,
         "@@ -0,0 +1 @@",
         "+created",
         "",
@@ -154,7 +153,12 @@ describe("approval patch previews", () => {
     );
     expect(
       await previewPatchContent("Write", { file_path: missing, content: "a\r\nb\r\n" }),
-    ).toEqual([{ type: "diff", path: missing, oldText: null, newText: "a\r\nb\r\n" }]);
+    ).toEqual([
+      {
+        type: "diff",
+        changes: [{ operation: "add", path: missing, fileType: "text" }],
+      },
+    ]);
   });
 
   it.skipIf(process.platform === "win32")(
@@ -203,7 +207,7 @@ describe("approval patch previews", () => {
 
     expect(creation).toContain("new file mode 100644\n--- /dev/null\n");
     expect(creation).toContain("@@ -0,0 +1 @@\n+a\n");
-    expect(fill).toContain(`--- a/${gitName(empty)}\n+++ b/${gitName(empty)}\n@@ -0,0 +1 @@\n`);
+    expect(fill).toContain(`--- ${empty}\n+++ ${empty}\n@@ -0,0 +1 @@\n`);
   });
 
   it("keeps the missing final newline marker", async () => {
@@ -283,7 +287,12 @@ describe("approval patch previews", () => {
     const clock = vi.spyOn(Date, "now").mockImplementation(() => (now += 1000));
     try {
       expect(await previewPatchContent("Write", { file_path: filePath, content: newText })).toEqual(
-        [{ type: "diff", path: filePath, oldText, newText }],
+        [
+          {
+            type: "diff",
+            changes: [{ operation: "modify", path: filePath, fileType: "text" }],
+          },
+        ],
       );
     } finally {
       clock.mockRestore();
@@ -340,57 +349,31 @@ describe("approval patch previews", () => {
     expect(all).toContain("@@ -1,2 +1 @@\n-x\n x\n");
   });
 
-  it("sends no content when there is no preview", async () => {
+  it("falls back to the standard diff when there is no exact preview", async () => {
     const missing = await temporaryFile();
     const input = { file_path: missing, old_string: "old", new_string: "new" };
     const presentation = buildClaudePermissionPresentation({
       toolName: "Edit",
       input,
       toolUseID: "tool-edit",
-      capabilities: new ClientCapabilities(false, false, true, {
-        client: true,
-        rawInputRendering: false,
-        planFile: false,
-      }),
+      capabilities: new ClientCapabilities(),
       previewContent: await previewPatchContent("Edit", input),
     });
 
-    // The tool_call already carries the standard diff.
-    expect(presentation.toolCall.content).toBeUndefined();
-    expect(presentation.toolCall.rawInput).toEqual({ file_path: missing });
+    // No exact patch (the file is gone), so the tool_call carries the standard
+    // diff of the Edit snippet.
+    expect(presentation.toolCall.content).toEqual([
+      { type: "diff", path: missing, oldText: "old", newText: "new" },
+    ]);
+    expect(presentation.toolCall.rawInput).toEqual({
+      file_path: missing,
+      old_string: "old",
+      new_string: "new",
+    });
   });
 });
 
 describe("git patch headers", () => {
-  const hunk = { oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ["-a", "+b"] };
-
-  it("strips the leading slash and converts Windows separators", () => {
-    expect(gitPatchText("/work/src/App.ts", "update", [hunk])).toMatch(
-      /^diff --git a\/work\/src\/App\.ts b\/work\/src\/App\.ts\n--- a\/work\/src\/App\.ts\n\+\+\+ b\/work\/src\/App\.ts\n/u,
-    );
-    expect(gitPatchText("C:\\work\\App.ts", "update", [hunk])).toContain(
-      "diff --git a/C:/work/App.ts b/C:/work/App.ts\n",
-    );
-  });
-
-  it("quotes names like git and marks names with a space", () => {
-    expect(gitPatchText('/work/a"b.ts', "update", [hunk])).toContain(
-      'diff --git "a/work/a\\"b.ts" "b/work/a\\"b.ts"\n--- "a/work/a\\"b.ts"\n',
-    );
-    expect(gitPatchText("/work/é.ts", "update", [hunk])).toContain(
-      'diff --git "a/work/\\303\\251.ts" "b/work/\\303\\251.ts"\n',
-    );
-    expect(gitPatchText("/work/my file.ts", "update", [hunk])).toContain(
-      "diff --git a/work/my file.ts b/work/my file.ts\n--- a/work/my file.ts\t\n+++ b/work/my file.ts\t\n",
-    );
-  });
-
-  it("writes a created file header", () => {
-    expect(gitPatchText("/f", "create", [{ ...hunk, oldLines: 0, lines: ["+b"] }])).toBe(
-      "diff --git a/f b/f\nnew file mode 100644\n--- /dev/null\n+++ b/f\n@@ -0,0 +1 @@\n+b\n",
-    );
-  });
-
   it("uses one header form for previews and hook patches", async () => {
     const filePath = await temporaryFile();
     const preview = patchText(
@@ -414,7 +397,7 @@ describe("git patch headers", () => {
 });
 
 describe("tool-call diff content", () => {
-  it("sends the standard diff for an Edit snippet in both modes", () => {
+  it("sends the standard diff for an Edit snippet", () => {
     const toolUse = {
       id: "edit",
       name: "Edit",
@@ -422,21 +405,20 @@ describe("tool-call diff content", () => {
     };
     const standard = [{ type: "diff", path: "/work/a.ts", oldText: "old", newText: "new" }];
 
-    expect(toolInfoFromToolUse(toolUse, false, undefined, true).content).toEqual(standard);
-    expect(toolInfoFromToolUse(toolUse, false, undefined, false).content).toEqual(standard);
+    expect(toolInfoFromToolUse(toolUse, false).content).toEqual(standard);
   });
 
-  it("sends a Write diff at tool use only to a client without diffPatch", () => {
+  it("sends a Write diff at tool use, with no old text to read", () => {
     const toolUse = {
       id: "write",
       name: "Write",
       input: { file_path: "/work/a.ts", content: "a\n" },
     };
 
-    // The input does not tell whether the file exists. The patch comes from the
-    // approval preview or from the PostToolUse hook.
-    expect(toolInfoFromToolUse(toolUse, false, undefined, true).content).toEqual([]);
-    expect(toolInfoFromToolUse(toolUse, false, undefined, false).content).toEqual([
+    // The input does not tell whether the file exists, so the tool use names
+    // the file without reading it; the exact content comes from the approval
+    // preview or from the PostToolUse hook.
+    expect(toolInfoFromToolUse(toolUse, false).content).toEqual([
       { type: "diff", path: "/work/a.ts", oldText: null, newText: "a\n" },
     ]);
   });
@@ -444,7 +426,7 @@ describe("tool-call diff content", () => {
 
 describe("ACP v2 diffs", () => {
   const hunk = { oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ["-a", "+b"] };
-  const v2 = new ClientCapabilities(false, false, false, undefined, true);
+  const v2 = new ClientCapabilities(false, false, true);
   const v2Diff = (filePath: string, operation: string, patch?: string) => ({
     type: "diff",
     changes: [{ operation, path: filePath, fileType: "text" }],
@@ -452,16 +434,16 @@ describe("ACP v2 diffs", () => {
   });
 
   it("names the absolute path in a git patch, without the a/ and b/ prefixes", () => {
-    expect(gitPatchText("/work/src/App.ts", "update", [hunk], "absolute")).toBe(
+    expect(gitPatchText("/work/src/App.ts", "update", [hunk])).toBe(
       "diff --git /work/src/App.ts /work/src/App.ts\n--- /work/src/App.ts\n+++ /work/src/App.ts\n@@ -1 +1 @@\n-a\n+b\n",
     );
-    expect(
-      gitPatchText("/f", "create", [{ ...hunk, oldLines: 0, lines: ["+b"] }], "absolute"),
-    ).toBe("diff --git /f /f\nnew file mode 100644\n--- /dev/null\n+++ /f\n@@ -0,0 +1 @@\n+b\n");
-    expect(gitPatchText('/work/a"b.ts', "update", [hunk], "absolute")).toContain(
+    expect(gitPatchText("/f", "create", [{ ...hunk, oldLines: 0, lines: ["+b"] }])).toBe(
+      "diff --git /f /f\nnew file mode 100644\n--- /dev/null\n+++ /f\n@@ -0,0 +1 @@\n+b\n",
+    );
+    expect(gitPatchText('/work/a"b.ts', "update", [hunk])).toContain(
       'diff --git "/work/a\\"b.ts" "/work/a\\"b.ts"\n',
     );
-    expect(gitPatchText("/work/my file.ts", "update", [hunk], "absolute")).toContain(
+    expect(gitPatchText("/work/my file.ts", "update", [hunk])).toContain(
       "--- /work/my file.ts\t\n+++ /work/my file.ts\t\n",
     );
   });
@@ -558,25 +540,17 @@ describe("ACP v2 diffs", () => {
 
   it("previews a change in v2 form", async () => {
     const filePath = await temporaryFile("a\n");
-    expect(
-      await previewPatchContent("Write", { file_path: filePath, content: "b\n" }, undefined, "v2"),
-    ).toEqual([
+    expect(await previewPatchContent("Write", { file_path: filePath, content: "b\n" })).toEqual([
       v2Diff(
         filePath,
         "modify",
         `diff --git ${filePath} ${filePath}\n--- ${filePath}\n+++ ${filePath}\n@@ -1 +1 @@\n-a\n+b\n`,
       ),
     ]);
-    // A text that cannot have an exact patch: the change alone, where v1 gets
-    // the standard diff.
-    expect(
-      await previewPatchContent(
-        "Write",
-        { file_path: filePath, content: "b\r\n" },
-        undefined,
-        "v2",
-      ),
-    ).toEqual([v2Diff(filePath, "modify")]);
+    // A text that cannot have an exact patch: the change alone.
+    expect(await previewPatchContent("Write", { file_path: filePath, content: "b\r\n" })).toEqual([
+      v2Diff(filePath, "modify"),
+    ]);
   });
 
   it("sends no diff where the operation is unknown or nothing changed", async () => {
@@ -603,23 +577,6 @@ describe("ACP v2 diffs", () => {
 });
 
 describe("Write tool calls for an existing file", () => {
-  const air = new ClientCapabilities(false, false, true, {
-    client: true,
-    rawInputRendering: false,
-    planFile: false,
-  });
-
-  it("does not read the file at tool use", async () => {
-    const filePath = await temporaryFile("before\n");
-    const toolUse = {
-      id: "write",
-      name: "Write",
-      input: { file_path: filePath, content: "after\n" },
-    };
-
-    expect(toolInfoFromToolUse(toolUse, false, undefined, true).content).toEqual([]);
-  });
-
   it("shows the standard diff in the approval of a Write whose diff exceeds the budget", async () => {
     // Every line changes, so the line diff runs out of its time budget.
     const oldText = Array.from({ length: 20_000 }, (_, index) => `old ${index}\n`).join("");
@@ -646,20 +603,6 @@ describe("Write tool calls for an existing file", () => {
     expect(result).toBeUndefined();
   });
 
-  it("shows a created file that cannot have a patch in the hook result", async () => {
-    // No approval ran, and CRLF text has no exact patch, so the hook is the
-    // only report that shows the created file.
-    const filePath = await temporaryFile("a\r\nb\r\n");
-    const result = await new WriteReporter().hookResult(
-      { type: "create", filePath, content: "a\r\nb\r\n", structuredPatch: [], originalFile: null },
-      { capabilities: air },
-    );
-
-    expect(result.content).toEqual([
-      { type: "diff", path: filePath, oldText: null, newText: "a\r\nb\r\n" },
-    ]);
-  });
-
   it("shows in the approval that the Write overwrites a file whose text is unknown", async () => {
     const filePath = await temporaryFile(Buffer.from([0x61, 0x00, 0x62, 0x0a]));
     const input = { file_path: filePath, content: "text\n" };
@@ -667,7 +610,7 @@ describe("Write tool calls for an existing file", () => {
       toolName: "Write",
       input,
       toolUseID: "write",
-      capabilities: air,
+      capabilities: new ClientCapabilities(),
       previewContent: await previewPatchContent("Write", input),
     });
 
@@ -682,12 +625,15 @@ describe("Write tool calls for an existing file", () => {
     ]);
   });
 
-  it("shows the standard diff in the approval of a Write whose text cannot have a patch", async () => {
+  it("shows the change alone in the approval of a Write whose text cannot have a patch", async () => {
     const filePath = await temporaryFile("before\n");
     const input = { file_path: filePath, content: "a\r\nb\r\n" };
 
     expect(await previewPatchContent("Write", input)).toEqual([
-      { type: "diff", path: filePath, oldText: "before\n", newText: "a\r\nb\r\n" },
+      {
+        type: "diff",
+        changes: [{ operation: "modify", path: filePath, fileType: "text" }],
+      },
     ]);
   });
 });
@@ -731,10 +677,10 @@ describe("PostToolUse hook patches", () => {
 
     expect(patchText(result?.content)).toBe(
       [
-        `diff --git a/${gitName(filePath)} b/${gitName(filePath)}`,
+        `diff --git ${filePath} ${filePath}`,
         "new file mode 100644",
         "--- /dev/null",
-        `+++ b/${gitName(filePath)}`,
+        `+++ ${filePath}`,
         "@@ -0,0 +1,2 @@",
         "+a",
         "+b",

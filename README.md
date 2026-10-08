@@ -2,6 +2,16 @@
 
 [![npm](https://img.shields.io/npm/v/%40agentclientprotocol%2Fclaude-agent-acp)](https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp)
 
+> **This repository is a maintained fork of the upstream ACP adapter.** Upstream is
+> [`agentclientprotocol/claude-agent-acp`](https://github.com/agentclientprotocol/claude-agent-acp)
+> (npm `@agentclientprotocol/claude-agent-acp`, Apache-2.0, © Zed Industries). This fork is
+> maintained **independently**: it defines its own product-behaviour contract and selectively
+> absorbs upstream changes, rather than mirroring upstream code. The divergences, the
+> behaviours this fork guarantees, and the upstream-absorption process are documented in
+> [`CLAUDE.md`](CLAUDE.md) and its `cases-*.md` companions. Upstream copyright, attribution,
+> and the [`LICENSE`](LICENSE) are preserved; the fork remains distributed under the Apache
+> License, Version 2.0. The npm package name and badges above refer to the upstream project.
+
 Use [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview#branding-guidelines) from [ACP-compatible](https://agentclientprotocol.com) clients!
 
 This tool implements an ACP agent by using the official [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview), supporting:
@@ -9,7 +19,7 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 - Context @-mentions
 - Images
 - Tool calls (with permission requests)
-- Compact file changes through the negotiated [AIR diff patch extension](docs/air-extensions.md#diff-patch)
+- Compact file changes as ACP `diff` content
 - Following
 - Edit review
 - TODO lists
@@ -18,12 +28,8 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 - Custom [Slash commands](https://docs.anthropic.com/en/docs/claude-code/slash-commands)
 - Client MCP servers
 - `/mcp` in the chat: the MCP server status as a list. The adapter runs `/mcp reconnect`, `/mcp enable`, and `/mcp disable` through the SDK control API, because Claude Code refuses them in SDK mode. A reconnect of an ACP server that needs authentication starts MCP OAuth through URL elicitation
-- Session-scoped long-running goals for AIR through the [goal extension](docs/air-extensions.md#goal) under `_meta.jetbrains.air.goal`
-- Structured errors, recovery, and warnings through the opt-in [session failure extension](docs/air-extensions.md#session-failure)
-- Concrete model and effort defaults through the opt-in [recommended config value extension](docs/air-extensions.md#recommended-config-values)
-- Tool permission presentation, editable choices, and durable effects through the [permission extension](docs/air-extensions.md#permission-presentation)
-- One fact per field in every tool call report, as the [ACP tool call contract](docs/air-extensions.md#tool-call-contract) defines
-- All AIR extensions, capabilities, and `_meta` keys: [AIR extensions](docs/air-extensions.md)
+- Tool permission presentation with editable choices and durable effects
+- One fact per field in every tool call report
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
@@ -37,14 +43,11 @@ npm install @agentclientprotocol/claude-agent-acp@preview
 
 ### Subagent sessions
 
-Subagents are exposed only after bilateral capability negotiation. Until the released ACP SDKs
-preserve the draft `clientCapabilities.subagents` field, a supporting client may advertise
-`nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`; the adapter mirrors the capability
-in its initialize response. The canonical field remains supported and takes precedence once it is
-available. Without either client signal, Agent/Task lifecycle keeps its legacy ordinary ACP
-tool-call representation and child interactions stay on the root session. Clients that use the
-historical `_meta["subagent-transcript"]` capability or `forwardSubagentText` session option retain
-the flattened child transcript behavior. See [AIR extensions](docs/air-extensions.md#native-subagent-sessions).
+Subagents are exposed only after bilateral capability negotiation through the draft
+`clientCapabilities.subagents` field, which the adapter mirrors in its initialize response. Without
+that signal, Agent/Task lifecycle keeps its legacy ordinary ACP tool-call representation and child
+interactions stay on the root session. Clients that use the historical `_meta["subagent-transcript"]`
+capability or `forwardSubagentText` session option retain the flattened child transcript behavior.
 
 ## Contribution Policy
 

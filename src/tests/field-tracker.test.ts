@@ -14,9 +14,6 @@ import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
 import { createPostToolUseHook } from "../tools.js";
 
 const logger = { log: () => {}, error: () => {} };
-const patchCapabilities = {
-  _meta: { jetbrains: { air: { version: 1, capabilities: ["diffPatch"] } } },
-};
 
 function recordingClient(updates: any[]): AcpClient {
   return {
@@ -115,26 +112,6 @@ describe("ToolCallFieldTracker", () => {
     expect(tracker.apply({ ...delta })).toBe(true);
   });
 
-  it("merges _meta.jetbrains.air keys like claudeCode keys", () => {
-    const tracker = new ToolCallFieldTracker();
-    const meta = {
-      claudeCode: { toolName: "Bash" },
-      jetbrains: { air: { version: 1, commandTitle: "List files" } },
-    };
-    tracker.apply({ sessionUpdate: "tool_call", toolCallId: "t", title: "ls", _meta: meta });
-
-    expect(
-      tracker.apply({ sessionUpdate: "tool_call_update", toolCallId: "t", _meta: meta } as any),
-    ).toBe(false);
-    expect(
-      tracker.apply({
-        sessionUpdate: "tool_call_update",
-        toolCallId: "t",
-        _meta: { ...meta, jetbrains: { air: { version: 1, commandTitle: "List all files" } } },
-      } as any),
-    ).toBe(true);
-  });
-
   it("keeps pinned content until the final result replaces it", () => {
     const tracker = new ToolCallFieldTracker();
     const patch = [{ type: "diff" as const, path: "/a.ts", oldText: null, newText: "" }];
@@ -176,8 +153,6 @@ describe("tool call refinements", () => {
       emittedToolCalls: new Set<string>(),
       streamedToolInputs: new Map() as StreamedToolInputCache,
       toolCallFields,
-      // AIR gets no rawInput until the input is complete.
-      clientCapabilities: patchCapabilities,
     };
     const base = {
       type: "stream_event",
@@ -215,18 +190,15 @@ describe("tool call refinements", () => {
       delta: { type: "input_json_delta", partial_json: '"glob":"*.ts",' },
     });
 
-    // No rawInput travels until the input is complete.
     expect(first[0].update).toMatchObject({ title: 'grep "todo"' });
-    expect(first[0].update).not.toHaveProperty("rawInput");
-    expect(first[0].update).not.toHaveProperty("kind");
+    expect((first[0].update as any).rawInput).toEqual({ pattern: "todo" });
     expect(second[0].update).toMatchObject({
       title: 'grep --include="*.ts" "todo"',
     });
-    expect(second[0].update).not.toHaveProperty("rawInput");
-    expect(second[0].update).not.toHaveProperty("kind");
+    expect((second[0].update as any).rawInput).toEqual({ pattern: "todo", glob: "*.ts" });
   });
 
-  it("sends the file text of a Write once, in the hook patch", async () => {
+  it("sends the Write file text in the input and the raw tool_response in the hook", async () => {
     const tracker = new ToolCallFieldTracker();
     const toolUseCache: ToolUseCache = {};
     const emittedToolCalls = new Set<string>();
@@ -249,11 +221,7 @@ describe("tool call refinements", () => {
         toolUseCache,
         recordingClient(updates),
         logger,
-        {
-          clientCapabilities: patchCapabilities,
-          emittedToolCalls,
-          toolCallFields: tracker,
-        },
+        { emittedToolCalls, toolCallFields: tracker },
       );
 
     const call = map(toolUse);
@@ -275,14 +243,17 @@ describe("tool call refinements", () => {
       originalFile: null,
     });
 
-    // The tool call holds no file text: the input does not tell whether the
-    // file exists. The hook sends the creation patch, which holds the file text once.
-    expect(JSON.stringify(call)).not.toContain("export const big");
-    expect((call[0].update as any).rawInput).toEqual({ file_path: filePath });
+    // The tool call carries the input verbatim (file text included); the
+    // identical refinement is dropped and the hook reports the raw
+    // tool_response in `_meta` instead of a diff.
+    expect((call[0].update as any).rawInput).toEqual({ file_path: filePath, content });
     expect(refine).toEqual([]);
     expect(result[0].update).not.toHaveProperty("content");
-    expect(JSON.stringify(updates).split("export const big").length - 1).toBe(100);
-    expect(JSON.stringify(updates)).toContain("new file mode 100644");
+    expect(updates).toHaveLength(1);
+    expect((updates[0] as any)._meta.claudeCode.toolResponse).toMatchObject({
+      type: "create",
+      filePath,
+    });
     expect(tracks(tracker, "toolu_write")).toBe(false);
   });
 
@@ -333,7 +304,6 @@ describe("tool call refinements", () => {
         path: "/a.ts",
         oldText: null,
         newText: "",
-        _meta: { jetbrains: { air: { version: 1, diffPatch: { text: "exact" } } } },
       },
     ];
     // The permission flow emitted the tool call with the exact patch.

@@ -1,5 +1,4 @@
 import type { AcpSessionNotification, SubagentState } from "./acp-subagents.js";
-import { AIR_SUBAGENT_KEY, airExtensionMeta } from "./air-extension.js";
 
 export type NativeSubagent = {
   sessionId: string;
@@ -571,10 +570,7 @@ export function isNativeSubagentControlUpdate(
     return false;
   }
   const claudeMeta = update._meta?.claudeCode as { toolName?: string } | undefined;
-  return (
-    airExtensionMeta(update._meta)?.[AIR_SUBAGENT_KEY] === true ||
-    isNativeSubagentControlTool(claudeMeta?.toolName)
-  );
+  return isNativeSubagentControlTool(claudeMeta?.toolName);
 }
 
 export function isNativeSubagentControlTool(toolName: unknown): boolean {
@@ -652,14 +648,7 @@ function ordinaryToolMeta(
       (value) => (value?.claudeCode as Record<string, unknown> | null | undefined) ?? {},
     ),
   );
-  const result: Record<string, unknown> = { ...merged, claudeCode };
-  const air = airExtensionMeta(merged);
-  if (air && AIR_SUBAGENT_KEY in air) {
-    const rest = { ...air };
-    delete rest[AIR_SUBAGENT_KEY];
-    result.jetbrains = { ...(merged.jetbrains as Record<string, unknown>), air: rest };
-  }
-  return result;
+  return { ...merged, claudeCode };
 }
 
 function subagentDisplayName(

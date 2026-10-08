@@ -20,25 +20,12 @@ export interface ToolUseFacts {
   /** The file change that the input makes, as diff content. */
   change?: ToolCallContent[];
   /**
-   * The input keys whose text a diff holds: {@link change}, or for a Write of a
-   * client with diffPatch, the approval preview or the hook patch. `rawInput`
-   * leaves them out.
-   */
-  fileTextKeys?: readonly string[];
-  /**
    * A display copy of the input that the user reads: a plan, a subagent
-   * prompt, a question, a command description. A client that renders
-   * `rawInput` itself gets no display copy.
+   * prompt, a question, a command description.
    */
   display?: ToolCallContent[];
   /** The tool runs a command. Its output goes to the terminal channel. */
   command?: boolean;
-  /**
-   * The absolute path of the plan file that holds the plan text of the input.
-   * Set only for a `planFile` client and an existing file. `rawInput` then
-   * carries this path and not the plan text.
-   */
-  planFilePath?: string;
 }
 
 /** The output of a command, for the terminal channel. */
@@ -64,13 +51,6 @@ export interface ToolResultFacts {
   command?: CommandOutput;
   /** A result that has no display form. */
   rawOutput?: unknown;
-  /** The plan file of the tool use, as {@link ToolUseFacts.planFilePath} defines it. */
-  planFilePath?: string;
-  /**
-   * The plan is done with its file: the user approved it and the session left
-   * Plan mode. AIR then gets the clear signal of the plan file.
-   */
-  planFileReleased?: boolean;
 }
 
 /** What a reporter reads besides the input of the tool use. */

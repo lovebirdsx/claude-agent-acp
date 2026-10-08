@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { RequestError } from "@agentclientprotocol/sdk";
 import { SessionNotification } from "@agentclientprotocol/sdk";
 import type { RequestPermissionResponse } from "@agentclientprotocol/sdk";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
@@ -489,6 +490,154 @@ describe("session config options", () => {
     });
   });
 
+  describe("setSessionConfigOption(model) failure handling", () => {
+    // 客户端经 `_meta.extraModels` 注入、SDK 一方目录里没有的模型 id。它和普通行一样
+    // 出现在 picker 里，唯一挡住切换的是 CLI 自己认不认这个值。
+    const EXTRA_MODEL_ID = "contract-extra-model-v4";
+
+    function addExtraModel(): void {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.models.availableModels.push({
+        modelId: EXTRA_MODEL_ID,
+        name: EXTRA_MODEL_ID,
+        description: "",
+      });
+      session.modelInfos.push({
+        value: EXTRA_MODEL_ID,
+        displayName: EXTRA_MODEL_ID,
+        description: "",
+      });
+      const modelOption = session.configOptions.find((o: any) => o.id === "model");
+      modelOption.options.push({ value: EXTRA_MODEL_ID, name: EXTRA_MODEL_ID, description: "" });
+    }
+
+    /** 会话当前存的 configOptions：一次模型切换会重建它，捕获的引用会失效。 */
+    function liveConfigOptions(): Array<{ id: string; currentValue?: string }> {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      return session.configOptions;
+    }
+
+    function liveModelOption(): { currentValue: string } {
+      return liveConfigOptions().find((o) => o.id === "model") as { currentValue: string };
+    }
+
+    const setExtraModel = () =>
+      agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: EXTRA_MODEL_ID,
+      });
+
+    beforeEach(() => {
+      populateSession();
+    });
+
+    it("passes an injected extra model through verbatim and applies it on success", async () => {
+      addExtraModel();
+
+      const response = await setExtraModel();
+
+      expect(setModelSpy).toHaveBeenCalledWith(EXTRA_MODEL_ID);
+      expect(liveModelOption().currentValue).toBe(EXTRA_MODEL_ID);
+      expect(response.configOptions.find((o) => o.id === "model")?.currentValue).toBe(
+        EXTRA_MODEL_ID,
+      );
+    });
+
+    it("classifies a credential-less native CLI refusal as authentication_failed, not model_not_found", async () => {
+      // 原生 CLI（2.1.287）在无凭据时切到目录外的 id：校验模型先要凭据，报的是缺认证，
+      // 不能说模型不存在。
+      addExtraModel();
+      setModelSpy.mockRejectedValueOnce(
+        new Error(
+          "Unable to validate model: Could not resolve authentication method. Expected one of apiKey, authToken, credentials, config, or profile to be set.",
+        ),
+      );
+
+      await expect(setExtraModel()).rejects.toMatchObject({
+        code: -32000,
+        message: "Authentication required",
+        data: { errorKind: "authentication_failed" },
+      });
+
+      // 失败不改会话状态：model 与 effort 两个选项都要留在原值，不能只看 currentModel。
+      expect(liveModelOption().currentValue).toBe("claude-opus-4-5");
+      expect(liveConfigOptions().find((o) => o.id === "effort")?.currentValue).toBe("default");
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      expect(session.models.currentModelId).toBe("claude-opus-4-5");
+      const configUpdates = sessionUpdates.filter(
+        (n) => n.update.sessionUpdate === "config_option_update",
+      );
+      expect(configUpdates).toHaveLength(0);
+    });
+
+    it("translates a gateway 'model not found' refusal to model_not_found", async () => {
+      // 同一个 CLI 接的网关已认证，但不提供这个 id。
+      addExtraModel();
+      setModelSpy.mockRejectedValueOnce(new Error(`Model '${EXTRA_MODEL_ID}' not found`));
+
+      await expect(setExtraModel()).rejects.toMatchObject({
+        code: -32602,
+        data: { errorKind: "model_not_found" },
+      });
+      expect(liveModelOption().currentValue).toBe("claude-opus-4-5");
+      expect(liveConfigOptions().find((o) => o.id === "effort")?.currentValue).toBe("default");
+    });
+
+    it("does not misclassify an unobserved validation failure", async () => {
+      // 同样以 "Unable to validate model" 开头，但原因不是缺认证：认不出的既不能算
+      // authentication_failed 也不能算 model_not_found。
+      addExtraModel();
+      setModelSpy.mockRejectedValueOnce(new Error("Unable to validate model: quota exhausted"));
+
+      const err = await setExtraModel().then(
+        () => undefined,
+        (e: { data?: unknown }) => e,
+      );
+
+      expect(err?.data).toEqual({ errorKind: "unknown" });
+      expect(liveModelOption().currentValue).toBe("claude-opus-4-5");
+    });
+
+    it("never echoes an unrecognised SDK error to the wire", async () => {
+      addExtraModel();
+      const secret = "ak-1-0123456789abcdef";
+      setModelSpy.mockRejectedValueOnce(new Error(`upstream exploded: Authorization: ${secret}`));
+
+      const err = await setExtraModel().then(
+        () => undefined,
+        (e: { message: string; data?: unknown }) => e,
+      );
+
+      const wire = JSON.stringify({ message: err?.message, data: err?.data });
+      expect(err).toBeDefined();
+      expect(wire).not.toContain(secret);
+      expect(wire).not.toContain("upstream exploded");
+      // 认不出的失败照旧报错，不能静默报成功。
+      expect(liveModelOption().currentValue).toBe("claude-opus-4-5");
+    });
+
+    it("does not leak a RequestError's sensitive details", async () => {
+      addExtraModel();
+      const secret = "ak-1-0123456789abcdef";
+      setModelSpy.mockRejectedValueOnce(
+        new RequestError(-32603, "upstream boom", { details: `Authorization: ${secret}` }),
+      );
+
+      const err = await setExtraModel().then(
+        () => undefined,
+        (e: { message: string; data?: unknown }) => e,
+      );
+
+      const wire = JSON.stringify({ message: err?.message, data: err?.data });
+      expect(err).toBeDefined();
+      expect(wire).not.toContain(secret);
+      expect(wire).not.toContain("upstream boom");
+      expect(err?.data ?? {}).not.toHaveProperty("details");
+      expect(liveModelOption().currentValue).toBe("claude-opus-4-5");
+    });
+  });
+
   describe("no config_option_update notification when using setSessionConfigOption", () => {
     beforeEach(() => {
       populateSession();
@@ -586,7 +735,6 @@ describe("session config options", () => {
       const session = agent.sessions[SESSION_ID];
       expect(session.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("default");
       expect(session.effortPinnedLevel).toBeUndefined();
-      expect(session.appliedEffortLevel).toBeUndefined();
     });
 
     it("throws for invalid effort value", async () => {
@@ -631,10 +779,7 @@ describe("session config options", () => {
       populateSession();
     });
 
-    it("applies concrete defaults and re-seeds automatic effort from each model's settings", async () => {
-      (agent as any).clientCapabilities = {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-      };
+    it("re-seeds the displayed effort from each model's settings", async () => {
       const session = agent.sessions[SESSION_ID];
       session.settingsManager.getSettings = () => ({
         modelSettings: { "claude-opus-4-5": { effortLevel: "high" } },
@@ -644,22 +789,24 @@ describe("session config options", () => {
         configId: "model",
         value: "claude-sonnet-4-6",
       });
+      // Settings-derived effort is display-only: the CLI resolves the
+      // persisted per-model value itself, so no flag-layer apply is made.
       expect(response.configOptions.find((o) => o.id === "effort")).toMatchObject({
-        currentValue: "medium",
-        _meta: { jetbrains: { air: { recommendedValue: "medium" } } },
+        currentValue: "default",
       });
-      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: "medium" });
+      expect(applyFlagSettingsSpy).not.toHaveBeenCalled();
       expect(session.effortPinnedLevel).toBeUndefined();
-      expect(session.appliedEffortLevel).toBe("medium");
 
-      await agent.setSessionConfigOption({
+      const opus = await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
         configId: "model",
         value: "claude-opus-4-5",
       });
-      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: "high" });
+      expect(opus.configOptions.find((o) => o.id === "effort")).toMatchObject({
+        currentValue: "high",
+      });
+      expect(applyFlagSettingsSpy).not.toHaveBeenCalled();
       expect(session.effortPinnedLevel).toBeUndefined();
-      expect(session.appliedEffortLevel).toBe("high");
 
       session.modelInfos[1].supportsEffort = false;
       await agent.setSessionConfigOption({
@@ -667,13 +814,10 @@ describe("session config options", () => {
         configId: "model",
         value: "claude-sonnet-4-6",
       });
-      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).not.toHaveBeenCalled();
     });
 
     it("re-seeds switches from retained programmatic settings before file settings", async () => {
-      (agent as any).clientCapabilities = {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-      };
       const session = agent.sessions[SESSION_ID];
       session.settingsManager.getSettings = () => ({ effortLevel: "high" });
       session.effortSettingsOverride = {
@@ -688,13 +832,10 @@ describe("session config options", () => {
       });
 
       expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
-      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: "low" });
+      expect(applyFlagSettingsSpy).not.toHaveBeenCalled();
     });
 
     it("clears an unsupported user pin before choosing the new model's concrete effort", async () => {
-      (agent as any).clientCapabilities = {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-      };
       const session = agent.sessions[SESSION_ID];
       session.modelInfos[0].supportedEffortLevels = ["low", "medium", "high", "max"];
       session.settingsManager.getSettings = () => ({ effortLevel: "low" });
@@ -706,9 +847,8 @@ describe("session config options", () => {
         value: "claude-sonnet-4-6",
       });
       expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
-      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: "low" });
+      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: null });
       expect(session.effortPinnedLevel).toBeUndefined();
-      expect(session.appliedEffortLevel).toBe("low");
     });
 
     it("clears a legacy pin without promoting persisted effort to a flag override", async () => {
@@ -727,7 +867,6 @@ describe("session config options", () => {
       expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
       expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: null });
       expect(session.effortPinnedLevel).toBeUndefined();
-      expect(session.appliedEffortLevel).toBeUndefined();
     });
 
     it("retains the original pin value when a legacy clamp fails", async () => {
@@ -754,31 +893,7 @@ describe("session config options", () => {
       expect(session.effortPinnedLevel).toBe("max");
     });
 
-    it("restores the last applied effort when recommended-value synchronization fails", async () => {
-      (agent as any).clientCapabilities = {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-      };
-      const session = agent.sessions[SESSION_ID];
-      session.configOptions.find((o) => o.id === "effort")!.currentValue = "low";
-      session.appliedEffortLevel = "low";
-      session.settingsManager.getSettings = () => ({ effortLevel: "high" });
-      applyFlagSettingsSpy.mockRejectedValueOnce(new Error("effort sync failed"));
-
-      const response = await agent.setSessionConfigOption({
-        sessionId: SESSION_ID,
-        configId: "model",
-        value: "claude-sonnet-4-6",
-      });
-
-      expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
-      expect(session.appliedEffortLevel).toBe("low");
-      expect(session.effortPinnedLevel).toBeUndefined();
-    });
-
     it("returns the new model state when effort synchronization fails", async () => {
-      (agent as any).clientCapabilities = {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-      };
       applyFlagSettingsSpy.mockRejectedValueOnce(new Error("effort sync failed"));
 
       const response = await agent.setSessionConfigOption({
@@ -795,9 +910,6 @@ describe("session config options", () => {
     });
 
     it("publishes the new model state when external-switch effort synchronization fails", async () => {
-      (agent as any).clientCapabilities = {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-      };
       applyFlagSettingsSpy.mockRejectedValueOnce(new Error("effort sync failed"));
       const session = agent.sessions[SESSION_ID];
 

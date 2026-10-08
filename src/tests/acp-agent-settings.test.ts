@@ -101,61 +101,45 @@ describe("ClaudeAcpAgent settings", () => {
   }, 15_000);
 
   it.each([
-    { recommended: false, setting: undefined, explicit: undefined, expected: "default" },
-    { recommended: false, setting: "low", explicit: "high", expected: "high" },
-    { recommended: true, setting: undefined, explicit: undefined, expected: "medium" },
-    { recommended: true, setting: "high", explicit: undefined, expected: "high" },
-    { recommended: true, setting: "high", explicit: "max", expected: "max" },
-  ])(
-    "initial effort reflects SDK state: %j",
-    async ({ recommended, setting, explicit, expected }) => {
-      await fs.promises.writeFile(
-        path.join(tempDir, "settings.json"),
-        JSON.stringify({ effortLevel: setting }),
-      );
-      const applyFlagSettings = vi.fn();
-      querySpy.mockReturnValue(
-        makeMockQuery({
-          initializationResult: async () => ({
-            models: [
-              {
-                value: "default",
-                displayName: "Default",
-                description: "",
-                supportsEffort: true,
-                supportedEffortLevels: ["low", "medium", "high", "max"],
-              },
-            ],
-          }),
-          applyFlagSettings,
+    { setting: undefined, explicit: undefined, expected: "default" },
+    { setting: "low", explicit: "high", expected: "high" },
+    { setting: "high", explicit: undefined, expected: "high" },
+    { setting: "high", explicit: "max", expected: "max" },
+  ])("initial effort reflects SDK state: %j", async ({ setting, explicit, expected }) => {
+    await fs.promises.writeFile(
+      path.join(tempDir, "settings.json"),
+      JSON.stringify({ effortLevel: setting }),
+    );
+    const applyFlagSettings = vi.fn();
+    querySpy.mockReturnValue(
+      makeMockQuery({
+        initializationResult: async () => ({
+          models: [
+            {
+              value: "default",
+              displayName: "Default",
+              description: "",
+              supportsEffort: true,
+              supportedEffortLevels: ["low", "medium", "high", "max"],
+            },
+          ],
         }),
-      );
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
-      const agent = new ClaudeAcpAgent(createMockClient());
-      if (recommended) {
-        (agent as any).clientCapabilities = {
-          _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-        };
-      }
-      const response = await (agent as any).createSession({
-        cwd: tempDir,
-        mcpServers: [],
-        _meta: { disableBuiltInTools: true, claudeCode: { options: { effort: explicit } } },
-      });
-      expect(
-        response.configOptions.find((option: any) => option.id === "effort").currentValue,
-      ).toBe(expected);
-      if (recommended) {
-        expect(applyFlagSettings).toHaveBeenCalledWith({ effortLevel: expected });
-      } else {
-        expect(applyFlagSettings).not.toHaveBeenCalled();
-      }
-      expect(agent.sessions[response.sessionId].effortPinnedLevel).toBe(explicit);
-      expect(agent.sessions[response.sessionId].appliedEffortLevel).toBe(
-        recommended ? expected : explicit,
-      );
-    },
-  );
+        applyFlagSettings,
+      }),
+    );
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent = new ClaudeAcpAgent(createMockClient());
+    const response = await (agent as any).createSession({
+      cwd: tempDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true, claudeCode: { options: { effort: explicit } } },
+    });
+    expect(response.configOptions.find((option: any) => option.id === "effort").currentValue).toBe(
+      expected,
+    );
+    expect(applyFlagSettings).not.toHaveBeenCalled();
+    expect(agent.sessions[response.sessionId].effortPinnedLevel).toBe(explicit);
+  });
 
   it("keeps a settings-requested ultracode on when applying effort", async () => {
     // Since CLI 2.1.284 an effortLevel apply without an ultracode key turns
@@ -183,16 +167,12 @@ describe("ClaudeAcpAgent settings", () => {
     );
     const { ClaudeAcpAgent } = await import("../acp-agent.js");
     const agent = new ClaudeAcpAgent(createMockClient());
-    (agent as any).clientCapabilities = {
-      _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-    };
 
     const response = await (agent as any).createSession({
       cwd: tempDir,
       mcpServers: [],
       _meta: { disableBuiltInTools: true },
     });
-    expect(applyFlagSettings).toHaveBeenLastCalledWith({ effortLevel: "medium", ultracode: true });
 
     await agent.setSessionConfigOption({
       sessionId: response.sessionId,
@@ -230,9 +210,6 @@ describe("ClaudeAcpAgent settings", () => {
     );
     const { ClaudeAcpAgent } = await import("../acp-agent.js");
     const agent = new ClaudeAcpAgent(createMockClient());
-    (agent as any).clientCapabilities = {
-      _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-    };
 
     const response = await (agent as any).createSession({
       cwd: tempDir,
@@ -253,7 +230,7 @@ describe("ClaudeAcpAgent settings", () => {
     expect(response.configOptions.find((option: any) => option.id === "effort").currentValue).toBe(
       "low",
     );
-    expect(applyFlagSettings).toHaveBeenCalledWith({ effortLevel: "low" });
+    expect(applyFlagSettings).not.toHaveBeenCalled();
     expect(agent.sessions[response.sessionId].effortSettingsOverride?.effortLevel).toBe("medium");
   });
 

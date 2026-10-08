@@ -3,8 +3,8 @@
  * `@agentclientprotocol/sdk` ships: v1 ({@link validateRecorded}) and the
  * draft v2 ({@link validateV2Message}).
  *
- * The session updates of the AIR extensions (`async_task_*`, `subagent_*`)
- * are not in the ACP schema. {@link validateRecorded} accepts them only for a
+ * The session updates of the draft ACP subagent extension (`subagent_*`) are
+ * not in the ACP schema. {@link validateRecorded} accepts them only for a
  * client that negotiated them, and checks only their envelope.
  *
  * The validator checks every `format` of the schema. `ajv-formats` defines
@@ -24,14 +24,8 @@ const v2Schema = require("@agentclientprotocol/sdk/schema/v2/schema.unstable.jso
   $defs: Record<string, { "x-method"?: string; "x-side"?: string }>;
 };
 
-/** The session update kinds of the AIR extensions. They are not in the ACP schema. */
-export const EXTENSION_SESSION_UPDATES = new Set([
-  "async_task_spawned",
-  "async_task_progress",
-  "async_task_state_update",
-  "subagent_spawned",
-  "subagent_state_update",
-]);
+/** The session update kinds of the draft ACP subagent extension. They are not in the ACP schema. */
+export const EXTENSION_SESSION_UPDATES = new Set(["subagent_spawned", "subagent_state_update"]);
 
 /** A validator of one ACP schema, which knows every format the schema uses. */
 function schemaValidator(source: Record<string, unknown>, name: string): Ajv2020 {

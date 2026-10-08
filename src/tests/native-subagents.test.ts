@@ -52,7 +52,6 @@ function control(
       rawInput: { description: "Investigate failure", prompt: "Find the cause" },
       _meta: {
         claudeCode: { toolName: "Agent", parentToolUseId },
-        jetbrains: { air: { version: 1, subagent: true } },
       },
     },
   } as AcpSessionNotification;
@@ -135,7 +134,6 @@ describe("NativeSubagentRuntime lifecycle", () => {
           status: "failed",
           _meta: {
             claudeCode: { toolName: "Agent" },
-            jetbrains: { air: { version: 1, subagent: true } },
           },
         },
       } as AcpSessionNotification,
@@ -658,7 +656,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
       });
       const taskUpdate = {
         sessionId: "root",
-        update: { sessionUpdate: "async_task_progress", asyncTaskId: "shell-1" },
+        update: { sessionUpdate: "tool_call_update", toolCallId: "child-bash" },
       } as AcpSessionNotification;
 
       const route = runtime.routeOfToolCall("child-bash");

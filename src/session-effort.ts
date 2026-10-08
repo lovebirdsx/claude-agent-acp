@@ -1,6 +1,5 @@
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import type { EffortLevel, ModelInfo, Settings } from "@anthropic-ai/claude-agent-sdk";
-import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, withAirMeta } from "./air-extension.js";
 import { EFFORT_CONFIG_ID } from "./session-config-ids.js";
 
 export { EFFORT_CONFIG_ID } from "./session-config-ids.js";
@@ -83,7 +82,6 @@ export function buildEffortConfigOption(
   modelInfos: ModelInfo[],
   currentModelId: string,
   currentEffortLevel: string | undefined,
-  useRecommendedValue: boolean,
 ): SessionConfigOption | undefined {
   const currentModelInfo = modelInfos.find((model) => model.value === currentModelId);
   const supportedLevels = currentModelInfo?.supportsEffort
@@ -91,11 +89,8 @@ export function buildEffortConfigOption(
     : [];
   if (supportedLevels.length === 0) return undefined;
 
-  const recommendedEffort = (supportedLevels as string[]).includes("medium")
-    ? "medium"
-    : supportedLevels[0];
   const options = [
-    ...(useRecommendedValue ? [] : [{ value: "default", name: "Default" }]),
+    { value: "default", name: "Default" },
     ...supportedLevels.map((level) => ({
       value: level,
       name: level
@@ -104,14 +99,10 @@ export function buildEffortConfigOption(
         .join(" "),
     })),
   ];
-  const includes = (level: string) =>
-    (!useRecommendedValue && level === "default") || (supportedLevels as string[]).includes(level);
   const currentValue =
-    currentEffortLevel && includes(currentEffortLevel)
+    currentEffortLevel && (supportedLevels as string[]).includes(currentEffortLevel)
       ? currentEffortLevel
-      : useRecommendedValue
-        ? recommendedEffort
-        : "default";
+      : "default";
 
   return {
     id: EFFORT_CONFIG_ID,
@@ -121,10 +112,5 @@ export function buildEffortConfigOption(
     type: "select",
     currentValue,
     options,
-    ...(useRecommendedValue
-      ? {
-          _meta: withAirMeta(undefined, AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, recommendedEffort),
-        }
-      : {}),
   };
 }

@@ -12,7 +12,6 @@ import type {
   PermissionResult,
   Query,
 } from "@anthropic-ai/claude-agent-sdk";
-import { AIR_KIND_KEY, airOnlyMeta } from "./air-extension.js";
 import { resolvePermissionMode } from "./permissions/modes.js";
 import {
   noticeOrTranscriptUpdate,
@@ -58,8 +57,6 @@ export type SessionModeManagerOptions<S extends SessionMode> = {
    *  known after `initialize`. */
   supportsNotices?(): boolean;
   logError(...args: unknown[]): void;
-  /** Whether the client is AIR. Only AIR gets the mode kind, under `_meta.jetbrains.air`. */
-  airClient?(): boolean;
 };
 
 type ModeConfigSession = SessionMode & {
@@ -348,36 +345,26 @@ export class SessionModeManager<S extends SessionMode> {
   }
 
   private buildAvailableModes(allowBypass: boolean): SessionModeState["availableModes"] {
-    // Only AIR gets the mode kind.
-    const air = this.options.airClient?.() ?? false;
-    const kind = (value: string) => {
-      const meta = airOnlyMeta(air, AIR_KIND_KEY, value);
-      return meta ? { _meta: meta } : {};
-    };
     const modes: SessionModeState["availableModes"] = [
       {
         id: "default",
         name: "Manual",
         description: "Always ask before making changes",
-        ...kind("standard"),
       },
       {
         id: "acceptEdits",
         name: "Accept edits",
         description: "Automatically accept all file edits",
-        ...kind("standard"),
       },
       {
         id: "plan",
         name: "Plan",
         description: "Create a plan before making changes",
-        ...kind("plan"),
       },
       {
         id: "auto",
         name: "Auto",
         description: "Claude handles permission decisions",
-        ...kind("auto_review"),
       },
     ];
     if (allowBypass) {
@@ -385,7 +372,6 @@ export class SessionModeManager<S extends SessionMode> {
         id: "bypassPermissions",
         name: "Bypass permissions",
         description: "Accepts all permissions",
-        ...kind("full_access"),
       });
     }
     // Fork addition: the editor pins a session to `dontAsk` when it forks a
@@ -397,7 +383,6 @@ export class SessionModeManager<S extends SessionMode> {
       id: "dontAsk",
       name: "Don't Ask",
       description: "Automatically deny actions that would need approval",
-      ...kind("standard"),
     });
     return modes;
   }

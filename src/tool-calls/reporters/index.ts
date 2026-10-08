@@ -1,7 +1,7 @@
 import type { ToolReporter } from "../facts.js";
 import { AgentReporter } from "./agent.js";
 import { BashReporter } from "./bash.js";
-import { EditReporter, NotebookEditReporter, WriteReporter } from "./file-edit.js";
+import { EditReporter, WriteReporter } from "./file-edit.js";
 import {
   AgentControlReporter,
   AskUserQuestionReporter,
@@ -24,7 +24,6 @@ const reporters: Record<string, ToolReporter> = {
   Read: new ReadReporter(),
   Write: new WriteReporter(),
   Edit: new EditReporter(),
-  NotebookEdit: new NotebookEditReporter(),
   Glob: new GlobReporter(),
   Grep: new GrepReporter(),
   WebFetch: new WebFetchReporter(),

@@ -44,21 +44,9 @@ export interface Recorded {
 
 /** A client profile: the capabilities that the client declares. */
 export interface Profile {
-  name: "plain" | "zed" | "air";
+  name: "plain" | "zed";
   capabilities: ClientCapabilities;
 }
-
-/** Every AIR capability name that the adapter knows. */
-export const AIR_CAPABILITY_NAMES = [
-  "nativeSubagentSessions",
-  "asyncTasks",
-  "sessionFailure",
-  "recommendedValue",
-  "diffPatch",
-  "rawInputRendering",
-  "planFile",
-  "agentFileChangeReport",
-];
 
 const baseCapabilities: ClientCapabilities = {
   fs: { readTextFile: true, writeTextFile: true },
@@ -74,17 +62,6 @@ export const PROFILES: Record<Profile["name"], Profile> = {
       ...baseCapabilities,
       auth: { terminal: true },
       _meta: { terminal_output: true, "terminal-auth": true },
-    },
-  },
-  air: {
-    name: "air",
-    capabilities: {
-      ...baseCapabilities,
-      _meta: {
-        terminal_output: true,
-        terminal_output_delta: true,
-        jetbrains: { air: { version: 1, capabilities: [...AIR_CAPABILITY_NAMES] } },
-      },
     },
   },
 };
@@ -331,7 +308,7 @@ export async function runScenario(
       return {};
     },
   };
-  // The `_meta` of the scenario adds to the `_meta` of the profile, so AIR stays AIR.
+  // The `_meta` of the scenario adds to the `_meta` of the profile.
   const capabilities: ClientCapabilities = {
     ...profile.capabilities,
     ...scenario.capabilities,

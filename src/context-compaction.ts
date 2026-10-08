@@ -1,9 +1,15 @@
 import { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk";
-import {
-  ContextCompactionMetadata,
-  createContextCompactionMeta,
-} from "./context-compaction-meta.js";
 import { compactionToolCall } from "./tool-calls/reporters/compaction.js";
+
+export type ContextCompactionTrigger = "manual" | "automatic";
+
+export interface ContextCompactionMetadata {
+  trigger?: ContextCompactionTrigger;
+  preTokens?: number;
+  postTokens?: number;
+  durationMs?: number;
+  error?: string;
+}
 
 type CompactionStatus = "completed" | "failed";
 type TerminalStatus = CompactionStatus | "cancelled";
@@ -40,8 +46,6 @@ export type ContextCompactionLifecycleOptions = {
   /** Receives failures of the send that must not propagate: the turn-boundary
    *  `cancelled` terminal. */
   logError?: (message: string, error: unknown) => void;
-  /** The client is AIR. Only AIR gets the compaction facts, under `_meta.jetbrains.air`. */
-  airClient?: boolean;
 };
 
 export function clientSupportsCompactionUpdates(capabilities?: ClientCapabilities | null): boolean {
@@ -156,7 +160,6 @@ export class ContextCompactionLifecycle {
   private readonly sessionId: string;
   readonly presentation: CompactionPresentation;
   private readonly logError: (message: string, error: unknown) => void;
-  private readonly airClient: boolean;
 
   constructor(
     private readonly sendUpdate: SendUpdate,
@@ -165,7 +168,6 @@ export class ContextCompactionLifecycle {
     this.sessionId = options.sessionId;
     this.presentation = options.presentation ?? "tool_call";
     this.logError = options.logError ?? (() => {});
-    this.airClient = options.airClient ?? false;
   }
 
   get hasDeliveredOutput(): boolean {
@@ -247,11 +249,10 @@ export class ContextCompactionLifecycle {
         sessionUpdate: "compaction_update",
         compactionId,
         status: "in_progress",
-        ...(this.airClient ? { _meta: createContextCompactionMeta() } : {}),
       });
       return;
     }
-    await this.send(compactionToolCall.started(compactionId, this.airClient));
+    await this.send(compactionToolCall.started(compactionId));
   }
 
   /**
@@ -282,7 +283,7 @@ export class ContextCompactionLifecycle {
     const state = this.activeCompaction;
     if (!state || state.terminalStatus || state.heartbeatSent) return;
     state.heartbeatSent = true;
-    await this.send(compactionToolCall.inProgress(state.compactionId, this.airClient));
+    await this.send(compactionToolCall.inProgress(state.compactionId));
   }
 
   /**
@@ -315,7 +316,7 @@ export class ContextCompactionLifecycle {
   async finish(
     compactionId: string,
     status: CompactionStatus,
-    metadata: Omit<ContextCompactionMetadata, "version"> = {},
+    metadata: ContextCompactionMetadata = {},
     enrichTerminal = false,
   ): Promise<void> {
     if (this.interrupted) return;
@@ -333,7 +334,6 @@ export class ContextCompactionLifecycle {
       this.duplicateErrorOutput = metadata.error;
     }
     const terminalStatus = state.terminalStatus ?? status;
-    const hasMetadata = Object.keys(metadata).length > 0;
 
     if (this.presentation === "compaction_update") {
       // A summary that went out as chunks is not sent again in full. The
@@ -350,14 +350,6 @@ export class ContextCompactionLifecycle {
         status: terminalStatus,
         ...(summary !== undefined ? { summary: [{ type: "text", text: summary }] } : {}),
         ...(terminalStatus === "failed" && metadata.error ? { error: metadata.error } : {}),
-        // `_meta` is a replace-patch: seed it with the first terminal, then
-        // only re-send it when the boundary adds facts, so a status-only
-        // duplicate can't wipe the token counts.
-        // The standard `error` field carries the error, so `_meta` does not.
-        // Only AIR gets the compaction facts.
-        ...(this.airClient && (firstTerminal || hasMetadata)
-          ? { _meta: createContextCompactionMeta(withoutError(metadata)) }
-          : {}),
       });
       return;
     }
@@ -368,7 +360,6 @@ export class ContextCompactionLifecycle {
         opened || firstTerminal ? status : undefined,
         metadata,
         opened,
-        this.airClient,
       ),
     );
   }
@@ -401,19 +392,12 @@ export class ContextCompactionLifecycle {
   }
 }
 
-function withoutError({
-  error: _error,
-  ...facts
-}: Omit<ContextCompactionMetadata, "version">): Omit<ContextCompactionMetadata, "version"> {
-  return facts;
-}
-
 export function contextCompactionMetadataFromBoundary(compactMetadata: {
   trigger: "manual" | "auto";
   pre_tokens: number;
   post_tokens?: number;
   duration_ms?: number;
-}): Omit<ContextCompactionMetadata, "version"> {
+}): ContextCompactionMetadata {
   return {
     trigger: compactMetadata.trigger === "auto" ? "automatic" : "manual",
     preTokens: compactMetadata.pre_tokens,

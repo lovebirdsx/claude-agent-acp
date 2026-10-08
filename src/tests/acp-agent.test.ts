@@ -72,7 +72,6 @@ import {
   getSessionInfo,
   getSessionMessages,
   getSubagentMessages,
-  importSessionToStore,
   listSessions,
   PermissionUpdate,
   query,
@@ -81,7 +80,7 @@ import {
   type Options,
   type SDKControlGetUsageResponse,
 } from "@anthropic-ai/claude-agent-sdk";
-import { createHash, randomUUID } from "crypto";
+import { randomUUID } from "crypto";
 import { claudeConfigDir } from "../paths.js";
 import { appendFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -92,12 +91,6 @@ import {
   userEcho,
   wrapQuery,
 } from "./session-doubles.js";
-import {
-  GOAL_CONTROL_METHOD,
-  goalUpdateFromPrompt,
-  parseGoalRequest,
-  toGoalSnapshot,
-} from "../goal-extension.js";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
@@ -123,12 +116,6 @@ import type {
   BetaWebFetchToolResultBlockParam,
   BetaCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
-
-/** The capabilities of an AIR client. Only AIR gets the AIR extensions of
- *  `docs/air-extensions.md`. */
-const AIR_CLIENT_CAPABILITIES = {
-  _meta: { jetbrains: { air: { version: 1, capabilities: [] as string[] } } },
-};
 
 /** A `system`/init frame advertising the msg_lifecycle_v1 capability, so the
  *  consumer latches `session.msgLifecycleV1` and cancel() routes orphan
@@ -601,11 +588,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
   }, 30000);
 
   it("/compact works", async () => {
-    // The contextCompaction key is an AIR key, so the client declares AIR.
-    const { client, connection, newSessionResponse } = await setupTestSession(
-      __dirname,
-      AIR_CLIENT_CAPABILITIES,
-    );
+    const { client, connection, newSessionResponse } = await setupTestSession(__dirname);
 
     const commands = await client.availableCommandsPromise;
 
@@ -644,32 +627,28 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
         (update) =>
           update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update",
       );
-    const start = toolCallUpdates.find(
-      (update) => (update._meta as any)?.jetbrains?.air?.contextCompaction,
-    );
-    // An AIR update carries only the _meta keys that changed, so the updates
-    // are found by the tool call id.
+    // The legacy synthetic tool call is the compaction surface for a client
+    // that does not advertise the ACP `session.compaction` capability.
     const compactionUpdates = toolCallUpdates.filter(
-      (update) => update.toolCallId === start?.toolCallId,
+      (update) => (update._meta as any)?.claudeCode?.toolName === "compact",
     );
     expect(compactionUpdates[0]).toMatchObject({
       sessionUpdate: "tool_call",
       title: "Compact conversation",
       kind: "think",
       status: "in_progress",
-      _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
+      _meta: { claudeCode: { toolName: "compact" } },
     });
     // The terminal status lands on the compact_result frame; the boundary that
-    // follows only enriches the call with token counts (no status field).
+    // follows only enriches the call with the boundary facts (no status field).
     const terminal = compactionUpdates.filter((update) => "status" in update && update.status);
     expect(terminal.at(-1)).toMatchObject({
       sessionUpdate: "tool_call_update",
       status: "completed",
     });
-    // The update leaves out the unchanged jetbrains.air.version. AIR reads it only in initialize.
     expect(compactionUpdates.at(-1)).toMatchObject({
       sessionUpdate: "tool_call_update",
-      _meta: { jetbrains: { air: { contextCompaction: { version: 1, trigger: "manual" } } } },
+      rawOutput: expect.objectContaining({ trigger: "manual" }),
     });
     // The fork also surfaces the lifecycle as structured `_universe/compaction`
     // extension notifications (start → success), not plain-text chunks, so the
@@ -681,7 +660,6 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
 
   it("/compact reports the ACP compaction lifecycle to a capable client", async () => {
     const { client, connection, newSessionResponse } = await setupTestSession(__dirname, {
-      ...AIR_CLIENT_CAPABILITIES,
       session: { compaction: {} },
     });
 
@@ -705,16 +683,13 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       sessionUpdates.some(
         (update) =>
           (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
-          (update._meta as any)?.jetbrains?.air?.contextCompaction,
+          (update._meta as any)?.claudeCode?.toolName === "compact",
       ),
     ).toBe(false);
     const compactionUpdates = sessionUpdates.filter(
       (update) => update.sessionUpdate === "compaction_update",
     );
-    expect(compactionUpdates[0]).toMatchObject({
-      status: "in_progress",
-      _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
-    });
+    expect(compactionUpdates[0]).toMatchObject({ status: "in_progress" });
     const compactionId = compactionUpdates[0].compactionId;
     expect(compactionUpdates.every((update) => update.compactionId === compactionId)).toBe(true);
     expect(compactionUpdates.slice(1).every((update) => update.status === "completed")).toBe(true);
@@ -730,16 +705,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     expect(text.startsWith("<analysis>")).toBe(false);
     expect(text.startsWith("<summary>")).toBe(false);
     expect(text.endsWith("</summary>")).toBe(false);
-    // The boundary enriches the entity with token counts.
-    expect(compactionUpdates.at(-1)).toMatchObject({
-      status: "completed",
-      _meta: {
-        jetbrains: { air: { version: 1, contextCompaction: { version: 1, trigger: "manual" } } },
-      },
-    });
-    expect(
-      (compactionUpdates.at(-1)!._meta as any).jetbrains.air.contextCompaction.preTokens,
-    ).toBeGreaterThan(0);
+    expect(compactionUpdates.at(-1)).toMatchObject({ status: "completed" });
   }, 90000);
 
   // Regression guard for the SDK's AskUserQuestion routing. The built-in
@@ -961,7 +927,7 @@ describe("tool conversions", () => {
     });
   });
 
-  it("marks Agent and legacy Task tool calls as subagent launches", () => {
+  it("keeps the tool name of an Agent and of a legacy Task", () => {
     for (const name of ["Agent", "Task"]) {
       const notifications = toAcpNotifications(
         [
@@ -977,15 +943,11 @@ describe("tool conversions", () => {
         {},
         {} as AcpClient,
         console,
-        { clientCapabilities: AIR_CLIENT_CAPABILITIES },
       );
 
       expect(notifications[0]?.update).toMatchObject({
         sessionUpdate: "tool_call",
-        _meta: {
-          claudeCode: { toolName: name },
-          jetbrains: { air: { subagent: true } },
-        },
+        _meta: { claudeCode: { toolName: name } },
       });
     }
 
@@ -1003,14 +965,11 @@ describe("tool conversions", () => {
       {},
       {} as AcpClient,
       console,
-      { parentToolUseId: "outer-agent", clientCapabilities: AIR_CLIENT_CAPABILITIES },
+      { parentToolUseId: "outer-agent" },
     );
     expect(nestedAgent[0]?.update).toMatchObject({
       sessionUpdate: "tool_call",
-      _meta: {
-        claudeCode: { toolName: "Agent", parentToolUseId: "outer-agent" },
-        jetbrains: { air: { subagent: true } },
-      },
+      _meta: { claudeCode: { toolName: "Agent", parentToolUseId: "outer-agent" } },
     });
   });
 
@@ -2750,9 +2709,7 @@ describe("task notification replay", () => {
 
   async function replay(
     history: History,
-    capabilities: ClientCapabilities = {
-      _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
-    },
+    capabilities: ClientCapabilities = {},
   ): Promise<AcpSessionNotification[]> {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -2776,93 +2733,11 @@ describe("task notification replay", () => {
         ? [update.content.text]
         : [],
     );
-  const asyncTaskUpdates = (updates: AcpSessionNotification[]) =>
-    updates.flatMap(({ update }) =>
-      update.sessionUpdate.startsWith("async_task_") ? [update] : [],
-    );
-
-  it("hides the notification and restores the task state like the live frame", async () => {
+  it("hides the notification and keeps the user text", async () => {
     const updates = await replay([...bashLaunch, notification("completed")]);
 
     expect(userChunks(updates)).toEqual(["run the tests"]);
     expect(JSON.stringify(updates)).not.toContain("task-notification");
-    expect(asyncTaskUpdates(updates)).toEqual([
-      {
-        sessionUpdate: "async_task_spawned",
-        asyncTaskId: "bg1",
-        name: "npm test",
-        taskType: "shell",
-        description: "npm test",
-        showInTranscript: true,
-        canStop: true,
-        outputFilePath: "/tmp/tasks/bg1.output",
-        toolCallId: "toolu_bash",
-      },
-      {
-        sessionUpdate: "async_task_state_update",
-        asyncTaskId: "bg1",
-        state: "completed",
-        summary: 'Background command "npm test" finished',
-      },
-    ]);
-  });
-
-  it("detects a notification without an origin by its text and maps killed to stopped", async () => {
-    const updates = await replay([...bashLaunch, notification("killed", { origin: undefined })]);
-
-    expect(userChunks(updates)).toEqual(["run the tests"]);
-    expect(asyncTaskUpdates(updates).at(-1)).toMatchObject({
-      sessionUpdate: "async_task_state_update",
-      asyncTaskId: "bg1",
-      state: "stopped",
-    });
-  });
-
-  it.each(["server_tool_use", "mcp_tool_use"])(
-    "restores a background task launched by a %s block",
-    async (type) => {
-      const launch = record({
-        ...bashLaunch[1],
-        message: {
-          role: "assistant",
-          content: [{ type, id: "toolu_bash", name: "Bash", input: { command: "npm test" } }],
-        },
-      });
-      const updates = await replay([
-        bashLaunch[0],
-        launch,
-        bashLaunch[2],
-        notification("completed"),
-      ]);
-
-      expect(asyncTaskUpdates(updates).map((update) => update.sessionUpdate)).toEqual([
-        "async_task_spawned",
-        "async_task_state_update",
-      ]);
-      expect(asyncTaskUpdates(updates).at(-1)).toMatchObject({ state: "completed" });
-    },
-  );
-
-  it("routes a task to the session of its launching tool even when the root receives the stop", async () => {
-    const updates = await replay(
-      [
-        ...bashLaunch.map((message, index) =>
-          index === 0 ? message : record({ ...message, parent_tool_use_id: "toolu_agent" }),
-        ),
-        notification("completed"),
-      ],
-      {
-        subagents: {},
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
-      } as ClientCapabilities,
-    );
-
-    const tasks = updates.filter(({ update }) => update.sessionUpdate.startsWith("async_task_"));
-    expect(tasks).toHaveLength(2);
-    expect(tasks.map(({ sessionId }) => sessionId)).toEqual([
-      "s1:replay-subagent:toolu_agent",
-      "s1:replay-subagent:toolu_agent",
-    ]);
   });
 
   it("keeps the user text next to an embedded notification", async () => {
@@ -2883,30 +2758,6 @@ describe("task notification replay", () => {
 
     expect(userChunks(updates)).toEqual(["run the tests", "why did it fail?"]);
     expect(JSON.stringify(updates)).not.toContain("task-notification");
-    expect(asyncTaskUpdates(updates).at(-1)).toMatchObject({ state: "failed" });
-  });
-
-  it("sends nothing for a task that no tool call in the history started", async () => {
-    const updates = await replay([
-      record({ type: "user", uuid: "u1", message: { role: "user", content: "hi" } }),
-      notification("completed"),
-    ]);
-
-    expect(userChunks(updates)).toEqual(["hi"]);
-    expect(asyncTaskUpdates(updates)).toEqual([]);
-  });
-
-  it("sends one terminal state for a repeated notification", async () => {
-    const updates = await replay([
-      ...bashLaunch,
-      notification("completed"),
-      notification("completed", { uuid: "notification-again" }),
-    ]);
-
-    expect(asyncTaskUpdates(updates).map((update) => update.sessionUpdate)).toEqual([
-      "async_task_spawned",
-      "async_task_state_update",
-    ]);
   });
 
   it("restores the notified state of a background Agent after its launch result", async () => {
@@ -2946,14 +2797,10 @@ describe("task notification replay", () => {
           origin: { kind: "task-notification" },
         }),
       ],
-      {
-        subagents: {},
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
-      } as ClientCapabilities,
+      { subagents: {} } as ClientCapabilities,
     );
 
     expect(userChunks(updates)).toEqual([]);
-    expect(asyncTaskUpdates(updates)).toEqual([]);
     expect(updates.at(-1)?.update).toMatchObject({
       sessionUpdate: "subagent_state_update",
       subagentSessionId: "s1:replay-subagent:toolu_agent",
@@ -3047,7 +2894,7 @@ describe("meta messages from other agents, sessions and channels", () => {
   });
 });
 
-describe("usage-limit failure replay", () => {
+describe("usage-limit message replay", () => {
   const usageLimitMessage = {
     type: "assistant" as const,
     uuid: "usage-limit-message",
@@ -3067,9 +2914,6 @@ describe("usage-limit failure replay", () => {
         },
       ],
     },
-  };
-  const airCapabilities = {
-    _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
   };
   const successfulResult = () => ({
     type: "result" as const,
@@ -3094,7 +2938,7 @@ describe("usage-limit failure replay", () => {
     session_id: "s1",
   });
 
-  async function replay(messages: Awaited<ReturnType<typeof getSessionMessages>>, capable = true) {
+  async function replay(messages: Awaited<ReturnType<typeof getSessionMessages>>) {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -3102,7 +2946,7 @@ describe("usage-limit failure replay", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    await initializeClient(agent, capable ? airCapabilities : {});
+    await initializeClient(agent, {});
     agent.sessions.s1 = mockSessionState();
     vi.mocked(getSessionMessages).mockResolvedValueOnce(messages);
     await (
@@ -3111,139 +2955,16 @@ describe("usage-limit failure replay", () => {
     return { agent, updates };
   }
 
-  it("restores the latest synthetic usage limit as a typed failure", async () => {
-    const { agent, updates } = await replay([
-      usageLimitMessage,
-      {
-        ...usageLimitMessage,
-        uuid: "local-command-result",
-        message: {
-          ...usageLimitMessage.message,
-          id: "api-local-command-result",
-          content: [{ type: "text", text: "No response requested." }],
-        },
-      },
-    ]);
-
-    const failure = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .find(Boolean);
-    expect(failure).toEqual(
-      expect.objectContaining({
-        category: "limit",
-        severity: "error",
-        title:
-          "You've hit your individual spend limit · run /usage-credits to ask your admin for a higher limit",
-        actions: [],
-        revision: 1,
-      }),
-    );
-    expect(
-      updates.some(
-        (update) =>
-          update.update.sessionUpdate === "agent_message_chunk" &&
-          update.update.content.type === "text" &&
-          update.update.content.text.includes("individual spend limit"),
-      ),
-    ).toBe(false);
-    expect(agent.sessions.s1.sessionFailureState.active.get(failure.id)).toEqual(
-      expect.objectContaining({ kind: "quota_exhausted", category: "limit", revision: 1 }),
-    );
-  });
-
-  it("keeps a recovered historical failure as a typed transcript record", async () => {
-    const { updates } = await replay([
-      usageLimitMessage,
-      {
-        ...usageLimitMessage,
-        uuid: "recovered-answer",
-        message: {
-          ...usageLimitMessage.message,
-          id: "api-recovered-answer",
-          model: "claude-sonnet-4-6",
-          content: [{ type: "text", text: "Recovered" }],
-        },
-      },
-    ]);
-
-    const failures = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .filter(Boolean);
-    expect(failures).toEqual([
-      expect.objectContaining({
-        id: "s1:history-error:usage-limit-message",
-        category: "limit",
-        severity: "error",
-      }),
-    ]);
-    expect(
-      updates.some(
-        (update) =>
-          update.update.sessionUpdate === "agent_message_chunk" &&
-          update.update.content.type === "text" &&
-          update.update.content.text.includes("individual spend limit"),
-      ),
-    ).toBe(false);
-  });
-
-  it("preserves the standard transcript for clients without the extension", async () => {
-    const { updates } = await replay([usageLimitMessage], false);
+  it("replays the synthetic usage-limit text as a normal message", async () => {
+    const { updates } = await replay([usageLimitMessage]);
 
     expect(JSON.stringify(updates)).toContain("individual spend limit");
     expect(JSON.stringify(updates)).not.toContain("sessionFailure");
   });
 
-  it("clears the replayed failure after a successful follow-up", async () => {
+  it("does not report the zero usage of a synthetic local command as context usage", async () => {
     const { agent, updates } = await replay([usageLimitMessage]);
     const session = agent.sessions.s1;
-    expect([...session.sessionFailureState.active.values()]).toEqual([
-      expect.objectContaining({ recoveryPolicy: "real_model_success" }),
-    ]);
-    const input = new Pushable<any>();
-    async function* messages() {
-      const iterator = input[Symbol.asyncIterator]();
-      const user = await iterator.next();
-      yield userEcho(user.value);
-      yield {
-        ...usageLimitMessage,
-        uuid: "recovered-model-answer",
-        message: {
-          ...usageLimitMessage.message,
-          id: "api-recovered-model-answer",
-          model: "claude-sonnet-4-6",
-          usage: {
-            input_tokens: 1,
-            output_tokens: 1,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-          },
-          content: [{ type: "text", text: "Recovered" }],
-        },
-      };
-      yield successfulResult();
-      await iterator.next();
-    }
-    session.query = wrapQuery(messages());
-    session.input = input;
-
-    await agent.prompt({ sessionId: "s1", prompt: [{ type: "text", text: "try again" }] });
-    await vi.waitFor(() => {
-      expect(session.sessionFailureState.active.size).toBe(0);
-    });
-
-    const failures = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .filter(Boolean);
-    expect(failures).toHaveLength(1);
-    expect(session.sessionFailureState.active.has(failures[0].id)).toBe(false);
-  });
-
-  it("does not clear restored quota after a successful local command", async () => {
-    const { agent, updates } = await replay([usageLimitMessage]);
-    const session = agent.sessions.s1;
-    expect([...session.sessionFailureState.active.values()]).toEqual([
-      expect.objectContaining({ recoveryPolicy: "real_model_success" }),
-    ]);
     const input = new Pushable<any>();
     async function* messages() {
       const iterator = input[Symbol.asyncIterator]();
@@ -3271,74 +2992,10 @@ describe("usage-limit failure replay", () => {
     session.input = input;
 
     await agent.prompt({ sessionId: "s1", prompt: [{ type: "text", text: "/usage" }] });
+
     // The synthetic local-command frame carries zero usage; it must not be
     // reported as the session's context usage.
     expect(updates.filter((update) => update.update.sessionUpdate === "usage_update")).toEqual([]);
-
-    const failures = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .filter(Boolean);
-    const quotaFailure = failures.find((failure) => failure.category === "limit");
-    expect(quotaFailure).toEqual(expect.objectContaining({ severity: "error", revision: 1 }));
-    expect(session.sessionFailureState.active.has(quotaFailure.id)).toBe(true);
-  });
-
-  it("replays every quota failure with its persisted turn id and keeps only the latest active", async () => {
-    const newerUsageLimitMessage = {
-      ...usageLimitMessage,
-      uuid: "newer-usage-limit-message",
-      message: {
-        ...usageLimitMessage.message,
-        id: "api-newer-usage-limit-message",
-        content: [{ type: "text", text: "You've reached your account usage limit" }],
-      },
-    };
-    const userMessage = (uuid: string) => ({
-      type: "user" as const,
-      uuid,
-      session_id: "s1",
-      parent_tool_use_id: null,
-      parent_agent_id: null,
-      message: { role: "user", content: [{ type: "text", text: "try" }] },
-    });
-    const { agent, updates } = await replay([
-      userMessage("turn-one"),
-      usageLimitMessage,
-      userMessage("turn-two"),
-      newerUsageLimitMessage,
-    ]);
-
-    const failures = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .filter(Boolean);
-    expect(failures).toEqual([
-      expect.objectContaining({ id: "turn-one:error", severity: "error", revision: 1 }),
-      expect.objectContaining({ id: "turn-two:error", severity: "error", revision: 1 }),
-    ]);
-    expect([...agent.sessions.s1.sessionFailureState.active.keys()]).toEqual(["turn-two:error"]);
-  });
-
-  it("does not record a restored failure when publishing it fails", async () => {
-    const errors: unknown[][] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async () => {
-          throw new Error("client disconnected");
-        },
-      } as unknown as AcpClient,
-      { log: () => {}, error: (...args) => errors.push(args) },
-    );
-    await initializeClient(agent, airCapabilities);
-    agent.sessions.s1 = mockSessionState();
-    vi.mocked(getSessionMessages).mockResolvedValueOnce([usageLimitMessage]);
-
-    await (
-      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
-    ).replaySessionHistory("s1");
-
-    expect(agent.sessions.s1.sessionFailureState.active.size).toBe(0);
-    expect(agent.sessions.s1.sessionFailureState.revisions.size).toBe(0);
-    expect(errors.flat().join(" ")).toContain("failed to publish AIR session failure");
   });
 
   it("recognizes a sanitized raw transcript through the real SDK parser", async () => {
@@ -3358,11 +3015,7 @@ describe("usage-limit failure replay", () => {
     expect(parsed.find((message) => message.uuid === entries[1].uuid)).not.toHaveProperty("error");
 
     const { updates } = await replay(parsed);
-    const failure = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .find(Boolean);
-    expect(failure).toEqual(expect.objectContaining({ category: "limit", severity: "error" }));
-    expect(failure.title).toContain("individual spend limit");
+    expect(JSON.stringify(updates)).toContain("individual spend limit");
   });
 });
 
@@ -4567,7 +4220,6 @@ describe("permission request cancellation", () => {
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     injectSession(agent, "session-1");
 
     await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
@@ -4580,9 +4232,7 @@ describe("permission request cancellation", () => {
       { kind: "allow_once", name: "Yes", optionId: "allow-once" },
       { kind: "reject_once", name: "No", optionId: "reject" },
     ]);
-    expect(request?._meta).toEqual({
-      jetbrains: { air: { version: 1, permission: { version: 1, title: "ls" } } },
-    });
+    expect(request).not.toHaveProperty("_meta");
   });
 
   it("maps explicit reject to deny while retaining Claude classification", async () => {
@@ -4783,7 +4433,7 @@ describe("permission request cancellation", () => {
     });
   });
 
-  it("maps Claude presentation fields without reconstructing provider text or changing input", async () => {
+  it("keeps the permission request minimal and the input a fresh Read receives identical", async () => {
     let request: RequestPermissionRequest | undefined;
     const mockClient = {
       sessionUpdate: async () => {},
@@ -4793,7 +4443,6 @@ describe("permission request cancellation", () => {
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     injectSession(agent, "session-1");
     const input = { file_path: "/outside/a.ts" };
 
@@ -4809,21 +4458,13 @@ describe("permission request cancellation", () => {
       blockedPath: "/outside/a.ts",
     });
 
-    expect(request?._meta).toEqual({
-      jetbrains: {
-        air: {
-          version: 1,
-          permission: {
-            version: 1,
-            title: "Read /outside/a.ts",
-            description: "Reason: Needed to inspect the dependency.",
-          },
-        },
-      },
-    });
-    // The request repeats nothing that the tool call has. The blocked path is new.
-    expect(request?.toolCall).toEqual({
+    expect(request).not.toHaveProperty("_meta");
+    // The request carries the whole tool call; the blocked path is new.
+    expect(request?.toolCall).toMatchObject({
       toolCallId: "tool-1",
+      name: "Read",
+      kind: "read",
+      status: "pending",
       title: "Read /outside/a.ts",
       rawInput: input,
     });
@@ -5010,7 +4651,7 @@ describe("tool_call emitted before permission request", () => {
 
   it("emits the tool_call (then asks permission) when the stream hasn't yet", async () => {
     const { agent, events, updates, session } = setup();
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
+    await initializeClient(agent, {});
 
     const result = await agent.canUseTool("session-1")(
       "Bash",
@@ -5029,10 +4670,7 @@ describe("tool_call emitted before permission request", () => {
       toolCallId: "tool-1",
       status: "pending",
       title: "git diff",
-      _meta: {
-        claudeCode: { toolName: "Bash" },
-        jetbrains: { air: { commandTitle: "Show current diff" } },
-      },
+      _meta: { claudeCode: { toolName: "Bash" } },
     });
     expect(session.emittedToolCalls.has("tool-1")).toBe(true);
     expect(result).toMatchObject({ behavior: "allow" });
@@ -5040,7 +4678,7 @@ describe("tool_call emitted before permission request", () => {
 
   it("carries the PowerShell description in claudeCode meta like Bash", async () => {
     const { agent, updates } = setup();
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
+    await initializeClient(agent, {});
 
     await agent.canUseTool("session-1")(
       "PowerShell",
@@ -5056,10 +4694,7 @@ describe("tool_call emitted before permission request", () => {
       sessionUpdate: "tool_call",
       toolCallId: "tool-1",
       title: "Get-ChildItem",
-      _meta: {
-        claudeCode: { toolName: "PowerShell" },
-        jetbrains: { air: { commandTitle: "List files" } },
-      },
+      _meta: { claudeCode: { toolName: "PowerShell" } },
     });
   });
 
@@ -5405,7 +5040,7 @@ describe("canUseTool in bypassPermissions mode", () => {
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
+    await initializeClient(agent, {});
     agent.sessions["session-1"] = mockSessionState();
     agent.sessions["session-1"]!.emittedToolCalls.add("tool-1");
 
@@ -5424,9 +5059,7 @@ describe("canUseTool in bypassPermissions mode", () => {
     } as any);
 
     expect(request?.options.map((option) => option.optionId)).toEqual(["allow-once", "reject"]);
-    expect(request?._meta).toEqual({
-      jetbrains: { air: { version: 1, permission: { version: 1, title: "rm -rf build" } } },
-    });
+    expect(request).not.toHaveProperty("_meta");
   });
 
   it("leads with the reject option and forwards the hint when the CLI defaults to no", async () => {
@@ -5439,7 +5072,7 @@ describe("canUseTool in bypassPermissions mode", () => {
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
+    await initializeClient(agent, {});
     agent.sessions["session-1"] = mockSessionState();
     agent.sessions["session-1"]!.emittedToolCalls.add("tool-1");
 
@@ -5462,11 +5095,7 @@ describe("canUseTool in bypassPermissions mode", () => {
       "allow_once",
       "allow_always",
     ]);
-    expect(request?._meta).toEqual({
-      jetbrains: {
-        air: { version: 1, permission: { version: 1, title: "rm -rf build", defaultToNo: true } },
-      },
-    });
+    expect(request).not.toHaveProperty("_meta");
     expect(result).toMatchObject({ behavior: "deny" });
   });
 });
@@ -5513,7 +5142,6 @@ describe("subagent permission attribution (issue #851)", () => {
 
   it("keeps the legacy child tool call before its root permission request", async () => {
     const { agent, updates, requests, session } = setup();
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     session.liveBackgroundTasks.set("agent-42", {
       parentToolUseId: "toolu_parent",
       isSubagent: true,
@@ -5532,15 +5160,19 @@ describe("subagent permission attribution (issue #851)", () => {
       _meta: { claudeCode: { parentToolUseId: "toolu_parent" } },
     });
     expect(requests[0].sessionId).toBe("session-1");
-    // The tool_call carries the parent. The request does not repeat it, and AIR
-    // gets neither the fork's auto-approve marker (its own `_meta` carries the
-    // hint instead).
-    expect(requests[0].toolCall._meta).toBeUndefined();
+    // The tool_call carries the parent; the request repeats it alongside the
+    // fork's auto-approve marker.
+    expect(requests[0].toolCall._meta).toEqual({
+      claudeCode: {
+        toolName: "Bash",
+        parentToolUseId: "toolu_parent",
+        clientMayAutoApproveOnce: true,
+      },
+    });
   });
 
   it("forwards the MCP server provenance on the permission request", async () => {
     const { agent, requests } = setup();
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
 
     await agent.canUseTool("session-1")("mcp__github__create_issue", { title: "x" }, {
       signal: new AbortController().signal,
@@ -5550,7 +5182,11 @@ describe("subagent permission attribution (issue #851)", () => {
     } as any);
 
     expect(requests[0].toolCall._meta).toEqual({
-      claudeCode: { mcpServer: { name: "github", source: "project" } },
+      claudeCode: {
+        toolName: "mcp__github__create_issue",
+        mcpServer: { name: "github", source: "project" },
+        clientMayAutoApproveOnce: true,
+      },
     });
   });
 
@@ -5992,84 +5628,6 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(
       updates.some(({ update }) => JSON.stringify(update).includes("hidden child output")),
     ).toBe(true);
-    expect(
-      updates.some(
-        ({ update }) =>
-          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
-          update.toolCallId === "toolu_parent",
-      ),
-    ).toBe(true);
-  });
-
-  it("keeps AIR Agent child text internal without native subagent sessions", async () => {
-    const updates: AcpSessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: AcpSessionNotification) => {
-          updates.push(update);
-        },
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await agent.initialize({ protocolVersion: 1, clientCapabilities: AIR_CLIENT_CAPABILITIES });
-    injectGeneratorSession(
-      agent,
-      makeGenerator([
-        {
-          type: "assistant",
-          parent_tool_use_id: null,
-          uuid: randomUUID(),
-          session_id: "test-session",
-          message: {
-            id: randomUUID(),
-            role: "assistant",
-            model: "claude-sonnet-4-20250514",
-            content: [
-              {
-                type: "tool_use",
-                id: "toolu_parent",
-                name: "Agent",
-                input: { description: "Investigate", subagent_type: "Explore" },
-              },
-            ],
-            stop_reason: null,
-            stop_sequence: null,
-            usage: SUBAGENT_TEST_USAGE,
-          },
-        },
-        {
-          ...taskStarted("agent-42", "toolu_parent"),
-          subagent_type: "Explore",
-        },
-        {
-          type: "stream_event",
-          parent_tool_use_id: "toolu_parent",
-          uuid: randomUUID(),
-          session_id: "test-session",
-          event: {
-            type: "content_block_delta",
-            index: 0,
-            delta: { type: "text_delta", text: "hidden child output" },
-          },
-        },
-        successResult(),
-      ]),
-    );
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
-
-    expect(
-      updates.some(
-        ({ update }) =>
-          update.sessionUpdate === "subagent_spawned" ||
-          update.sessionUpdate === "subagent_state_update",
-      ),
-    ).toBe(false);
-    // For AIR, nested text stays internal without negotiation, streamed or
-    // consolidated. A client that is not AIR gets the streamed text, like upstream.
-    expect(
-      updates.some(({ update }) => JSON.stringify(update).includes("hidden child output")),
-    ).toBe(false);
     expect(
       updates.some(
         ({ update }) =>
@@ -6627,234 +6185,7 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(logs).toContainEqual(expect.stringContaining("pending buffer limit reached"));
   });
 
-  it("propagates a terminal SDK output_file through the async task lifecycle", async () => {
-    const updates: AcpSessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
-      },
-    });
-    injectGeneratorSession(
-      agent,
-      makeGenerator([
-        {
-          ...taskStarted("workflow-1", "toolu_workflow"),
-          task_type: "local_workflow",
-          workflow_name: "assets",
-          is_backgrounded: true,
-        },
-        {
-          type: "system",
-          subtype: "task_notification",
-          task_id: "workflow-1",
-          tool_use_id: "toolu_workflow",
-          status: "completed",
-          output_file: "/tmp/tasks/workflow-1.output",
-          summary: "done",
-          uuid: randomUUID(),
-          session_id: "test-session",
-        },
-        successResult(),
-      ]),
-    );
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
-
-    expect(updates.map(({ update }) => update)).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          sessionUpdate: "async_task_spawned",
-          asyncTaskId: "workflow-1",
-          name: "assets",
-        }),
-        expect.objectContaining({
-          sessionUpdate: "async_task_state_update",
-          asyncTaskId: "workflow-1",
-          state: "completed",
-          outputFilePath: "/tmp/tasks/workflow-1.output",
-        }),
-      ]),
-    );
-  });
-
-  it("stops one advertised async task through the SDK without cancelling the prompt", async () => {
-    const updates: AcpSessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
-      },
-    });
-    injectGeneratorSession(
-      agent,
-      makeGenerator([
-        {
-          ...taskStarted("workflow-1", "toolu_workflow"),
-          task_type: "local_workflow",
-          is_backgrounded: true,
-        },
-        successResult(),
-      ]),
-    );
-    const query = agent.sessions["test-session"].query as any;
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
-    query.stopTask.mockRejectedValueOnce(new Error("SDK stop failed"));
-    await expect(
-      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "workflow-1" }),
-    ).rejects.toThrow("SDK stop failed");
-    await expect(
-      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "workflow-1" }),
-    ).resolves.toEqual({ stopped: true });
-
-    expect(query.stopTask).toHaveBeenCalledTimes(2);
-    expect(query.stopTask).toHaveBeenNthCalledWith(1, "workflow-1");
-    expect(query.stopTask).toHaveBeenNthCalledWith(2, "workflow-1");
-    expect(query.interrupt).not.toHaveBeenCalled();
-    expect(updates.map(({ update }) => update)).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          sessionUpdate: "async_task_spawned",
-          asyncTaskId: "workflow-1",
-          canStop: true,
-        }),
-        expect.objectContaining({
-          sessionUpdate: "async_task_state_update",
-          asyncTaskId: "workflow-1",
-          state: "stopped",
-        }),
-      ]),
-    );
-    // One transcript line for the two stop attempts: the failed one never
-    // reached a terminal state, and the retry says it once.
-    expect(
-      updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk"),
-    ).toHaveLength(1);
-    expect(updates.at(-1)?.update).toMatchObject({
-      sessionUpdate: "agent_message_chunk",
-      content: { type: "text" },
-    });
-  });
-
-  it("holds async_task_spawned until the Bash result brings the tool id", async () => {
-    const updates: AcpSessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
-      },
-    });
-    injectGeneratorSession(
-      agent,
-      makeGenerator([
-        {
-          type: "assistant",
-          parent_tool_use_id: null,
-          uuid: randomUUID(),
-          session_id: "test-session",
-          message: {
-            role: "assistant",
-            content: [
-              {
-                type: "tool_use",
-                id: "bash-tool",
-                name: "Bash",
-                input: { command: "npm run build", run_in_background: true },
-              },
-            ],
-            usage: SUBAGENT_TEST_USAGE,
-          },
-        },
-        {
-          type: "system",
-          subtype: "task_started",
-          task_id: "shell-1",
-          task_type: "local_bash",
-          description: "Build",
-          is_backgrounded: true,
-          uuid: randomUUID(),
-          session_id: "test-session",
-        },
-        {
-          type: "user",
-          parent_tool_use_id: null,
-          uuid: randomUUID(),
-          session_id: "test-session",
-          tool_use_result: { backgroundTaskId: "shell-1" },
-          message: {
-            role: "user",
-            content: [
-              {
-                type: "tool_result",
-                tool_use_id: "bash-tool",
-                content:
-                  "Command running in background. Output is being written to: /tmp/tasks/shell-1.output. You will be notified when it completes.",
-              },
-            ],
-          },
-        },
-        successResult(),
-      ]),
-    );
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
-
-    const lifecycle = updates
-      .map(({ update }) => update)
-      .filter(
-        (update) =>
-          update.sessionUpdate === "async_task_spawned" ||
-          update.sessionUpdate === "async_task_progress",
-      );
-    // task_started has no tool_use_id, so the spawn waits for the Bash result.
-    expect(lifecycle).toEqual([
-      expect.objectContaining({
-        sessionUpdate: "async_task_spawned",
-        asyncTaskId: "shell-1",
-        toolCallId: "bash-tool",
-        outputFilePath: "/tmp/tasks/shell-1.output",
-      }),
-    ]);
-
-    // The Bash card completes as soon as the command detaches, so this marker is
-    // the only thing telling a client it is backgrounded work, not finished work.
-    const bashUpdate = updates
-      .map(({ update }) => update)
-      .findLast(
-        (update) =>
-          update.sessionUpdate === "tool_call_update" && update.toolCallId === "bash-tool",
-      );
-    expect(bashUpdate).toMatchObject({
-      status: "completed",
-      _meta: {
-        jetbrains: { air: { version: 1, asyncTasks: { backgrounded: true } } },
-      },
-    });
-    // Agent-native tool metadata keeps its own namespace alongside it.
-    // The tool_call sent the tool name, so the update does not repeat it.
-    expect((bashUpdate?._meta?.claudeCode as any)?.toolName).toBeUndefined();
-  });
-
-  it("omits the background task link for a client without the asyncTasks capability", async () => {
+  it("completes a background Bash call without a background-task link", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -6908,7 +6239,6 @@ describe("subagent permission attribution (issue #851)", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
-    // The id would name an `async_task_spawned` this client is never sent.
     const bashUpdate = updates
       .map(({ update }) => update)
       .findLast(
@@ -6919,151 +6249,6 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(bashUpdate?._meta ?? {}).not.toHaveProperty("jetbrains");
   });
 
-  it("sends the background tasks of a subagent to its session and keeps a root task in the root", async () => {
-    const updates: AcpSessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: {
-        subagents: {},
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
-      } as ClientCapabilities & { subagents: Record<string, never> },
-    });
-    const assistant = (parentToolUseId: string | null, content: unknown[]) => ({
-      type: "assistant",
-      parent_tool_use_id: parentToolUseId,
-      uuid: randomUUID(),
-      session_id: "test-session",
-      message: { role: "assistant", content, usage: SUBAGENT_TEST_USAGE },
-    });
-    const backgroundTask = (taskId: string, toolUseId: string, description: string) => ({
-      type: "system",
-      subtype: "task_started",
-      task_id: taskId,
-      tool_use_id: toolUseId,
-      task_type: "local_bash",
-      description,
-      is_backgrounded: true,
-      uuid: randomUUID(),
-      session_id: "test-session",
-    });
-    const taskNotification = (taskId: string, toolUseId: string) => ({
-      type: "system",
-      subtype: "task_notification",
-      task_id: taskId,
-      tool_use_id: toolUseId,
-      status: "completed",
-      output_file: "",
-      summary: "done",
-      uuid: randomUUID(),
-      session_id: "test-session",
-    });
-    let tasksStarted!: () => void;
-    const started = new Promise<void>((resolve) => (tasksStarted = resolve));
-    let release!: () => void;
-    const released = new Promise<void>((resolve) => (release = resolve));
-    injectGeneratorSession(agent, (input) => {
-      async function* messages() {
-        const iter = input[Symbol.asyncIterator]();
-        const user = await iter.next();
-        yield userEcho(user.value);
-        yield assistant(null, [
-          {
-            type: "tool_use",
-            id: "toolu_agent",
-            name: "Agent",
-            input: { description: "Investigate", prompt: "Find the bug" },
-          },
-        ]);
-        yield { ...taskStarted("agent-1", "toolu_agent"), subagent_type: "Explore" };
-        yield assistant("toolu_agent", [
-          {
-            type: "tool_use",
-            id: "child-bash",
-            name: "Bash",
-            input: { command: "npm test", run_in_background: true },
-          },
-          {
-            type: "tool_use",
-            id: "child-monitor",
-            name: "Monitor",
-            input: { command: "tail -f build.log", description: "watch the build log" },
-          },
-        ]);
-        yield backgroundTask("shell-child", "child-bash", "npm test");
-        yield backgroundTask("monitor-child", "child-monitor", "watch the build log");
-        yield assistant(null, [
-          {
-            type: "tool_use",
-            id: "root-bash",
-            name: "Bash",
-            input: { command: "npm run build", run_in_background: true },
-          },
-        ]);
-        yield backgroundTask("shell-root", "root-bash", "npm run build");
-        yield taskNotification("shell-child", "child-bash");
-        yield taskNotification("shell-root", "root-bash");
-        tasksStarted();
-        await released;
-        yield taskNotification("agent-1", "toolu_agent");
-        yield successResult();
-        yield { type: "system", subtype: "session_state_changed", state: "idle" };
-      }
-      return messages();
-    });
-    const query = agent.sessions["test-session"].query as any;
-
-    const prompt = agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "go" }],
-    });
-    await started;
-    // AIR stops a task with the root session id and the SDK task id.
-    await expect(
-      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "monitor-child" }),
-    ).resolves.toEqual({ stopped: true });
-    release();
-    await prompt;
-
-    expect(query.stopTask).toHaveBeenCalledWith("monitor-child");
-    const lifecycle = updates.flatMap(({ sessionId, update }) =>
-      "asyncTaskId" in update
-        ? [[sessionId, update.sessionUpdate, update.asyncTaskId, (update as any).state]]
-        : [],
-    );
-    expect(lifecycle).toEqual([
-      ["agent-1", "async_task_spawned", "shell-child", undefined],
-      ["agent-1", "async_task_spawned", "monitor-child", undefined],
-      ["test-session", "async_task_spawned", "shell-root", undefined],
-      ["agent-1", "async_task_state_update", "shell-child", "completed"],
-      ["test-session", "async_task_state_update", "shell-root", "completed"],
-      ["agent-1", "async_task_state_update", "monitor-child", "stopped"],
-    ]);
-    // The stop acknowledgement goes to the transcript that holds the task.
-    const stopAcknowledgement = updates.find(
-      ({ update }) =>
-        update.sessionUpdate === "agent_message_chunk" &&
-        update.content.type === "text" &&
-        update.content.text.includes("Task stopped by user"),
-    );
-    expect(stopAcknowledgement?.sessionId).toBe("agent-1");
-    // The tool call that started each task is in the same session as the task.
-    const toolCallSession = (toolCallId: string) =>
-      updates.find(
-        ({ update }) => update.sessionUpdate === "tool_call" && update.toolCallId === toolCallId,
-      )?.sessionId;
-    expect(toolCallSession("child-bash")).toBe("agent-1");
-    expect(toolCallSession("child-monitor")).toBe("agent-1");
-    expect(toolCallSession("root-bash")).toBe("test-session");
-  });
-});
-
-describe("native subagent eager tool ownership", () => {
   it("completes an Agent card created by a permission after its control frame was suppressed", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -7227,7 +6412,6 @@ describe("native subagent eager tool ownership", () => {
         rawInput: { description: "Investigate", prompt: "Find the bug" },
         _meta: {
           claudeCode: { toolName: "Agent" },
-          jetbrains: { air: { version: 1, subagent: true } },
         },
       },
     } as AcpSessionNotification;
@@ -7433,17 +6617,6 @@ describe("stop reason propagation", () => {
     ];
     return message;
   }
-
-  const airSessionFailureCapabilities = {
-    _meta: {
-      jetbrains: {
-        air: { version: 1, capabilities: ["sessionFailure"] },
-      },
-    },
-  };
-
-  const sessionFailureFromResponse = (response: PromptResponse) =>
-    (response._meta as any)?.jetbrains?.air?.sessionFailure;
 
   function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
     const input = new Pushable<any>();
@@ -7867,228 +7040,6 @@ describe("stop reason propagation", () => {
     expect(errors.filter((e) => e.includes("unknown command_lifecycle state"))).toEqual([]);
   });
 
-  it("publishes active_goal as provider-neutral session state without changing turn settlement", async () => {
-    const updates: any[] = [];
-    const mockClient = {
-      sessionUpdate: async (notification: any) => updates.push(notification),
-    } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
-
-    injectGeneratorSession(agent, (input) => {
-      async function* messageGenerator() {
-        const iter = input[Symbol.asyncIterator]();
-        const { value: userMessage } = await iter.next();
-        yield userEcho(userMessage);
-        yield {
-          type: "active_goal",
-          value: {
-            condition: "  Finish the migration  ",
-            iterations: 3,
-            set_at: 1710000000123,
-            tokens_at_start: 42,
-            last_reason: "Tests still need work",
-          },
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
-        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
-        yield {
-          type: "active_goal",
-          value: null,
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
-        yield { type: "system", subtype: "session_state_changed", state: "idle" };
-      }
-      return messageGenerator();
-    });
-
-    await expect(
-      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
-    ).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
-    expect(updates).toContainEqual({
-      sessionId: "test-session",
-      update: {
-        sessionUpdate: "session_info_update",
-        _meta: {
-          jetbrains: {
-            air: {
-              version: 1,
-              goal: {
-                objective: "Finish the migration",
-                status: "active",
-                iterations: 3,
-                lastReason: "Tests still need work",
-                createdAt: 1710000000123,
-                controlMethod: GOAL_CONTROL_METHOD,
-              },
-            },
-          },
-        },
-      },
-    });
-    expect(updates).toContainEqual({
-      sessionId: "test-session",
-      update: {
-        sessionUpdate: "session_info_update",
-        _meta: { jetbrains: { air: { version: 1, goal: null } } },
-      },
-    });
-    expect(updates.some((notification) => notification.update?._meta?.claudeCode?.goal)).toBe(
-      false,
-    );
-  });
-
-  it("publishes a submitted goal before a long-running command returns without active_goal", async () => {
-    const updates: any[] = [];
-    let releaseResult!: () => void;
-    const resultGate = new Promise<void>((resolve) => (releaseResult = resolve));
-    const mockClient = {
-      sessionUpdate: async (notification: any) => updates.push(notification),
-    } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
-
-    injectGeneratorSession(agent, (input) => {
-      async function* messageGenerator() {
-        const iter = input[Symbol.asyncIterator]();
-        const { value: userMessage } = await iter.next();
-        yield userEcho(userMessage);
-        await resultGate;
-        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
-        yield { type: "system", subtype: "session_state_changed", state: "idle" };
-      }
-      return messageGenerator();
-    });
-
-    const response = agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "/goal   Finish the migration  " }],
-    });
-    await vi.waitFor(() => {
-      expect(updates).toContainEqual({
-        sessionId: "test-session",
-        update: {
-          sessionUpdate: "session_info_update",
-          _meta: {
-            jetbrains: {
-              air: {
-                version: 1,
-                goal: {
-                  objective: "Finish the migration",
-                  status: "active",
-                  controlMethod: GOAL_CONTROL_METHOD,
-                },
-              },
-            },
-          },
-        },
-      });
-    });
-    releaseResult();
-    await expect(response).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
-  });
-
-  it("rolls back an optimistic goal update when the goal command fails", async () => {
-    const updates: any[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (notification: any) => updates.push(notification),
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
-    injectGeneratorSession(agent, (input) => {
-      async function* messageGenerator() {
-        const iter = input[Symbol.asyncIterator]();
-        const { value: original } = await iter.next();
-        yield userEcho(original);
-        yield {
-          type: "active_goal",
-          value: {
-            condition: "Original",
-            iterations: 2,
-            set_at: 1710000000000,
-            tokens_at_start: 0,
-          },
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
-        yield createResultMessage({
-          subtype: "success",
-          stop_reason: "end_turn",
-          is_error: false,
-        });
-        yield { type: "system", subtype: "session_state_changed", state: "idle" };
-        const { value: replacement } = await iter.next();
-        yield userEcho(replacement);
-        yield createResultMessage({
-          subtype: "success",
-          stop_reason: null,
-          is_error: true,
-          result: "goal rejected",
-        });
-        yield { type: "system", subtype: "session_state_changed", state: "idle" };
-      }
-      return messageGenerator();
-    });
-
-    await expect(
-      agent.prompt({
-        sessionId: "test-session",
-        prompt: [{ type: "text", text: "/goal Original" }],
-      }),
-    ).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
-
-    await expect(
-      agent.prompt({
-        sessionId: "test-session",
-        prompt: [{ type: "text", text: "/goal Replacement" }],
-      }),
-    ).rejects.toBeDefined();
-
-    const goalUpdates = updates
-      .map(({ update }) => update._meta?.jetbrains?.air?.goal)
-      .filter((goal) => goal !== undefined);
-    expect(goalUpdates.at(-2)).toEqual(
-      expect.objectContaining({ objective: "Replacement", status: "active" }),
-    );
-    expect(goalUpdates.at(-1)).toEqual(
-      expect.objectContaining({ objective: "Original", iterations: 2 }),
-    );
-  });
-
-  it("derives only state-changing goal slash commands", () => {
-    expect(goalUpdateFromPrompt("/goal clear")).toBeNull();
-    expect(goalUpdateFromPrompt("/goal")).toBeUndefined();
-    expect(goalUpdateFromPrompt("explain /goal clear")).toBeUndefined();
-    expect(goalUpdateFromPrompt(" /goal Finish the migration")).toBeUndefined();
-  });
-
-  it("maps the SDK goal shape without exposing provider fields", () => {
-    expect(
-      toGoalSnapshot({
-        type: "active_goal",
-        value: {
-          condition: "Goal",
-          iterations: 1,
-          set_at: 1710000000000,
-          tokens_at_start: 99,
-        },
-        uuid: randomUUID(),
-        session_id: "test-session",
-      }),
-    ).toEqual({
-      objective: "Goal",
-      status: "active",
-      iterations: 1,
-      lastReason: null,
-      createdAt: 1710000000000,
-      controlMethod: GOAL_CONTROL_METHOD,
-    });
-  });
-
   it("settles a no-echo command result (e.g. /compact) by promoting the head turn", async () => {
     // Regression: /compact never echoes a user message carrying the prompt's
     // uuid (its only user messages are the generated summary and a
@@ -8261,62 +7212,7 @@ describe("stop reason propagation", () => {
     ).rejects.toThrow("Internal error");
   });
 
-  it.each([1, 2])(
-    "publishes the Claude failure title for compatible AIR version %i",
-    async (version) => {
-      const updates: SessionNotification[] = [];
-      const agent = new ClaudeAcpAgent(
-        {
-          sessionUpdate: async (update: SessionNotification) => {
-            updates.push(update);
-          },
-        } as unknown as AcpClient,
-        { log: () => {}, error: () => {} },
-      );
-      await agent.initialize({
-        protocolVersion: 1,
-        clientCapabilities: {
-          _meta: { jetbrains: { air: { version, capabilities: ["sessionFailure"] } } },
-        },
-      });
-      injectSession(agent, [
-        createResultMessage({
-          subtype: "success",
-          stop_reason: "end_turn",
-          is_error: true,
-          result: "Claude could not complete the request.",
-        }),
-      ]);
-
-      const response = await agent.prompt({
-        sessionId: "test-session",
-        prompt: [{ type: "text", text: "test" }],
-      });
-      const failure = sessionFailureFromResponse(response);
-      expect(failure).toEqual(
-        expect.objectContaining({
-          revision: 1,
-          category: "service",
-          severity: "error",
-          title: "Claude could not complete the request.",
-          actions: ["retry"],
-        }),
-      );
-      for (const removedField of [
-        "phase",
-        "source",
-        "safeMessage",
-        "retryable",
-        "retryAfterMs",
-        "turnId",
-      ]) {
-        expect(failure).not.toHaveProperty(removedField);
-      }
-      expect(JSON.stringify(updates)).not.toContain("sessionFailure");
-    },
-  );
-
-  it("updates an api retry warning into the terminal failure", async () => {
+  it("hides a synthetic spend limit and keeps the prior turn's usage", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -8324,264 +7220,6 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    await initializeClient(agent, airSessionFailureCapabilities);
-    injectSession(agent, [
-      {
-        type: "system",
-        subtype: "api_retry",
-        attempt: 1,
-        max_retries: 5,
-        retry_delay_ms: 100,
-        error_status: 429,
-        error: "rate_limit",
-        uuid: randomUUID(),
-        session_id: "test-session",
-      },
-      createAssistantError("rate_limit", "Rate limit reached."),
-      createResultMessage({
-        subtype: "success",
-        stop_reason: "end_turn",
-        is_error: true,
-        result: "Rate limit reached.",
-      }),
-    ]);
-
-    const response = await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "test" }],
-    });
-    const warning = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .find(Boolean);
-    const terminal = sessionFailureFromResponse(response);
-
-    expect(warning).toEqual(
-      expect.objectContaining({
-        category: "limit",
-        severity: "warning",
-        revision: 1,
-        title: "Retrying Claude, attempt 1 of 5.",
-        actions: [],
-      }),
-    );
-    expect(terminal).toEqual(
-      expect.objectContaining({
-        id: warning.id,
-        category: "limit",
-        severity: "error",
-        revision: 2,
-        title: "Rate limit reached.",
-        actions: ["retry"],
-      }),
-    );
-  });
-
-  it("says how long a no-response retry waited and will wait", async () => {
-    const updates: SessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: SessionNotification) => updates.push(update),
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, airSessionFailureCapabilities);
-    injectSession(agent, [
-      {
-        type: "system",
-        subtype: "api_retry",
-        attempt: 1,
-        max_retries: 1,
-        retry_delay_ms: 0,
-        error_status: null,
-        error: "unknown",
-        // SDK 0.3.261+: the API sent no response headers within the
-        // first-byte window; the retry waits longer for them.
-        no_response: { waited_ms: 180_000, retry_wait_ms: 600_000 },
-        uuid: randomUUID(),
-        session_id: "test-session",
-      },
-      createResultMessage({
-        subtype: "success",
-        stop_reason: "end_turn",
-        is_error: false,
-        result: "ok",
-      }),
-    ]);
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
-    const warning = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .find(Boolean);
-    expect(warning).toEqual(
-      expect.objectContaining({
-        category: "connection",
-        severity: "warning",
-        title:
-          "Reconnecting to Claude, attempt 1 of 1. No response after 180s; waiting up to 600s.",
-      }),
-    );
-  });
-
-  it("clears a connection retry warning internally after the turn succeeds", async () => {
-    const updates: SessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: SessionNotification) => updates.push(update),
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, airSessionFailureCapabilities);
-    injectSession(agent, [
-      {
-        type: "system",
-        subtype: "api_retry",
-        attempt: 2,
-        max_retries: 5,
-        retry_delay_ms: 100,
-        error_status: null,
-        error: "unknown",
-        uuid: randomUUID(),
-        session_id: "test-session",
-      },
-      createAssistantError(undefined, "Recovered."),
-      createResultMessage({
-        subtype: "success",
-        stop_reason: "end_turn",
-        is_error: false,
-        result: "Recovered.",
-      }),
-    ]);
-
-    await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "test" }],
-    });
-    const warning = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .find(Boolean);
-
-    expect(warning).toEqual(
-      expect.objectContaining({
-        category: "connection",
-        severity: "warning",
-        title: "Reconnecting to Claude, attempt 2 of 5.",
-        actions: [],
-      }),
-    );
-    expect(agent.sessions["test-session"].sessionFailureState.active.has(warning.id)).toBe(false);
-  });
-
-  it.each([
-    ["missing envelope", {}],
-    ["missing capability", { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } }],
-    [
-      "string version",
-      { _meta: { jetbrains: { air: { version: "1", capabilities: ["sessionFailure"] } } } },
-    ],
-    [
-      "fractional version",
-      { _meta: { jetbrains: { air: { version: 1.5, capabilities: ["sessionFailure"] } } } },
-    ],
-    [
-      "zero version",
-      { _meta: { jetbrains: { air: { version: 0, capabilities: ["sessionFailure"] } } } },
-    ],
-    [
-      "negative version",
-      { _meta: { jetbrains: { air: { version: -1, capabilities: ["sessionFailure"] } } } },
-    ],
-    [
-      "non-finite version",
-      { _meta: { jetbrains: { air: { version: Number.NaN, capabilities: ["sessionFailure"] } } } },
-    ],
-    ["non-string capability", { _meta: { jetbrains: { air: { version: 1, capabilities: [1] } } } }],
-    [
-      "legacy nested version",
-      { _meta: { jetbrains: { air: { sessionFailure: { version: 1 } } } } },
-    ],
-  ])("does not publish typed failures for %s", async (_label, capabilities) => {
-    const updates: SessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: SessionNotification) => {
-          updates.push(update);
-        },
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: capabilities,
-    });
-    injectSession(agent, [
-      createResultMessage({
-        subtype: "success",
-        stop_reason: "end_turn",
-        is_error: true,
-        result: "provider detail",
-      }),
-    ]);
-
-    await expect(
-      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
-    ).rejects.toThrow("provider detail");
-    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
-  });
-
-  it.each([
-    ["billing_error", "limit"],
-    ["account_on_hold", "limit"],
-    ["verification_required", "service"],
-    ["cloud_credential_error", "service"],
-    ["rate_limit", "limit"],
-    ["overloaded", "service"],
-    ["invalid_request", "request"],
-    ["max_output_tokens", "limit"],
-  ] as const)("maps SDK error %s to broad category %s", async (sdkError, expectedCategory) => {
-    const updates: SessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: SessionNotification) => {
-          updates.push(update);
-        },
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, airSessionFailureCapabilities);
-    injectSession(agent, [
-      createAssistantError(sdkError, "Claude request failed."),
-      createResultMessage({
-        subtype: "success",
-        stop_reason: "end_turn",
-        is_error: true,
-        result: "Claude request failed.",
-      }),
-    ]);
-
-    const response = await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "test" }],
-    });
-    expect(sessionFailureFromResponse(response)).toEqual(
-      expect.objectContaining({
-        category: expectedCategory,
-        severity: "error",
-        title: "Claude request failed.",
-      }),
-    );
-    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
-    expect(JSON.stringify(updates)).not.toContain("Claude request failed.");
-  });
-
-  it("classifies a live synthetic spend limit as exhausted quota", async () => {
-    const updates: SessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: SessionNotification) => updates.push(update),
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, airSessionFailureCapabilities);
     const priorAssistant = createAssistantError(undefined);
     priorAssistant.message.usage = {
       input_tokens: 170000,
@@ -8600,21 +7238,10 @@ describe("stop reason propagation", () => {
       }),
     ]);
 
-    const response = await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "test" }],
-    });
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).rejects.toThrow();
 
-    expect(sessionFailureFromResponse(response)).toEqual(
-      expect.objectContaining({
-        category: "limit",
-        severity: "error",
-        title:
-          "You've hit your individual spend limit · run /usage-credits to ask your admin for a higher limit",
-        actions: [],
-      }),
-    );
-    expect(JSON.stringify(updates)).not.toContain("agent_message_chunk");
     const usageUpdates = updates.filter((update) => update.update.sessionUpdate === "usage_update");
     expect(usageUpdates.at(-1)?.update).toEqual(
       expect.objectContaining({ used: 170910, size: 200000 }),
@@ -8629,7 +7256,6 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    await initializeClient(agent, airSessionFailureCapabilities);
     injectSession(agent, [
       createUsageLimitAssistantError(),
       createResultMessage({
@@ -8641,19 +7267,15 @@ describe("stop reason propagation", () => {
     ]);
     agent.sessions["test-session"].contextUsedTokens = 170910;
 
-    const response = await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "test" }],
-    });
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).rejects.toThrow();
 
-    expect(sessionFailureFromResponse(response)).toEqual(
-      expect.objectContaining({ category: "limit" }),
-    );
     expect(updates.filter((update) => update.update.sessionUpdate === "usage_update")).toEqual([]);
     expect(agent.sessions["test-session"].contextUsedTokens).toBe(170910);
   });
 
-  it("preserves live usage-limit prose for clients without typed failures", async () => {
+  it("preserves the usage-limit prose of a refused turn", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -8677,43 +7299,6 @@ describe("stop reason propagation", () => {
     expect(JSON.stringify(updates)).toContain("individual spend limit");
   });
 
-  it.each([
-    ["error_max_budget_usd", "limit"],
-    ["error_max_turns", "limit"],
-    ["error_max_structured_output_retries", "service"],
-  ] as const)("maps terminal subtype %s to %s", async (subtype, expectedCategory) => {
-    const updates: SessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: SessionNotification) => {
-          updates.push(update);
-        },
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, airSessionFailureCapabilities);
-    injectSession(agent, [
-      createResultMessage({
-        subtype,
-        stop_reason: null,
-        is_error: true,
-        errors: ["Claude request failed."],
-      }),
-    ]);
-
-    const response = await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "test" }],
-    });
-    expect(sessionFailureFromResponse(response)).toEqual(
-      expect.objectContaining({ category: expectedCategory, title: "Claude request failed." }),
-    );
-    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
-  });
-
-  const sessionFailuresFromUpdates = (updates: SessionNotification[]) =>
-    updates.map((u) => (u.update as any)?._meta?.jetbrains?.air?.sessionFailure).filter(Boolean);
-
   it("rejects authentication_failed through ACP without an access update", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -8724,7 +7309,6 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    await initializeClient(agent, airSessionFailureCapabilities);
     injectSession(agent, [
       createAssistantError("authentication_failed", "Claude request failed."),
       createResultMessage({
@@ -8740,8 +7324,6 @@ describe("stop reason propagation", () => {
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
     ).rejects.toMatchObject({ code: -32000 });
     await agent.sessions["test-session"]?.consumer;
-    const failures = sessionFailuresFromUpdates(updates);
-    expect(failures).toEqual([]);
   });
 
   it("recovers auth_required internally after a successful auth_status", async () => {
@@ -8754,7 +7336,6 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    await initializeClient(agent, airSessionFailureCapabilities);
     injectSession(agent, [
       createAssistantError("authentication_failed", "Authentication required."),
       createResultMessage({
@@ -8776,8 +7357,6 @@ describe("stop reason propagation", () => {
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
     ).rejects.toThrow();
     await agent.sessions["test-session"]?.consumer;
-    expect(sessionFailuresFromUpdates(updates)).toEqual([]);
-    expect(agent.sessions["test-session"].sessionFailureState.active.size).toBe(0);
     expect(JSON.stringify(updates)).not.toContain("private login token");
   });
 
@@ -8791,7 +7370,6 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    await initializeClient(agent, airSessionFailureCapabilities);
     injectSession(agent, [
       createAssistantError("authentication_failed", "Authentication required."),
       createResultMessage({
@@ -8814,8 +7392,6 @@ describe("stop reason propagation", () => {
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
     ).rejects.toThrow();
     await agent.sessions["test-session"]?.consumer;
-    expect(sessionFailuresFromUpdates(updates)).toEqual([]);
-    expect(agent.sessions["test-session"].sessionFailureState.active.size).toBe(0);
     expect(JSON.stringify(updates)).not.toContain("private login token");
     expect(JSON.stringify(updates)).not.toContain("private login error");
   });
@@ -8836,7 +7412,6 @@ describe("stop reason propagation", () => {
         },
       },
     );
-    await initializeClient(agent, airSessionFailureCapabilities);
     // The CLI reports one signed-out turn twice: the synthetic login assistant
     // message rejects the turn, then the result repeats the same text. One
     // The ACP auth error covers both. The CLI's TUI advice stays local.
@@ -8859,8 +7434,6 @@ describe("stop reason propagation", () => {
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
     ).rejects.toThrow();
     await agent.sessions["test-session"]?.consumer;
-    expect(sessionFailuresFromUpdates(updates)).toEqual([]);
-    expect(agent.sessions["test-session"].sessionFailureState.active.size).toBe(0);
     // The first delivery already rejected the turn, so the second one has no
     // turn to fail. That is expected here and must not be logged as a fault.
     expect(logged.join("\n")).not.toContain("cannot fail active turn");
@@ -8876,7 +7449,6 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    await initializeClient(agent, airSessionFailureCapabilities);
     const answer = "A normal answer can quote: Please run /login.";
     injectSession(agent, [
       createAssistantError(undefined, answer),
@@ -8892,7 +7464,6 @@ describe("stop reason propagation", () => {
     await expect(
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
     ).resolves.toMatchObject({ stopReason: "end_turn" });
-    expect(sessionFailuresFromUpdates(updates)).toEqual([]);
   });
 
   it("rejects a later sign-out after a real model answer", async () => {
@@ -8905,7 +7476,6 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    await initializeClient(agent, airSessionFailureCapabilities);
     const signedOut = () => {
       const message = createAssistantError("authentication_failed");
       message.message.model = "<synthetic>";
@@ -8956,246 +7526,11 @@ describe("stop reason propagation", () => {
     // A client can sign the user in out of band — AIR runs `claude /login` in a
     // terminal — and then no `auth_status` message arrives. A real model answer
     // is the proof that the session is signed in again.
-    expect(agent.sessions["test-session"].sessionFailureState.active.size).toBe(0);
     await expect(
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "three" }] }),
     ).rejects.toThrow();
 
     // The next sign-out also uses the ACP auth error.
-    expect(sessionFailuresFromUpdates(updates)).toEqual([]);
-  });
-
-  it("publishes no retry warning for an authentication_failed api_retry", async () => {
-    const updates: SessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: SessionNotification) => {
-          updates.push(update);
-        },
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, airSessionFailureCapabilities);
-    // The 401 retry is the CLI's credential re-check. The sign-out that
-    // follows is the signal. Neither event publishes an access update.
-    injectSession(agent, [
-      {
-        type: "system",
-        subtype: "api_retry",
-        attempt: 1,
-        max_retries: 10,
-        retry_delay_ms: 100,
-        error_status: 401,
-        error: "authentication_failed",
-        uuid: randomUUID(),
-        session_id: "test-session",
-      },
-      createAssistantError("authentication_failed", "Claude request failed."),
-      createResultMessage({
-        subtype: "success",
-        stop_reason: "end_turn",
-        is_error: true,
-        result: "Claude request failed.",
-      }),
-    ]);
-
-    await expect(
-      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
-    ).rejects.toThrow();
-    await agent.sessions["test-session"]?.consumer;
-    expect(sessionFailuresFromUpdates(updates)).toEqual([]);
-  });
-
-  it("keeps the historical failure record unchanged after recovery", async () => {
-    const updates: SessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: SessionNotification) => {
-          updates.push(update);
-        },
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, airSessionFailureCapabilities);
-    const input = new Pushable<any>();
-    async function* messageGenerator() {
-      const iter = input[Symbol.asyncIterator]();
-      const first = await iter.next();
-      yield {
-        type: "user",
-        message: first.value.message,
-        parent_tool_use_id: null,
-        uuid: first.value.uuid,
-        session_id: "test-session",
-        isReplay: true,
-      };
-      yield createResultMessage({
-        subtype: "success",
-        stop_reason: "end_turn",
-        is_error: true,
-        result: "first turn failed",
-      });
-      const second = await iter.next();
-      yield {
-        type: "user",
-        message: second.value.message,
-        parent_tool_use_id: null,
-        uuid: second.value.uuid,
-        session_id: "test-session",
-        isReplay: true,
-      };
-      yield createResultMessage({
-        subtype: "success",
-        stop_reason: "end_turn",
-        is_error: false,
-        result: "recovered",
-      });
-    }
-    agent.sessions["test-session"] = mockSessionState({
-      query: wrapQuery(messageGenerator()),
-      input,
-    });
-
-    const failed = await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "first" }],
-    });
-    await expect(
-      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "second" }] }),
-    ).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
-
-    const failures = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .filter(Boolean);
-    const active = sessionFailureFromResponse(failed);
-    expect(active).toEqual(expect.objectContaining({ revision: 1, severity: "error" }));
-    expect(failures).toEqual([]);
-    expect(agent.sessions["test-session"].sessionFailureState.active.has(active.id)).toBe(false);
-  });
-
-  it("does not publish a clear record when the next turn is refused", async () => {
-    const updates: SessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: SessionNotification) => {
-          updates.push(update);
-        },
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, airSessionFailureCapabilities);
-    const input = new Pushable<any>();
-    async function* messageGenerator() {
-      const iter = input[Symbol.asyncIterator]();
-      for (const result of [
-        createResultMessage({
-          subtype: "success",
-          stop_reason: "end_turn",
-          is_error: true,
-          result: "first turn failed",
-        }),
-        createResultMessage({
-          subtype: "success",
-          stop_reason: "refusal",
-          is_error: true,
-        }),
-      ]) {
-        const user = await iter.next();
-        yield {
-          type: "user",
-          message: user.value.message,
-          parent_tool_use_id: null,
-          uuid: user.value.uuid,
-          session_id: "test-session",
-          isReplay: true,
-        };
-        yield result;
-      }
-    }
-    agent.sessions["test-session"] = mockSessionState({
-      query: wrapQuery(messageGenerator()),
-      input,
-    });
-
-    const failed = await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "first" }],
-    });
-    await expect(
-      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "second" }] }),
-    ).resolves.toEqual(expect.objectContaining({ stopReason: "refusal" }));
-
-    const failures = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .filter(Boolean);
-    const active = sessionFailureFromResponse(failed);
-    expect(failures).toEqual([]);
-    expect(agent.sessions["test-session"].sessionFailureState.active.has(active.id)).toBe(false);
-  });
-
-  it("does not publish clear records on repeated successful turns", async () => {
-    const updates: SessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: SessionNotification) => {
-          updates.push(update);
-        },
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, airSessionFailureCapabilities);
-    const input = new Pushable<any>();
-    async function* messageGenerator() {
-      const iter = input[Symbol.asyncIterator]();
-      const results = [
-        createResultMessage({
-          subtype: "success",
-          stop_reason: "end_turn",
-          is_error: true,
-          result: "first turn failed",
-        }),
-        createResultMessage({
-          subtype: "success",
-          stop_reason: "end_turn",
-          is_error: false,
-        }),
-        createResultMessage({
-          subtype: "success",
-          stop_reason: "end_turn",
-          is_error: false,
-        }),
-      ];
-      for (const result of results) {
-        const user = await iter.next();
-        yield {
-          type: "user",
-          message: user.value.message,
-          parent_tool_use_id: null,
-          uuid: user.value.uuid,
-          session_id: "test-session",
-          isReplay: true,
-        };
-        yield result;
-      }
-    }
-    agent.sessions["test-session"] = mockSessionState({
-      query: wrapQuery(messageGenerator()),
-      input,
-    });
-
-    const failed = await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "first" }],
-    });
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "second" }] });
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "third" }] });
-
-    const failures = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .filter(Boolean);
-    const active = sessionFailureFromResponse(failed);
-    expect(failures).toEqual([]);
-    expect(agent.sessions["test-session"].sessionFailureState.active.has(active.id)).toBe(false);
   });
 
   it("logs loudly when a failure has no active turn to reject", async () => {
@@ -9231,7 +7566,7 @@ describe("stop reason propagation", () => {
     expect(errors).toContainEqual(expect.stringContaining("late duplicate failure"));
   });
 
-  it("retains a replayed worker shutdown through later buffered activity", async () => {
+  it("fails the active turn on a worker shutdown only at the live tail", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -9241,50 +7576,6 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    await initializeClient(agent, airSessionFailureCapabilities);
-    injectSession(agent, [
-      {
-        type: "system",
-        subtype: "worker_shutting_down",
-        reason: "historical_host_exit",
-        uuid: randomUUID(),
-        session_id: "test-session",
-      },
-      createResultMessage({
-        subtype: "success",
-        stop_reason: "end_turn",
-        is_error: false,
-      }),
-    ]);
-
-    const prompt = agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "test" }],
-    });
-    const consumer = agent.sessions["test-session"]?.consumer;
-    const response = await prompt;
-    await consumer;
-
-    expect(sessionFailureFromResponse(response)).toBeUndefined();
-    const failure = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .find((candidate) => candidate?.title === "The Claude worker is shutting down.");
-    expect(failure).toEqual(
-      expect.objectContaining({ category: "connection", severity: "error", revision: 1 }),
-    );
-  });
-
-  it("returns an active-turn worker shutdown on PromptResponse only at live tail", async () => {
-    const updates: SessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: SessionNotification) => {
-          updates.push(update);
-        },
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, airSessionFailureCapabilities);
     let reachedQuietTail!: () => void;
     const quietTail = new Promise<void>((resolve) => (reachedQuietTail = resolve));
     let closeStream!: () => void;
@@ -9323,51 +7614,8 @@ describe("stop reason propagation", () => {
     await quietTail;
     expect(JSON.stringify(updates)).not.toContain("worker_shutdown");
     closeStream();
-    const response = await prompt;
-    const failure = sessionFailureFromResponse(response);
-    expect(failure).toEqual(
-      expect.objectContaining({ category: "connection", severity: "error", revision: 1 }),
-    );
-    expect(failure).not.toHaveProperty("turnId");
-    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
-  });
-
-  it("publishes an idle worker shutdown as a session update only", async () => {
-    const updates: SessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: SessionNotification) => {
-          updates.push(update);
-        },
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, airSessionFailureCapabilities);
-    injectSession(agent, [
-      createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false }),
-      {
-        type: "system",
-        subtype: "worker_shutting_down",
-        reason: "host_exit",
-        uuid: randomUUID(),
-        session_id: "test-session",
-      },
-    ]);
-
-    const response = await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "test" }],
-    });
-    await agent.sessions["test-session"]?.consumer;
-
-    expect(sessionFailureFromResponse(response)).toBeUndefined();
-    const failure = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .find((candidate) => candidate?.title === "The Claude worker is shutting down.");
-    expect(failure).toEqual(
-      expect.objectContaining({ category: "connection", severity: "error", revision: 1 }),
-    );
-    expect(failure).not.toHaveProperty("turnId");
+    await expect(prompt).rejects.toThrow();
+    expect(JSON.stringify(updates)).not.toContain("worker_shutdown");
   });
 
   it("ignores a late worker shutdown from a replaced query consumer", async () => {
@@ -9380,7 +7628,6 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    await initializeClient(agent, airSessionFailureCapabilities);
     let reachedQuietTail!: () => void;
     const quietTail = new Promise<void>((resolve) => (reachedQuietTail = resolve));
     let closeOldStream!: () => void;
@@ -9425,48 +7672,7 @@ describe("stop reason propagation", () => {
     expect(JSON.stringify(updates)).not.toContain("worker_shutdown");
   });
 
-  it("uses a fresh session-scoped failure identity for each query-stream consumer", async () => {
-    const runWorkerTail = async () => {
-      const updates: SessionNotification[] = [];
-      const agent = new ClaudeAcpAgent(
-        {
-          sessionUpdate: async (update: SessionNotification) => {
-            updates.push(update);
-          },
-        } as unknown as AcpClient,
-        { log: () => {}, error: () => {} },
-      );
-      await initializeClient(agent, airSessionFailureCapabilities);
-      injectSession(agent, [
-        createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false }),
-        {
-          type: "system",
-          subtype: "worker_shutting_down",
-          reason: "host_exit",
-          uuid: randomUUID(),
-          session_id: "test-session",
-        },
-      ]);
-      const prompt = agent.prompt({
-        sessionId: "test-session",
-        prompt: [{ type: "text", text: "test" }],
-      });
-      const consumer = agent.sessions["test-session"]?.consumer;
-      await prompt;
-      await consumer;
-      return updates
-        .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-        .find((candidate) => candidate?.title === "The Claude worker is shutting down.");
-    };
-
-    const first = await runWorkerTail();
-    const restarted = await runWorkerTail();
-    expect(first).toEqual(expect.objectContaining({ revision: 1, severity: "error" }));
-    expect(restarted).toEqual(expect.objectContaining({ revision: 1, severity: "error" }));
-    expect(restarted.id).not.toBe(first.id);
-  });
-
-  it("publishes and returns a sanitized transport failure when the query iterator throws", async () => {
+  it("rejects the turn with a sanitized transport failure when the query iterator throws", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -9476,7 +7682,6 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    await initializeClient(agent, airSessionFailureCapabilities);
     const input = new Pushable<any>();
     async function* messageGenerator() {
       const iter = input[Symbol.asyncIterator]();
@@ -9496,19 +7701,14 @@ describe("stop reason propagation", () => {
       input,
     });
 
-    const response = await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "test" }],
-    });
-    expect(sessionFailureFromResponse(response)).toEqual(
-      expect.objectContaining({
-        category: "connection",
-        severity: "error",
-        title: "The connection to Claude was lost.",
-        actions: ["new_session"],
-      }),
-    );
-    expect(JSON.stringify(response)).not.toContain("private transport URL and token");
+    const error = await agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] })
+      .then(
+        () => undefined,
+        (cause: unknown) => cause,
+      );
+    expect(error).toBeDefined();
+    expect(JSON.stringify(error)).not.toContain("private transport URL and token");
     expect(JSON.stringify(updates)).not.toContain("sessionFailure");
   });
 
@@ -9845,65 +8045,11 @@ describe("model refusal fallback handling", () => {
     expect(notice.content.text).toContain("This request tripped a safety classifier.");
   });
 
-  it("publishes the model fallback as a warning advisory for AIR clients", async () => {
-    const { agent, sessionUpdate } = createCapturingAgent();
-    await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
-      },
-    });
-    injectGeneratorSession(
-      agent,
-      makeGenerator([refusalFallbackMessage(), successResult()]),
-      modelStateOverrides,
-    );
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
-
-    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
-    // The advisory replaces the transcript line; it must not be delivered as both.
-    expect(
-      updates.find(
-        (u: any) =>
-          u.sessionUpdate === "agent_message_chunk" && u.content?.text?.includes("Model fallback"),
-      ),
-    ).toBeUndefined();
-
-    const advisory = updates
-      .map((u: any) => u._meta?.jetbrains?.air?.sessionFailure)
-      .find((record: any) => record?.severity === "warning");
-    expect(advisory).toEqual(
-      expect.objectContaining({
-        category: "unknown",
-        severity: "warning",
-        actions: [],
-      }),
-    );
-    // Its own wording, carried through instead of the canned per-category message.
-    expect(advisory.title).toContain("claude-fable-5");
-    expect(advisory.title).toContain("claude-opus-4-8");
-    expect(advisory.title).toContain("(cyber)");
-    // No markdown lead-in: the banner supplies the severity, so the text must not fake one.
-    expect(advisory.title).not.toContain("**");
-    // Its own id namespace, so it never collides with a turn's error record.
-    expect(advisory.id).toContain(":notice:");
-    expect(
-      updates
-        .map((u: any) => u._meta?.jetbrains?.air?.sessionFailure)
-        .filter((record: any) => record?.id === advisory.id),
-    ).toEqual([advisory]);
-  });
-
   it("publishes the model fallback as a notice for clients on the notice contract", async () => {
     const { agent, sessionUpdate } = createCapturingAgent();
     await agent.initialize({
       protocolVersion: 1,
-      clientCapabilities: {
-        session: { notices: {} },
-        // Both lanes advertised: the standard notice wins over the AIR record.
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
-      },
+      clientCapabilities: { session: { notices: {} } },
     });
     injectGeneratorSession(
       agent,
@@ -9917,14 +8063,13 @@ describe("model refusal fallback handling", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
-    // Exactly one surface: no transcript line and no AIR advisory beside the notice.
+    // Exactly one surface: the notice replaces the transcript line.
     expect(
       updates.find(
         (u: any) =>
           u.sessionUpdate === "agent_message_chunk" && u.content?.text?.includes("Model fallback"),
       ),
     ).toBeUndefined();
-    expect(updates.find((u: any) => u._meta?.jetbrains?.air?.sessionFailure)).toBeUndefined();
 
     const notices = updates.filter((u: any) => u.sessionUpdate === "notice");
     expect(notices).toHaveLength(1);
@@ -9966,34 +8111,6 @@ describe("model refusal fallback handling", () => {
     expect(notice.title).toBe("Model fallback");
     expect(notice.description).toContain(longCategory);
     expect(notice.description).toContain("\n\nwhy");
-  });
-
-  it("puts only a genuinely long model fallback explanation in details", async () => {
-    const { agent, sessionUpdate } = createCapturingAgent();
-    await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
-      },
-    });
-    const explanation = "Long provider explanation. ".repeat(20);
-    injectGeneratorSession(
-      agent,
-      makeGenerator([
-        refusalFallbackMessage({ api_refusal_explanation: explanation }),
-        successResult(),
-      ]),
-      modelStateOverrides,
-    );
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
-
-    const advisory = sessionUpdate.mock.calls
-      .map((call: any[]) => (call[0] as { update: any }).update)
-      .map((update: any) => update._meta?.jetbrains?.air?.sessionFailure)
-      .find((record: any) => record?.severity === "warning");
-    expect(advisory.title).not.toContain(explanation);
-    expect(advisory.details).toBe(explanation);
   });
 
   it("tracks the raw model id when the fallback model is not among the options", async () => {
@@ -10377,11 +8494,10 @@ describe("terminal slash command filtering", () => {
 
 describe("skill commands in available_commands_update", () => {
   let cwd: string;
-  let skillPath: string;
 
   beforeEach(async () => {
     cwd = await mkdtemp(path.join(os.tmpdir(), "acp-skill-commands-"));
-    skillPath = path.join(cwd, ".claude", "skills", "review", "SKILL.md");
+    const skillPath = path.join(cwd, ".claude", "skills", "review", "SKILL.md");
     await mkdir(path.dirname(skillPath), { recursive: true });
     await writeFile(skillPath, "# review\n");
   });
@@ -10468,33 +8584,7 @@ describe("skill commands in available_commands_update", () => {
     return commandsUpdate.availableCommands as Array<{ name: string; _meta?: unknown }>;
   }
 
-  it("marks a skill with a SKILL.md on disk for an AIR client", async () => {
-    const commands = await advertisedCommands(AIR_CLIENT_CAPABILITIES);
-
-    expect(commands.find((c) => c.name === "review")?._meta).toEqual({
-      jetbrains: { air: { version: 1, kind: "skill", skillPath } },
-    });
-    expect(commands.filter((c) => c.name !== "review").map((c) => [c.name, c._meta])).toEqual([
-      ["compact", undefined],
-      ["missing", undefined],
-      ["mcp:review", undefined],
-      ["mcp", undefined],
-    ]);
-  });
-
-  it("resolves the SKILL.md paths again after a commands_changed", async () => {
-    const missingPath = path.join(cwd, ".claude", "skills", "missing", "SKILL.md");
-    const commands = await advertisedCommands(AIR_CLIENT_CAPABILITIES, async () => {
-      await mkdir(path.dirname(missingPath), { recursive: true });
-      await writeFile(missingPath, "# missing\n");
-    });
-
-    expect(commands.find((c) => c.name === "missing")?._meta).toEqual({
-      jetbrains: { air: { version: 1, kind: "skill", skillPath: missingPath } },
-    });
-  });
-
-  it("gives a client that is not AIR no _meta", async () => {
+  it("lists the commands without a per-command _meta", async () => {
     const commands = await advertisedCommands({});
 
     expect(commands.map((c) => [c.name, c._meta])).toEqual([
@@ -10543,7 +8633,7 @@ describe("logout", () => {
     ).toEqual({});
   });
 
-  it("negotiates subagents through AIR metadata when the SDK strips the draft field", async () => {
+  it("does not negotiate subagents from the retired AIR capability metadata", async () => {
     const agent = createMockAgent();
     const supported = await agent.initialize({
       protocolVersion: 1,
@@ -10560,63 +8650,12 @@ describe("logout", () => {
       (supported.agentCapabilities?.sessionCapabilities as { subagents?: unknown }).subagents,
     ).toEqual({});
   });
-
-  it("advertises canonical AIR sessionFailure support during initialize", async () => {
-    const agent = createMockAgent();
-    const response = await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: {
-        _meta: {
-          jetbrains: {
-            air: { version: 1, capabilities: ["sessionFailure"] },
-          },
-        },
-      },
-    });
-
-    expect((response._meta as any)?.jetbrains?.air).toEqual({
-      version: 1,
-      capabilities: [
-        "sessionFailure",
-        "agentFileChangeReport",
-        "nativeSubagentSessions",
-        "asyncTasks",
-        "recommendedValue",
-        "diffPatch",
-        "planFile",
-      ],
-      goal: { version: 1, controlMethod: GOAL_CONTROL_METHOD, actions: ["set", "clear"] },
-    });
-  });
-
-  it("advertises AIR sessionFailure support even before client negotiation", async () => {
-    const agent = createMockAgent();
-    const response = await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: AIR_CLIENT_CAPABILITIES,
-    });
-
-    expect((response._meta as any)?.jetbrains?.air).toEqual({
-      version: 1,
-      capabilities: [
-        "sessionFailure",
-        "agentFileChangeReport",
-        "nativeSubagentSessions",
-        "asyncTasks",
-        "recommendedValue",
-        "diffPatch",
-        "planFile",
-      ],
-      goal: { version: 1, controlMethod: GOAL_CONTROL_METHOD, actions: ["set", "clear"] },
-    });
-  });
 });
 
 describe("session/fork", () => {
   beforeEach(() => {
     vi.mocked(forkSession).mockClear();
     vi.mocked(getSessionMessages).mockClear();
-    vi.mocked(importSessionToStore).mockClear();
   });
 
   it("forks the latest turn in the requested workspace", async () => {
@@ -10633,182 +8672,6 @@ describe("session/fork", () => {
 
     expect(response.sessionId).toBe("fork-id");
     expect(forkSession).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
-  });
-
-  it("forks at an AIR message id through the current SDK", async () => {
-    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
-    vi.mocked(getSessionMessages).mockResolvedValueOnce([
-      {
-        type: "assistant",
-        uuid: "assistant-thinking-uuid",
-        session_id: "source-id",
-        message: {
-          id: "msg_123",
-          role: "assistant",
-          content: [{ type: "thinking", thinking: "hidden" }],
-        },
-        parent_tool_use_id: null,
-        parent_agent_id: null,
-      },
-      {
-        type: "assistant",
-        uuid: "assistant-uuid",
-        session_id: "source-id",
-        message: { id: "msg_123", role: "assistant", content: [] },
-        parent_tool_use_id: null,
-        parent_agent_id: null,
-      },
-    ]);
-    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
-    const meta = {
-      jetbrains: { air: { fork: { version: 1, messageId: "msg_123:segment:0" } } },
-    };
-    const response = await agent.unstable_forkSession({
-      sessionId: "source-id",
-      cwd: "/workspace",
-      additionalDirectories: ["/workspace/extra"],
-      mcpServers: [],
-      _meta: meta,
-    });
-
-    expect(response.sessionId).toBe("fork-id");
-    expect(getSessionMessages).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
-    expect(importSessionToStore).not.toHaveBeenCalled();
-    expect(forkSession).toHaveBeenCalledWith("source-id", {
-      dir: "/workspace",
-      upToMessageId: "assistant-uuid",
-    });
-  });
-
-  it.each([
-    {
-      resolution: "its ACP message id",
-      messageId: "persisted-message-id:segment:0",
-      messageOccurrence: 1,
-    },
-    {
-      resolution: "its fingerprint occurrence",
-      messageId: "stale-air-message-id:segment:0",
-      messageOccurrence: 2,
-    },
-  ])("forks at an inactive persisted branch by $resolution", async (forkPoint) => {
-    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
-    const targetText = "Answer from the branch that is no longer active.";
-    const targetFingerprint = `sha256:${createHash("sha256").update(targetText).digest("hex")}`;
-    vi.mocked(getSessionMessages).mockResolvedValueOnce([
-      {
-        type: "assistant",
-        uuid: "active-assistant-uuid",
-        session_id: "source-id",
-        message: { id: "active-message-id", role: "assistant", content: [] },
-        parent_tool_use_id: null,
-        parent_agent_id: null,
-      },
-    ]);
-    vi.mocked(importSessionToStore).mockImplementationOnce(async (_sessionId, store) => {
-      await store.append({ projectKey: "-workspace", sessionId: "source-id" }, [
-        {
-          type: "assistant",
-          uuid: "earlier-duplicate-uuid",
-          parentUuid: "earlier-user-uuid",
-          isSidechain: false,
-          sessionId: "source-id",
-          message: {
-            id: "earlier-duplicate-message-id",
-            role: "assistant",
-            content: [{ type: "text", text: targetText }],
-          },
-        },
-        {
-          type: "user",
-          uuid: "inactive-user-uuid",
-          parentUuid: "earlier-duplicate-uuid",
-          isSidechain: false,
-          sessionId: "source-id",
-          message: { role: "user", content: "regenerate" },
-        },
-        {
-          type: "assistant",
-          uuid: "inactive-thinking-uuid",
-          parentUuid: "inactive-user-uuid",
-          isSidechain: false,
-          sessionId: "source-id",
-          message: {
-            id: "persisted-message-id",
-            role: "assistant",
-            content: [{ type: "thinking", thinking: "Hidden reasoning" }],
-          },
-        },
-        {
-          type: "assistant",
-          uuid: "inactive-assistant-uuid",
-          parentUuid: "inactive-thinking-uuid",
-          isSidechain: false,
-          sessionId: "source-id",
-          message: {
-            id: "persisted-message-id",
-            role: "assistant",
-            content: [{ type: "text", text: targetText }],
-          },
-        },
-        {
-          type: "assistant",
-          uuid: "nested-assistant-uuid",
-          parentUuid: "nested-user-uuid",
-          isSidechain: true,
-          sessionId: "source-id",
-          message: {
-            id: "persisted-message-id",
-            role: "assistant",
-            content: [{ type: "text", text: targetText }],
-          },
-        },
-        {
-          type: "assistant",
-          uuid: "active-assistant-uuid",
-          parentUuid: "active-user-uuid",
-          isSidechain: false,
-          sessionId: "source-id",
-          message: {
-            id: "active-message-id",
-            role: "assistant",
-            content: [{ type: "text", text: "Answer from the active branch." }],
-          },
-        },
-      ]);
-    });
-    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
-
-    const response = await agent.unstable_forkSession({
-      sessionId: "source-id",
-      cwd: "/workspace",
-      additionalDirectories: [],
-      mcpServers: [],
-      _meta: {
-        jetbrains: {
-          air: {
-            fork: {
-              version: 1,
-              messageId: forkPoint.messageId,
-              messageFingerprint: targetFingerprint,
-              messageOccurrence: forkPoint.messageOccurrence,
-            },
-          },
-        },
-      },
-    });
-
-    expect(response.sessionId).toBe("fork-id");
-    expect(importSessionToStore).toHaveBeenLastCalledWith("source-id", expect.any(Object), {
-      dir: "/workspace",
-      includeSubagents: false,
-    });
-    expect(forkSession).toHaveBeenLastCalledWith("source-id", {
-      dir: "/workspace",
-      upToMessageId: "inactive-assistant-uuid",
-    });
   });
 });
 
@@ -10867,7 +8730,6 @@ describe("session/close", () => {
       owedTrailingIdles: 0,
       backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
-      sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
     };
     return agent.sessions[sessionId]!;
   }
@@ -10966,7 +8828,6 @@ describe("session/delete", () => {
       owedTrailingIdles: 0,
       backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
-      sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
     };
     return agent.sessions[sessionId]!;
   }
@@ -11982,7 +9843,6 @@ describe("getOrCreateSession param change detection", () => {
       owedTrailingIdles: 0,
       backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
-      sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
     };
     return agent.sessions[sessionId]!;
   }
@@ -13762,7 +11622,7 @@ describe("usage_update computation", () => {
 
   it("compact_boundary uses post_tokens without waiting for getContextUsage", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
+    await initializeClient(agent, {});
     // No trailing idle: an idle with no preceding result now fails the turn as
     // abandoned (issue #825), and a real compaction turn always produces a
     // result. Here the stream simply ends, settling the prompt end_turn.
@@ -13803,19 +11663,12 @@ describe("usage_update computation", () => {
       title: "Compact conversation",
       kind: "think",
       status: "completed",
-      _meta: {
-        jetbrains: {
-          air: {
-            version: 1,
-            contextCompaction: {
-              version: 1,
-              trigger: "automatic",
-              preTokens: 180000,
-              postTokens: 12345,
-              durationMs: 2500,
-            },
-          },
-        },
+      _meta: { claudeCode: { toolName: "compact" } },
+      rawOutput: {
+        trigger: "automatic",
+        preTokens: 180000,
+        postTokens: 12345,
+        durationMs: 2500,
       },
     });
   });
@@ -14845,7 +12698,7 @@ describe("assembled assistant text fallback", () => {
 
   it("does not forward the result text of a turn that only emitted compaction output", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
+    await initializeClient(agent, {});
     // `/compact` carries no echo, so it is promoted at its own result, and its
     // status surfaces directly (the fork's structured compaction card via
     // COMPACTION_METHOD — not a text chunk — but still marked delivered).
@@ -14871,15 +12724,13 @@ describe("assembled assistant text fallback", () => {
       title: "Compact conversation",
       kind: "think",
       status: "in_progress",
-      _meta: {
-        jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } },
-      },
+      _meta: { claudeCode: { toolName: "compact" } },
     });
   });
 
   it("emits one compaction tool lifecycle and ignores duplicate terminal status", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
+    await initializeClient(agent, {});
     injectSession(agent, [
       {
         type: "system",
@@ -14940,18 +12791,15 @@ describe("assembled assistant text fallback", () => {
       content: [
         { type: "content", content: { type: "text", text: "Compaction failed: summary rejected" } },
       ],
-      _meta: {
-        jetbrains: {
-          air: { contextCompaction: { version: 1, error: "summary rejected" } },
-        },
-      },
+      _meta: { claudeCode: { toolName: "compact" } },
+      rawOutput: { error: "summary rejected" },
     });
     expect(messageChunkTexts(updates)).toEqual(["additional diagnostic"]);
   });
 
   it("does not repeat a failed compaction error delivered as an assistant message", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
+    await initializeClient(agent, {});
     injectSession(agent, [
       {
         type: "system",
@@ -14983,13 +12831,8 @@ describe("assembled assistant text fallback", () => {
       expect.objectContaining({
         sessionUpdate: "tool_call_update",
         status: "failed",
-        _meta: expect.objectContaining({
-          jetbrains: expect.objectContaining({
-            air: expect.objectContaining({
-              contextCompaction: { version: 1, error: "Not enough messages to compact." },
-            }),
-          }),
-        }),
+        _meta: expect.objectContaining({ claudeCode: { toolName: "compact" } }),
+        rawOutput: { error: "Not enough messages to compact." },
       }),
     );
   });
@@ -15035,10 +12878,7 @@ describe("assembled assistant text fallback", () => {
   /** An agent whose client advertises the ACP session-compaction contract. */
   async function compactionCapableAgent() {
     const capture = createMockAgentWithCapture();
-    await initializeClient(capture.agent, {
-      ...AIR_CLIENT_CAPABILITIES,
-      session: { compaction: {} },
-    });
+    await initializeClient(capture.agent, { session: { compaction: {} } });
     return capture;
   }
 
@@ -15080,7 +12920,7 @@ describe("assembled assistant text fallback", () => {
       .some(
         (update) =>
           (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
-          (update._meta as any)?.jetbrains?.air?.contextCompaction,
+          (update._meta as any)?.claudeCode?.toolName === "compact",
       );
   }
 
@@ -15112,34 +12952,20 @@ describe("assembled assistant text fallback", () => {
         sessionUpdate: "compaction_update",
         compactionId: "compact-start",
         status: "in_progress",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
       {
         sessionUpdate: "compaction_update",
         compactionId: "compact-start",
         status: "completed",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
       {
         sessionUpdate: "compaction_update",
         compactionId: "compact-start",
         status: "completed",
-        _meta: {
-          jetbrains: {
-            air: {
-              version: 1,
-              contextCompaction: {
-                version: 1,
-                trigger: "manual",
-                preTokens: 180000,
-                postTokens: 12345,
-                durationMs: 2500,
-              },
-            },
-          },
-        },
       },
     ]);
+    // The boundary facts of the closing frame are not an extension _meta field.
+    expect(compactionUpdates(updates).at(-1)).not.toHaveProperty("_meta");
     // The synthetic tool call is the fallback for clients without the capability.
     expect(hasSyntheticCompactionToolCall(updates)).toBe(false);
     // The compaction entity counts as the turn's delivered output: the result
@@ -15178,17 +13004,13 @@ describe("assembled assistant text fallback", () => {
         sessionUpdate: "compaction_update",
         compactionId: "compact-start",
         status: "in_progress",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
       {
         sessionUpdate: "compaction_update",
         compactionId: "compact-start",
+        // The standard error field carries the error once.
         status: "failed",
         error: "summary rejected",
-        // The standard error field carries the error once.
-        _meta: {
-          jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } },
-        },
       },
     ]);
     expect(messageChunkTexts(updates)).toEqual(["additional diagnostic"]);
@@ -15260,7 +13082,6 @@ describe("assembled assistant text fallback", () => {
             sessionUpdate: "compaction_update",
             compactionId: "force-cancel-compaction",
             status: "in_progress",
-            _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
           },
           {
             sessionUpdate: "compaction_update",
@@ -15553,7 +13374,6 @@ describe("assembled assistant text fallback", () => {
         sessionUpdate: "compaction_update",
         compactionId: "compact-start",
         status: "in_progress",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
       {
         sessionUpdate: "compaction_summary_chunk",
@@ -15564,7 +13384,6 @@ describe("assembled assistant text fallback", () => {
         sessionUpdate: "compaction_update",
         compactionId: "compact-start",
         status: "completed",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
     ]);
     expect(JSON.stringify(updates)).not.toContain("child summary");
@@ -15601,7 +13420,6 @@ describe("assembled assistant text fallback", () => {
         compactionId: "compact-summary",
         status: "completed",
         summary: [{ type: "text", text: "1. Primary Request and Intent:\n   Count upward." }],
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
     ]);
 
@@ -15686,7 +13504,7 @@ describe("assembled assistant text fallback", () => {
 
   it("emits a completed compaction tool call for a terminal-only result", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
+    await initializeClient(agent, {});
     injectSession(agent, [
       {
         type: "system",
@@ -15708,9 +13526,7 @@ describe("assembled assistant text fallback", () => {
       title: "Compact conversation",
       kind: "think",
       status: "completed",
-      _meta: {
-        jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } },
-      },
+      _meta: { claudeCode: { toolName: "compact" } },
     });
     expect(messageChunkTexts(updates)).toEqual([]);
   });
@@ -16780,7 +14596,6 @@ describe("post-error recovery", () => {
       owedTrailingIdles: 0,
       backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
-      sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
     };
     return { interrupt };
   }
@@ -19527,36 +17342,25 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     // deferral gate, or the subagent's remaining work is stranded
     // out-of-turn through the refusal lane.
     const agent = createMockAgent();
-    const report = vi.fn(async () => {});
     let releaseDrain!: () => void;
     const drainGate = new Promise<void>((resolve) => (releaseDrain = resolve));
 
-    injectGeneratorSession(
-      agent,
-      (input) => {
-        async function* messageGenerator() {
-          const iter = input[Symbol.asyncIterator]();
-          const { value: userMessage } = await iter.next();
-          yield userEcho(userMessage);
-          yield running();
-          yield subagentStarted("agent-1");
-          yield resultMessage({ stop_reason: "refusal" }); // held, not settled
-          yield idle();
-          await drainGate;
-          yield taskNotification("agent-1");
-          yield resultMessage({ origin: { kind: "task-notification" } }); // settles
-          yield idle();
-        }
-        return messageGenerator();
-      },
-      {
-        fileChangeReporter: {
-          request: vi.fn(),
-          report,
-          finish: vi.fn(),
-        },
-      },
-    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage({ stop_reason: "refusal" }); // held, not settled
+        yield idle();
+        await drainGate;
+        yield taskNotification("agent-1");
+        yield resultMessage({ origin: { kind: "task-notification" } }); // settles
+        yield idle();
+      }
+      return messageGenerator();
+    });
 
     const response = agent.prompt({
       sessionId: "test-session",
@@ -19567,28 +17371,15 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await waitFor(
       () => agent.sessions["test-session"]?.activeTurn?.deferredSettle?.stopReason === "refusal",
     );
-    expect(report).not.toHaveBeenCalled();
     releaseDrain();
     await expect(response).resolves.toEqual(expect.objectContaining({ stopReason: "refusal" }));
-    expect(report).toHaveBeenCalledTimes(1);
     await agent.sessions["test-session"]?.consumer;
   });
 
-  it("resolves a held turn and reports the dead session when the transport dies", async () => {
+  it("resolves a held turn and fails the next prompt when the transport dies", async () => {
     // The held turn's answer already streamed; a stream death during the
     // post-answer hold is a background failure, not the turn's.
-    const updates: SessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: SessionNotification) => {
-          updates.push(update);
-        },
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, {
-      _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
-    });
+    const agent = createMockAgent();
 
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
@@ -19610,18 +17401,6 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     });
     expect(response.stopReason).toBe("end_turn");
     await agent.sessions["test-session"]?.consumer;
-    const failure = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .find((candidate) => candidate?.title === "The connection to Claude was lost.");
-    expect(failure).toEqual(
-      expect.objectContaining({
-        category: "connection",
-        severity: "error",
-        actions: ["new_session"],
-      }),
-    );
-    expect(failure).not.toHaveProperty("turnId");
-    expect((response._meta as any)?.jetbrains?.air?.sessionFailure).toBeUndefined();
     await expect(
       agent.prompt({
         sessionId: "test-session",
@@ -19630,19 +17409,8 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     ).rejects.toThrow("session has ended");
   });
 
-  it("resolves a held turn and reports the dead session on worker-shutdown EOF", async () => {
-    const updates: SessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: SessionNotification) => {
-          updates.push(update);
-        },
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, {
-      _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
-    });
+  it("resolves a held turn and fails the next prompt on worker-shutdown EOF", async () => {
+    const agent = createMockAgent();
 
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
@@ -19670,18 +17438,6 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     });
     expect(response.stopReason).toBe("end_turn");
     await agent.sessions["test-session"]?.consumer;
-    const failure = updates
-      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
-      .find((candidate) => candidate?.title === "The Claude worker is shutting down.");
-    expect(failure).toEqual(
-      expect.objectContaining({
-        category: "connection",
-        severity: "error",
-        actions: ["new_session"],
-      }),
-    );
-    expect(failure).not.toHaveProperty("turnId");
-    expect((response._meta as any)?.jetbrains?.air?.sessionFailure).toBeUndefined();
     await expect(
       agent.prompt({
         sessionId: "test-session",
@@ -20553,331 +18309,11 @@ describe("turn steering (_session/steering)", () => {
 
   it("preserves the existing steering capability declaration", async () => {
     const agent = createMockAgent();
-    const response = await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: AIR_CLIENT_CAPABILITIES,
-    });
+    const response = await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
     // Top-level _meta (sibling of agentCapabilities), per the existing steering
     // extension contract. Idle behavior is selected per steering request.
     expect((response._meta as any)?.steering).toEqual({
       supported: true,
-    });
-    expect((response._meta as any)?.jetbrains?.air?.goal).toEqual({
-      version: 1,
-      controlMethod: GOAL_CONTROL_METHOD,
-      actions: ["set", "clear"],
-    });
-  });
-
-  it("submits set and clear through the session prompt queue when the session is idle", async () => {
-    const agent = createMockAgent();
-    const prompt = vi.spyOn(agent, "prompt").mockResolvedValue({ stopReason: "end_turn" });
-    agent.sessions["test-session"] = mockSessionState({
-      input: new Pushable<any>(),
-      turnQueue: [],
-    });
-
-    await expect(
-      agent.goal({ sessionId: "test-session", action: "set", objective: "Replacement" }),
-    ).resolves.toEqual({});
-    await expect(agent.goal({ sessionId: "test-session", action: "clear" })).resolves.toEqual({});
-    expect(prompt).toHaveBeenNthCalledWith(1, {
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "/goal Replacement" }],
-    });
-    expect(prompt).toHaveBeenNthCalledWith(2, {
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "/goal clear" }],
-    });
-  });
-
-  it("injects clear into a running goal at priority 'now' and publishes removal", async () => {
-    const updates: any[] = [];
-    const captured: any[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (notification: any) => updates.push(notification),
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
-    injectGeneratorSession(agent, (input) => {
-      async function* messageGenerator() {
-        const iter = input[Symbol.asyncIterator]();
-        const goal = await iter.next();
-        yield userEcho(goal.value);
-        const clear = await iter.next();
-        captured.push(clear.value);
-        yield {
-          type: "active_goal",
-          value: {
-            condition: "Keep working",
-            iterations: 2,
-            set_at: 1710000000000,
-            tokens_at_start: 0,
-          },
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
-        yield createResultMessage();
-        yield userEcho(clear.value);
-        yield createResultMessage();
-        yield { type: "system", subtype: "session_state_changed", state: "idle" };
-      }
-      return messageGenerator();
-    });
-
-    const runningGoal = agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "/goal Keep working" }],
-    });
-    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
-
-    await expect(agent.goal({ sessionId: "test-session", action: "clear" })).resolves.toEqual({});
-    expect(captured).toHaveLength(1);
-    expect(captured[0].priority).toBe("now");
-    expect(JSON.stringify(captured[0].message.content)).toContain("/goal clear");
-    expect(updates).toContainEqual({
-      sessionId: "test-session",
-      update: {
-        sessionUpdate: "session_info_update",
-        _meta: { jetbrains: { air: { version: 1, goal: null } } },
-      },
-    });
-    await expect(runningGoal).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
-    const goalUpdates = updates
-      .map(({ update }) => update._meta?.jetbrains?.air?.goal)
-      .filter((goal) => goal !== undefined);
-    const clearIndex = goalUpdates.findIndex((goal) => goal === null);
-    expect(clearIndex).toBeGreaterThanOrEqual(0);
-    expect(goalUpdates.slice(clearIndex + 1)).not.toContainEqual(
-      expect.objectContaining({ objective: "Keep working" }),
-    );
-  });
-
-  it("replaces a running goal through the goal extension and publishes it immediately", async () => {
-    const updates: any[] = [];
-    const captured: any[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (notification: any) => updates.push(notification),
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
-    injectGeneratorSession(agent, (input) => {
-      async function* messageGenerator() {
-        const iter = input[Symbol.asyncIterator]();
-        const goal = await iter.next();
-        yield userEcho(goal.value);
-        const replacement = await iter.next();
-        captured.push(replacement.value);
-        yield createResultMessage();
-        yield userEcho(replacement.value);
-        yield createResultMessage();
-        yield { type: "system", subtype: "session_state_changed", state: "idle" };
-      }
-      return messageGenerator();
-    });
-
-    const runningGoal = agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "/goal Keep working" }],
-    });
-    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
-
-    await expect(
-      agent.goal({ sessionId: "test-session", action: "set", objective: "Replacement" }),
-    ).resolves.toEqual({});
-    expect(captured).toHaveLength(1);
-    expect(captured[0].priority).toBe("now");
-    expect(JSON.stringify(captured[0].message.content)).toContain("/goal Replacement");
-    expect(updates).toContainEqual({
-      sessionId: "test-session",
-      update: {
-        sessionUpdate: "session_info_update",
-        _meta: {
-          jetbrains: {
-            air: {
-              version: 1,
-              goal: {
-                objective: "Replacement",
-                status: "active",
-                controlMethod: GOAL_CONTROL_METHOD,
-              },
-            },
-          },
-        },
-      },
-    });
-    await expect(runningGoal).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
-  });
-
-  it("does not let a stale runtime update overwrite an optimistic goal replacement", async () => {
-    const updates: any[] = [];
-    let staleUpdateEmitted!: () => void;
-    const staleUpdate = new Promise<void>((resolve) => (staleUpdateEmitted = resolve));
-    let releaseReplacement!: () => void;
-    const replacementGate = new Promise<void>((resolve) => (releaseReplacement = resolve));
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (notification: any) => updates.push(notification),
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
-    injectGeneratorSession(agent, (input) => {
-      async function* messageGenerator() {
-        const iter = input[Symbol.asyncIterator]();
-        const original = await iter.next();
-        yield userEcho(original.value);
-        yield {
-          type: "active_goal",
-          value: {
-            condition: "Original",
-            iterations: 1,
-            set_at: 1710000000000,
-            tokens_at_start: 0,
-          },
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
-        const replacement = await iter.next();
-        yield {
-          type: "active_goal",
-          value: {
-            condition: "Original",
-            iterations: 2,
-            set_at: 1710000000000,
-            tokens_at_start: 0,
-          },
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
-        staleUpdateEmitted();
-        await replacementGate;
-        yield userEcho(replacement.value);
-        yield {
-          type: "active_goal",
-          value: {
-            condition: "Replacement",
-            iterations: 1,
-            set_at: 1710000001000,
-            tokens_at_start: 0,
-          },
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
-        yield createResultMessage();
-        yield idleMessage();
-      }
-      return messageGenerator();
-    });
-
-    const runningGoal = agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "/goal Original" }],
-    });
-    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
-    await agent.goal({ sessionId: "test-session", action: "set", objective: "Replacement" });
-    await staleUpdate;
-
-    const goalUpdates = updates
-      .map(({ update }) => update._meta?.jetbrains?.air?.goal)
-      .filter((goal) => goal !== undefined);
-    const replacementIndex = goalUpdates.findIndex((goal) => goal?.objective === "Replacement");
-    expect(replacementIndex).toBeGreaterThanOrEqual(0);
-    expect(goalUpdates.slice(replacementIndex + 1)).not.toContainEqual(
-      expect.objectContaining({ objective: "Original" }),
-    );
-
-    releaseReplacement();
-    await expect(runningGoal).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
-    expect(goalUpdates).not.toContainEqual(
-      expect.objectContaining({ objective: "Replacement", iterations: 1 }),
-    );
-    await vi.waitFor(() => {
-      expect(updates).toContainEqual({
-        sessionId: "test-session",
-        update: {
-          sessionUpdate: "session_info_update",
-          _meta: {
-            jetbrains: {
-              air: {
-                version: 1,
-                goal: expect.objectContaining({ objective: "Replacement", iterations: 1 }),
-              },
-            },
-          },
-        },
-      });
-    });
-  });
-
-  it("cancels the running turn without clearing the persistent goal", async () => {
-    const updates: any[] = [];
-    let releaseAfterCancel!: () => void;
-    const afterCancel = new Promise<void>((resolve) => (releaseAfterCancel = resolve));
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (notification: any) => updates.push(notification),
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    injectGeneratorSession(agent, (input) => {
-      async function* messageGenerator() {
-        const iter = input[Symbol.asyncIterator]();
-        const goal = await iter.next();
-        yield userEcho(goal.value);
-        await afterCancel;
-        yield { type: "system", subtype: "session_state_changed", state: "idle" };
-      }
-      return messageGenerator();
-    });
-
-    const runningGoal = agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "/goal Keep working" }],
-    });
-    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
-    await agent.cancel({ sessionId: "test-session" });
-    releaseAfterCancel();
-
-    await expect(runningGoal).resolves.toEqual(
-      expect.objectContaining({ stopReason: "cancelled" }),
-    );
-    expect(
-      updates.some(
-        ({ update }) =>
-          update.sessionUpdate === "session_info_update" &&
-          update._meta?.jetbrains?.air?.goal === null,
-      ),
-    ).toBe(false);
-  });
-
-  it("validates goal control requests", () => {
-    expect(parseGoalRequest({ sessionId: "test-session", action: "clear" })).toEqual({
-      sessionId: "test-session",
-      action: "clear",
-    });
-    expect(
-      parseGoalRequest({ sessionId: "test-session", action: "set", objective: "  Replacement  " }),
-    ).toEqual({ sessionId: "test-session", action: "set", objective: "Replacement" });
-    expect(() => parseGoalRequest({ sessionId: "test-session", action: "set" })).toThrow(
-      'goal action "set" requires a non-empty objective',
-    );
-    expect(() =>
-      parseGoalRequest({ sessionId: "test-session", action: "set", objective: "   " }),
-    ).toThrow('goal action "set" requires a non-empty objective');
-    expect(() => parseGoalRequest({ sessionId: "test-session", action: "pause" })).toThrow(
-      'goal action must be "set" or "clear"',
-    );
-    expect(() => parseGoalRequest({ sessionId: "test-session", action: "resume" })).toThrow(
-      'goal action must be "set" or "clear"',
-    );
-    expect(goalUpdateFromPrompt("/goal pause")).toMatchObject({
-      objective: "pause",
-      status: "active",
     });
   });
 
@@ -21205,54 +18641,6 @@ describe("turn steering (_session/steering)", () => {
     },
   );
 
-  it("publishes an optimistic goal update for a steered goal replacement", async () => {
-    const updates: any[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (notification: any) => updates.push(notification),
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
-    const input = new Pushable<any>();
-    agent.sessions["test-session"] = mockSessionState({
-      input,
-      turnQueue: [
-        {
-          promptUuid: "running",
-          isLocalOnlyCommand: false,
-          settled: false,
-          resolve: () => {},
-          reject: () => {},
-        },
-      ],
-    });
-
-    await agent.steer({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "/goal Replace the objective" }],
-    });
-
-    expect(updates).toContainEqual({
-      sessionId: "test-session",
-      update: {
-        sessionUpdate: "session_info_update",
-        _meta: {
-          jetbrains: {
-            air: {
-              version: 1,
-              goal: {
-                objective: "Replace the objective",
-                status: "active",
-                controlMethod: GOAL_CONTROL_METHOD,
-              },
-            },
-          },
-        },
-      },
-    });
-  });
-
   it("does not attribute a cancelled pending steer result to the next prompt", async () => {
     const agent = createMockAgent();
     let releaseCancel!: () => void;
@@ -21280,7 +18668,10 @@ describe("turn steering (_session/steering)", () => {
       prompt: [{ type: "text", text: "/goal Original" }],
     });
     await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
-    await agent.goal({ sessionId: "test-session", action: "clear" });
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "stop" }],
+    });
     await agent.cancel({ sessionId: "test-session" });
     releaseCancel();
     await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
@@ -21307,40 +18698,29 @@ describe("turn steering (_session/steering)", () => {
       error: () => {},
     });
 
-    const report = vi.fn(async () => void timeline.push("checkpoint"));
-    injectGeneratorSession(
-      agent,
-      (input) => {
-        async function* messageGenerator() {
-          const iter = input[Symbol.asyncIterator]();
-          const u1 = await iter.next();
-          yield userEcho(u1.value); // turn becomes active
-          yield createAssistantText("working on it");
-          // The steered message is pushed at priority 'now'...
-          const steered = await iter.next();
-          // ...so the CLI aborts the query, ending the interrupted cycle with a
-          // result of its own. No idle follows it: one comes at the very end, for
-          // the whole interrupted + steered sequence.
-          yield interruptedCycleResult();
-          // Only now does the steered message run, as a second cycle. Its echo
-          // matches no queued turn (dropped as an unrelated replay), its output is
-          // the answer the user is waiting for, and its result has the last word
-          // on the turn's stop reason.
-          yield userEcho(steered.value);
-          yield createAssistantText("STEERED-OK");
-          yield createResultMessage();
-          yield idleMessage();
-        }
-        return messageGenerator();
-      },
-      {
-        fileChangeReporter: {
-          request: vi.fn(),
-          report,
-          finish: vi.fn(),
-        },
-      },
-    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value); // turn becomes active
+        yield createAssistantText("working on it");
+        // The steered message is pushed at priority 'now'...
+        const steered = await iter.next();
+        // ...so the CLI aborts the query, ending the interrupted cycle with a
+        // result of its own. No idle follows it: one comes at the very end, for
+        // the whole interrupted + steered sequence.
+        yield interruptedCycleResult();
+        // Only now does the steered message run, as a second cycle. Its echo
+        // matches no queued turn (dropped as an unrelated replay), its output is
+        // the answer the user is waiting for, and its result has the last word
+        // on the turn's stop reason.
+        yield userEcho(steered.value);
+        yield createAssistantText("STEERED-OK");
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
 
     const turn = agent
       .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
@@ -21362,8 +18742,7 @@ describe("turn steering (_session/steering)", () => {
     // The steered continuation belongs to the turn the client is waiting on, so
     // all of it precedes that turn's response. A `prompt:` entry anywhere but
     // last is the bug: updates outlived the stopReason.
-    expect(timeline).toEqual(["working on it", "STEERED-OK", "checkpoint", "prompt:end_turn"]);
-    expect(report).toHaveBeenCalledTimes(1);
+    expect(timeline).toEqual(["working on it", "STEERED-OK", "prompt:end_turn"]);
     // Both cycles ran for this one prompt, so its usage covers both (2 × the
     // mock result's 10 in / 5 out) rather than stopping at the interrupt.
     expect(response.usage).toEqual({
@@ -22449,7 +19828,6 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       owedTrailingIdles: 0,
       backgroundToolCalls: new Set(),
       messageIdToUuid: new Map(),
-      sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
     };
     return { interrupt, close };
   }
@@ -23313,12 +20691,7 @@ describe("streamEventToAcpNotifications", () => {
     const toolUseCache = {};
     const emittedToolCalls = new Set<string>();
     const streamedToolInputs: StreamedToolInputCache = new Map();
-    const options = {
-      cwd: "/Users/test/project",
-      emittedToolCalls,
-      streamedToolInputs,
-      clientCapabilities: AIR_CLIENT_CAPABILITIES,
-    };
+    const options = { cwd: "/Users/test/project", emittedToolCalls, streamedToolInputs };
     const baseMessage = {
       type: "stream_event",
       parent_tool_use_id: null,
@@ -23401,8 +20774,10 @@ describe("streamEventToAcpNotifications", () => {
       title: "Read src/ZodiacList.tsx",
       locations: [{ path: "/Users/test/project/src/ZodiacList.tsx", line: 1 }],
     });
-    // The input is not complete yet, so no rawInput travels.
-    expect(pathAvailable[0].update).not.toHaveProperty("rawInput");
+    // The completed file_path travels as rawInput right away.
+    expect(pathAvailable[0].update).toMatchObject({
+      rawInput: { file_path: "/Users/test/project/src/ZodiacList.tsx" },
+    });
     expect(streamedToolInputs.size).toBe(1);
 
     const completed = streamEventToAcpNotifications(
@@ -23434,7 +20809,6 @@ describe("streamEventToAcpNotifications", () => {
       cwd: "/Users/test/project",
       emittedToolCalls: new Set<string>(),
       streamedToolInputs,
-      clientCapabilities: AIR_CLIENT_CAPABILITIES,
     };
     const toolUseCache = {};
     const stream = (event: unknown) =>
@@ -23503,13 +20877,7 @@ describe("streamEventToAcpNotifications", () => {
       const toolUseCache = {};
       const emittedToolCalls = new Set<string>();
       const streamedToolInputs: StreamedToolInputCache = new Map();
-      const options = {
-        cwd: "/Users/test/project",
-        emittedToolCalls,
-        streamedToolInputs,
-        // AIR gets no rawInput until the input is complete.
-        clientCapabilities: AIR_CLIENT_CAPABILITIES,
-      };
+      const options = { cwd: "/Users/test/project", emittedToolCalls, streamedToolInputs };
       const baseMessage = {
         type: "stream_event",
         parent_tool_use_id: null,
@@ -23574,7 +20942,9 @@ describe("streamEventToAcpNotifications", () => {
         locations: [{ path: "/Users/test/project/src/write.ts" }],
       });
       expect(refined[0].update).not.toHaveProperty("content");
-      expect(refined[0].update).not.toHaveProperty("rawInput");
+      expect(refined[0].update).toMatchObject({
+        rawInput: { file_path: "/Users/test/project/src/write.ts" },
+      });
     });
 
     it("refines a pending Write from the consolidated block after complete streamed input", () => {
@@ -23762,13 +21132,8 @@ describe("streamEventToAcpNotifications", () => {
         toolCallId: "toolu_partial",
         title: testCase.title,
       });
-      // The input is not complete yet, so no rawInput travels.
-      expect(refined[0].update).not.toHaveProperty("rawInput");
-      if ("metaTitle" in testCase) {
-        expect(refined[0].update._meta).toMatchObject({
-          jetbrains: { air: { commandTitle: testCase.metaTitle } },
-        });
-      }
+      // The completed fields travel as rawInput; the incomplete one does not.
+      expect(refined[0].update).toMatchObject({ rawInput: testCase.rawInput });
       // Refinements never carry `content`: content built from partial input is
       // misleading (an Edit missing new_string renders as a deletion) or
       // invalid (a Write diff without content lacks the required newText).
@@ -23848,7 +21213,7 @@ describe("streamEventToAcpNotifications", () => {
         partialJson: '{"timeout":100,"command":',
       });
       expect(delimited.refined).toHaveLength(1);
-      expect(delimited.refined[0].update).not.toHaveProperty("rawInput");
+      expect(delimited.refined[0].update).toMatchObject({ rawInput: { timeout: 100 } });
     });
 
     it.each([
@@ -23868,14 +21233,14 @@ describe("streamEventToAcpNotifications", () => {
         partialJson: '{"options":{"limit":5,"enabled":true},"command":',
         rawInput: { options: { limit: 5, enabled: true } },
       },
-    ])("recovers a completed $label value at a field boundary", ({ partialJson }) => {
+    ])("recovers a completed $label value at a field boundary", ({ partialJson, rawInput }) => {
       const { refined } = refineFromPartialInput({ name: "CustomTool", partialJson });
       expect(refined).toHaveLength(1);
       expect(refined[0].update).toMatchObject({
         sessionUpdate: "tool_call_update",
         title: "CustomTool",
+        rawInput,
       });
-      expect(refined[0].update).not.toHaveProperty("rawInput");
     });
 
     it("survives a ping keep-alive arriving mid-stream", () => {
@@ -24518,31 +21883,19 @@ describe("tool_progress heartbeats", () => {
     });
   });
 
-  it("sends the parent tool name to AIR when a beat falls back to the parent call", async () => {
+  it("keeps the beat's own tool name when it falls back to the parent call", async () => {
     const toolUseCache = {
       toolu_task: { type: "tool_use", id: "toolu_task", name: "Agent", input: {} },
     };
-    const [air] = await run(
-      [beat("toolu_hidden", "toolu_task", { heartbeat: undefined })],
-      ["toolu_task"],
-      { clientCapabilities: AIR_CLIENT_CAPABILITIES, toolUseCache },
-    );
-    const [unknown] = await run(
-      [beat("toolu_hidden", "toolu_other", { heartbeat: undefined })],
-      ["toolu_other"],
-      { clientCapabilities: AIR_CLIENT_CAPABILITIES },
-    );
-    const [plain] = await run(
+    const [sent] = await run(
       [beat("toolu_hidden", "toolu_task", { heartbeat: undefined })],
       ["toolu_task"],
       { toolUseCache },
     );
 
-    expect(air.toolCallId).toBe("toolu_task");
-    expect((air._meta as any).claudeCode.toolName).toBe("Agent");
-    expect((unknown._meta as any).claudeCode).not.toHaveProperty("toolName");
-    // A client that is not AIR keeps the upstream tool name of the beat.
-    expect((plain._meta as any).claudeCode.toolName).toBe("Bash");
+    // The beat names its own tool; the cached parent only supplies the id.
+    expect(sent.toolCallId).toBe("toolu_task");
+    expect((sent._meta as any).claudeCode.toolName).toBe("Bash");
   });
 
   // A subagent's own `bash_progress` reports the inner tool's real id, with the
@@ -24710,7 +22063,7 @@ describe("permission_denied", () => {
     const updates = await run(
       [toolUse("toolu_denied"), denial("toolu_denied"), toolResult("toolu_denied")],
       {},
-      AIR_CLIENT_CAPABILITIES,
+      {},
     );
 
     // The denial resolves the call the preceding tool_call announced, before the
@@ -24731,11 +22084,13 @@ describe("permission_denied", () => {
         },
       ],
     });
-    // The tool_call sent the tool name, so the denial does not repeat it.
-    // The reason is in content. The SDK message differs, so it stays.
+    // The denial repeats the tool name and the reason; the reason is also in
+    // the content (their wording differs, so both stay).
     expect((sent[0]._meta as any).claudeCode).toEqual({
+      toolName: "Write",
       toolResponse: {
         decisionReasonType: "mode",
+        decisionReason: "dontAsk mode denies tools that require approval",
         message: "Permission to use Write has been denied.",
       },
     });
@@ -24754,11 +22109,7 @@ describe("permission_denied", () => {
       yield denial("toolu_denied");
     }
 
-    const updates = await run(
-      messages() as any,
-      { toolCallFields: tracker },
-      AIR_CLIENT_CAPABILITIES,
-    );
+    const updates = await run(messages() as any, { toolCallFields: tracker }, {});
 
     expect(denials(updates)).toHaveLength(1);
   });
@@ -24821,13 +22172,16 @@ describe("permission_denied", () => {
         denial("toolu_inner", { agent_id: "agent-1" }),
       ],
       {},
-      AIR_CLIENT_CAPABILITIES,
+      {},
     );
 
-    // The tool_call carries the parent. The denial does not repeat it.
+    // The denial repeats the parent attribution of the tool_call.
     expect((denials(updates)[0]._meta as any).claudeCode).toEqual({
+      toolName: "Write",
+      parentToolUseId: "toolu_agent",
       toolResponse: {
         decisionReasonType: "mode",
+        decisionReason: "dontAsk mode denies tools that require approval",
         message: "Permission to use Write has been denied.",
       },
     });

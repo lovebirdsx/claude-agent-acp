@@ -12,11 +12,6 @@ import type {
   AskUserQuestionInput,
   AskUserQuestionOutput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
-import {
-  AIR_CUSTOM_ANSWER_KEY,
-  LEGACY_AIR_CUSTOM_ANSWER_KEY,
-  withAirMeta,
-} from "./air-extension.js";
 
 /**
  * Bridges between the Claude Agent SDK's elicitation/dialog callbacks and ACP's
@@ -175,7 +170,6 @@ export function askUserQuestionsToCreateRequest(
   questions: AskUserQuestion[],
   sessionId: string,
   toolCallId: string | undefined,
-  airClient = false,
 ): CreateElicitationRequest {
   const single = questions.length === 1;
   const properties: Record<string, ElicitationPropertySchema> = {};
@@ -208,25 +202,12 @@ export function askUserQuestionsToCreateRequest(
       ? { type: "array", title, description, items: { anyOf: options } }
       : { type: "string", title, description, oneOf: options };
 
-    const customAnswer = { questionId: questionFieldKey(index), isCustomAnswer: true };
     properties[questionCustomFieldKey(index)] = {
       type: "string",
       title: "Other",
       description: question.multiSelect
         ? "Type your own answer to add to your selection above (optional)."
         : "Type your own answer, or add a note to the option you chose above (optional).",
-      // Marks the field as the custom answer companion of a select question,
-      // under `_meta.jetbrains.air.customAnswer` and under the root key that
-      // released AIR versions read. Only AIR gets the marker.
-      ...(airClient
-        ? {
-            _meta: withAirMeta(
-              { [LEGACY_AIR_CUSTOM_ANSWER_KEY]: customAnswer },
-              AIR_CUSTOM_ANSWER_KEY,
-              customAnswer,
-            ),
-          }
-        : {}),
     };
   });
 

@@ -630,20 +630,14 @@ describe("Claude permission options and response mapping", () => {
   });
 
   it("reuses the Computer Use MCP tool-call title", () => {
-    expect(
-      buildClaudePermissionPresentation({
-        toolName: "mcp__computer-use__screenshot",
-        input: {},
-        toolUseID: "tool-computer-use",
-        capabilities: ClientCapabilities.from({
-          _meta: { jetbrains: { air: { version: 1, capabilities: [] } } },
-        }),
-      })._meta,
-    ).toEqual({
-      jetbrains: {
-        air: { version: 1, permission: { version: 1, title: "mcp__computer-use__screenshot" } },
-      },
+    const presentation = buildClaudePermissionPresentation({
+      toolName: "mcp__computer-use__screenshot",
+      input: {},
+      toolUseID: "tool-computer-use",
+      capabilities: ClientCapabilities.from({}),
     });
+    expect(presentation.toolCall.title).toBe("mcp__computer-use__screenshot");
+    expect(presentation._meta).toBeUndefined();
   });
 
   it("uses the provider display name for a matching generic-tool rule", () => {

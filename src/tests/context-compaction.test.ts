@@ -13,11 +13,9 @@ const PERSISTED_SUMMARY =
   "If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /tmp/session.jsonl\n" +
   "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening.";
 
-/** A lifecycle for an AIR client, which gets the compaction facts, unless `airClient` is false. */
 function lifecycle(
   presentation: "tool_call" | "compaction_update",
   sendUpdate?: (notification: SessionNotification) => Promise<void>,
-  airClient = true,
 ) {
   const sent: SessionNotification["update"][] = [];
   const logError = vi.fn();
@@ -26,14 +24,14 @@ function lifecycle(
       (async (notification) => {
         sent.push(notification.update);
       }),
-    { sessionId: "s", presentation, logError, airClient },
+    { sessionId: "s", presentation, logError },
   );
   return { sent, compaction, logError };
 }
 
-describe("ContextCompactionLifecycle for a client that is not AIR", () => {
-  it("sends the upstream tool call fields and no AIR key", async () => {
-    const { sent, compaction } = lifecycle("tool_call", undefined, false);
+describe("ContextCompactionLifecycle legacy tool call", () => {
+  it("sends the upstream tool call fields and no extension key", async () => {
+    const { sent, compaction } = lifecycle("tool_call");
     await compaction.start("c");
     await compaction.finish("c", "completed", { trigger: "manual", preTokens: 10 });
     expect(sent).toEqual([
@@ -56,7 +54,7 @@ describe("ContextCompactionLifecycle for a client that is not AIR", () => {
   });
 
   it("sends compaction updates without _meta, and a summary that differs from the chunks", async () => {
-    const { sent, compaction } = lifecycle("compaction_update", undefined, false);
+    const { sent, compaction } = lifecycle("compaction_update");
     await compaction.start("c");
     await compaction.heartbeat("c", "Part");
     compaction.recordSummary("<summary>\nThe whole summary\n</summary>");
@@ -203,33 +201,17 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
         sessionUpdate: "compaction_update",
         compactionId: "cmp-1",
         status: "in_progress",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
       {
         sessionUpdate: "compaction_update",
         compactionId: "cmp-1",
         status: "completed",
         summary: [{ type: "text", text: "Retained." }],
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
       {
         sessionUpdate: "compaction_update",
         compactionId: "cmp-1",
         status: "completed",
-        _meta: {
-          jetbrains: {
-            air: {
-              version: 1,
-              contextCompaction: {
-                version: 1,
-                trigger: "manual",
-                preTokens: 100,
-                postTokens: 10,
-                durationMs: 5,
-              },
-            },
-          },
-        },
       },
     ]);
     expect(compaction.hasDeliveredOutput).toBe(true);
@@ -313,19 +295,11 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
         compactionId: "cmp-boundary",
         status: "completed",
         summary: [{ type: "text", text: "Only terminal." }],
-        _meta: {
-          jetbrains: {
-            air: {
-              version: 1,
-              contextCompaction: { version: 1, trigger: "automatic", preTokens: 50 },
-            },
-          },
-        },
       },
     ]);
   });
 
-  it("seeds _meta on a boundary-first terminal even without metadata", async () => {
+  it("materializes a boundary-first terminal without metadata", async () => {
     const { sent, compaction } = lifecycle("compaction_update");
 
     await compaction.finish("cmp-boundary", "completed", {}, true);
@@ -335,7 +309,6 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
         sessionUpdate: "compaction_update",
         compactionId: "cmp-boundary",
         status: "completed",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
     ]);
   });
@@ -353,7 +326,6 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
       status: "failed",
       error: "summary rejected",
       // The standard error field carries the error once.
-      _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
     });
     expect(compaction.consumeDuplicateErrorOutput("summary rejected\n")).toBe(true);
     expect(compaction.consumeDuplicateErrorOutput("summary rejected")).toBe(false);
@@ -383,7 +355,6 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
         sessionUpdate: "compaction_update",
         compactionId: "cmp-1",
         status: "in_progress",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
       {
         sessionUpdate: "compaction_summary_chunk",
@@ -399,7 +370,6 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
         sessionUpdate: "compaction_update",
         compactionId: "cmp-1",
         status: "completed",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
     ]);
   });
@@ -453,7 +423,6 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
       sessionUpdate: "compaction_update",
       compactionId: "cmp-2",
       status: "completed",
-      _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
     });
   });
 
@@ -473,7 +442,6 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
         sessionUpdate: "compaction_update",
         compactionId: "next-terminal",
         status: "completed",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
     ]);
   });
@@ -540,7 +508,7 @@ describe("ContextCompactionLifecycle summary chunks", () => {
   });
 });
 
-describe("ContextCompactionLifecycle summary for AIR", () => {
+describe("ContextCompactionLifecycle summary chunks and the hook summary", () => {
   it("sends the summary when it differs from the streamed chunks", async () => {
     const { sent, compaction } = lifecycle("compaction_update");
     await compaction.start("cmp-1");
@@ -567,6 +535,7 @@ describe("ContextCompactionLifecycle (tool_call)", () => {
     await compaction.finish("compact-start", "completed");
     await compaction.reset();
 
+    const compactMeta = { _meta: { claudeCode: { toolName: "compact" } } };
     expect(sent).toEqual([
       {
         sessionUpdate: "tool_call",
@@ -574,19 +543,19 @@ describe("ContextCompactionLifecycle (tool_call)", () => {
         title: "Compact conversation",
         kind: "think",
         status: "in_progress",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
+        ...compactMeta,
       },
       {
         sessionUpdate: "tool_call_update",
         toolCallId: "compact-start",
         status: "in_progress",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
+        ...compactMeta,
       },
       {
         sessionUpdate: "tool_call_update",
         toolCallId: "compact-start",
         status: "completed",
-        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
+        ...compactMeta,
       },
     ]);
   });
@@ -617,20 +586,14 @@ describe("ContextCompactionLifecycle (tool_call)", () => {
             content: { type: "text", text: "Compaction failed: summary rejected" },
           },
         ],
-        _meta: {
-          jetbrains: {
-            air: { version: 1, contextCompaction: { version: 1, error: "summary rejected" } },
-          },
-        },
+        rawOutput: { error: "summary rejected" },
+        _meta: { claudeCode: { toolName: "compact" } },
       },
       {
         sessionUpdate: "tool_call_update",
         toolCallId: "compact-failed",
-        _meta: {
-          jetbrains: {
-            air: { version: 1, contextCompaction: { version: 1, trigger: "manual", preTokens: 3 } },
-          },
-        },
+        rawOutput: { trigger: "manual", preTokens: 3 },
+        _meta: { claudeCode: { toolName: "compact" } },
       },
     ]);
   });

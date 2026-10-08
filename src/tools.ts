@@ -26,23 +26,20 @@ import { Logger, type ToolUpdateMeta } from "./acp-agent.js";
 
 /**
  * The title, kind, content, and locations of a tool use, for a client with the
- * given terminal and patch capabilities. The {@link AcpToolCallRenderer} builds
- * them from the facts of the tool reporter.
+ * given terminal capabilities. The {@link AcpToolCallRenderer} builds them from
+ * the facts of the tool reporter.
  */
 export function toolInfoFromToolUse(
   toolUse: any,
   supportsTerminalOutput: boolean = false,
   cwd?: string,
-  supportsDiffPatch: boolean = false,
 ): {
   title: string;
   kind: ToolKind;
   content: ToolCallContent[];
   locations?: ToolCallLocation[];
 } {
-  const renderer = new AcpToolCallRenderer(
-    new ClientCapabilities(supportsTerminalOutput, false, supportsDiffPatch),
-  );
+  const renderer = new AcpToolCallRenderer(new ClientCapabilities(supportsTerminalOutput, false));
   return renderer.toolInfo({ id: toolUse?.id, name: toolUse?.name, input: toolUse?.input }, cwd);
 }
 
@@ -835,35 +832,6 @@ export function taskStateToPlanEntries(state: TaskState): PlanEntry[] {
     status: task.status,
     priority: "medium",
   }));
-}
-
-/** The plan entries that the client holds for each task list, as JSON. */
-const publishedTaskPlans = new WeakMap<TaskState, string>();
-
-/**
- * The plan entries of the task list, or undefined when the client already
- * holds the same entries. The TaskCreated and TaskCompleted hooks and the
- * Task* tool results report the same change, so the second report of a
- * change has nothing new.
- *
- * Only an AIR client skips the repeated plan. Every other client gets every
- * plan, like upstream.
- */
-export function changedTaskPlanEntries(
-  state: TaskState,
-  airClient: boolean,
-): PlanEntry[] | undefined {
-  const entries = taskStateToPlanEntries(state);
-  if (!airClient) return entries;
-  const json = JSON.stringify(entries);
-  if (publishedTaskPlans.get(state) === json) return undefined;
-  publishedTaskPlans.set(state, json);
-  return entries;
-}
-
-/** Forgets the plan that the client holds, so that the next plan goes out, for example on replay. */
-export function forgetPublishedTaskPlan(state: TaskState): void {
-  publishedTaskPlans.delete(state);
 }
 
 /* Callbacks are keyed globally because the SDK hook is process-wide, but each

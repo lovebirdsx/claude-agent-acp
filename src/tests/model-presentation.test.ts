@@ -13,7 +13,7 @@ describe("versioned model display names", () => {
   beforeEach(() => vi.stubEnv("ANTHROPIC_MODEL", undefined));
   afterEach(() => vi.unstubAllEnvs());
 
-  it("adds standard-family versions and preserves model identity and recommendation", async () => {
+  it("adds standard-family versions and preserves model identity", async () => {
     const models: ModelInfo[] = [
       { ...OPUS, value: "default", displayName: "Default (recommended)" },
       OPUS,
@@ -38,10 +38,10 @@ describe("versioned model display names", () => {
         description: model.description,
       })),
     );
-    expect(buildModelConfigOption(state, models, true)).toMatchObject({
-      currentValue: "opus[1m]",
-      _meta: { jetbrains: { air: { recommendedValue: "opus[1m]" } } },
+    expect(buildModelConfigOption(state, models)).toMatchObject({
+      currentValue: "default",
       options: expect.arrayContaining([
+        { value: "default", name: "Default (recommended)", description: "Opus (1M context)" },
         { value: "opus[1m]", name: "Opus 5", description: OPUS.description },
       ]),
     });

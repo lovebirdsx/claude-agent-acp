@@ -5,34 +5,21 @@ import type {
   ToolCallContent,
   ToolCallLocation,
 } from "@agentclientprotocol/sdk";
-import {
-  AIR_COMMAND_TITLE_KEY,
-  AIR_SKILL_KEY,
-  AIR_SUBAGENT_KEY,
-  withAirMeta,
-} from "../air-extension.js";
 import { exitPlanModeRawOutput } from "../exit-plan.js";
 import { ClientCapabilities } from "./client-capabilities.js";
-import { resultText, textContent, toAcpContentUpdate, toolResponseMarkers } from "./content.js";
+import { resultText, textContent, toAcpContentUpdate } from "./content.js";
 import type { ToolResultContext, ToolResultFacts, ToolUse, ToolUseFacts } from "./facts.js";
 import { reporterFor } from "./reporters/index.js";
-import { resolveSkillPath } from "./reporters/interaction.js";
 
 export type ToolCallUpdate = SessionNotification["update"];
-
-/** The id suffix of the call that clears the plan file of an approved plan for AIR. */
-const PLAN_FILE_CLEAR_SUFFIX = ":plan-file-clear";
 
 /** The `_meta` of a tool call report. */
 export type ToolUpdateMeta = {
   claudeCode?: {
     /* The name of the tool that was used in Claude Code. Also carried as the
-       standard ACP `name` field on the initial `tool_call`. A progress beat
-       for AIR leaves it out when the adapter does not know the tool. */
+       standard ACP `name` field on the initial `tool_call`. */
     toolName?: string;
-    /* The structured output provided by Claude Code. For an AIR client, a
-       PostToolUse update carries only the `status` and `isAsync` markers of
-       the tool_response: the tool output itself is in the tool-call content. */
+    /* The structured output provided by Claude Code. */
     toolResponse?: unknown;
     /* For a tool call made inside a subagent: the tool_use id of the
        Agent/Task call that spawned the subagent. Mirrors the SDK's
@@ -57,24 +44,6 @@ export type ToolUpdateMeta = {
     /* The MCP server of an `mcp__*` tool, on a permission request. */
     mcpServer?: { name: string; source: string };
   };
-  /* The AIR client flags of the ACP tool call contract (`docs/air-extensions.md#tool-call-contract`). */
-  jetbrains?: {
-    air?: {
-      version?: number;
-      /* The concise description of a shell command, kept out of the
-         standard `title`, which clients use as the command preview. */
-      commandTitle?: string;
-      /* Marks Agent/Task tool calls as subagent launches. ACP has no standard
-         subagent ToolKind yet. */
-      subagent?: true;
-      /* For Skill tool calls: the skill name, and the absolute path of its
-         SKILL.md when it could be located on disk. */
-      skill?: { name: string; path?: string };
-      [key: string]: unknown;
-    };
-  };
-  /* `true` for an MCP tool call. */
-  is_mcp_tool_call?: true;
   /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
   terminal_info?: {
     terminal_id: string;
@@ -101,10 +70,6 @@ export interface RenderedResult {
   locations?: ToolCallLocation[];
   /** Present when the reporter decided the raw output. */
   rawOutput?: unknown;
-  /** The plan file that `rawInput` names. See {@link ToolResultFacts.planFilePath}. */
-  planFilePath?: string;
-  /** See {@link ToolResultFacts.planFileReleased}. */
-  planFileReleased?: boolean;
   _meta?: Pick<
     ToolUpdateMeta,
     "terminal_info" | "terminal_output" | "terminal_output_delta" | "terminal_exit"
@@ -115,8 +80,8 @@ export interface RenderedResult {
 type ResultBlock = ToolResultContext["result"];
 
 /**
- * Turns tool facts into the fields of the standard ACP tool call report, as
- * `docs/air-extensions.md#tool-call-contract` defines: each fact goes in one field.
+ * Turns tool facts into the fields of the standard ACP tool call report: each
+ * fact goes in one field.
  *
  * The {@link ToolReporter} of the tool reads the SDK data. The renderer
  * decides the fields from the facts and the {@link ClientCapabilities}. The
@@ -174,24 +139,17 @@ export class AcpToolCallRenderer {
     options: { cwd?: string; inputComplete?: boolean; previewContent?: ToolCallContent[] } = {},
   ): ToolCallUpdate {
     const facts = this.facts(toolUse, options.cwd);
-    const isMcp = toolUse.name.startsWith("mcp__");
     return {
       _meta: {
-        ...this.toolUseMeta(toolUse, options.cwd),
+        ...this.toolUseMeta(toolUse),
         ...(facts.command && this.capabilities.terminalOutput
           ? { terminal_info: { terminal_id: toolUse.id } }
           : {}),
-        // Only AIR gets the MCP flag. The upstream adapter does not send it.
-        ...(isMcp && this.capabilities.air.client ? { is_mcp_tool_call: true } : {}),
       } satisfies ToolUpdateMeta,
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call",
       name: toolUse.name,
-      // AIR gets `rawInput` once it is complete. Every other client gets the
-      // input as it stands, also the empty input at the stream start.
-      ...(options.inputComplete === false && this.capabilities.air.client
-        ? {}
-        : { rawInput: this.rawInput(facts, toolUse.input) }),
+      rawInput: toolUse.input,
       status: "pending",
       title: facts.title,
       kind: facts.kind,
@@ -204,10 +162,10 @@ export class AcpToolCallRenderer {
   refinement(toolUse: ToolUse, cwd?: string): ToolCallUpdate {
     const facts = this.facts(toolUse, cwd);
     return {
-      _meta: this.toolUseMeta(toolUse, cwd),
+      _meta: this.toolUseMeta(toolUse),
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
-      rawInput: this.rawInput(facts, toolUse.input),
+      rawInput: toolUse.input,
       title: facts.title,
       kind: facts.kind,
       content: this.toolUseContent(toolUse.id, facts),
@@ -219,16 +177,15 @@ export class AcpToolCallRenderer {
    * The report of a tool call from the complete top-level fields of its still
    * streaming input. It carries no content: content built from partial input
    * is misleading (an Edit without its `new_string` renders as a deletion) or
-   * invalid. AIR gets no `rawInput`, which goes out once it is complete. Every
-   * other client gets the partial input as `rawInput`.
+   * invalid.
    */
   partialRefinement(toolUse: Pick<ToolUse, "id" | "name">, input: unknown, cwd?: string) {
     const facts = this.facts({ name: toolUse.name, input }, cwd);
     return {
-      _meta: this.toolUseMeta({ name: toolUse.name, input }, cwd),
+      _meta: this.toolUseMeta({ name: toolUse.name }),
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
-      ...(this.capabilities.air.client ? {} : { rawInput: input }),
+      rawInput: input,
       title: facts.title,
       kind: facts.kind,
       ...(facts.locations ? { locations: facts.locations } : {}),
@@ -249,37 +206,24 @@ export class AcpToolCallRenderer {
       previewContent?: ToolCallContent[];
       extraLocations?: ToolCallLocation[];
       meta?: ToolUpdateMeta;
-      /** The content of a client that is not AIR, when the tool call has none. */
+      /** The content of the client, when the tool call has none. */
       fallbackContent?: ToolCallContent[];
     } = {},
   ): RequestPermissionRequest["toolCall"] {
     const facts = this.facts(toolUse, options.cwd);
-    if (!this.capabilities.air.client) {
-      // The upstream shape: the whole tool call again. A v2 client also gets
-      // the exact preview patch, which the tool call does not show.
-      const content = options.previewContent ?? this.toolUseContent(toolUse.id, facts);
-      const locations = [...(facts.locations ?? []), ...(options.extraLocations ?? [])];
-      return {
-        toolCallId: toolUse.id,
-        name: toolUse.name,
-        status: "pending",
-        rawInput: toolUse.input,
-        title: options.title ?? facts.title,
-        kind: facts.kind,
-        content:
-          content.length === 0 && options.fallbackContent ? options.fallbackContent : content,
-        ...(facts.locations !== undefined || options.extraLocations?.length ? { locations } : {}),
-        ...(options.meta ? { _meta: options.meta } : {}),
-      };
-    }
+    // The upstream shape: the whole tool call again. A v2 client also gets
+    // the exact preview patch, which the tool call does not show.
+    const content = options.previewContent ?? this.toolUseContent(toolUse.id, facts);
+    const locations = [...(facts.locations ?? []), ...(options.extraLocations ?? [])];
     return {
       toolCallId: toolUse.id,
+      name: toolUse.name,
+      status: "pending",
+      rawInput: toolUse.input,
       title: options.title ?? facts.title,
-      rawInput: this.rawInput(facts, toolUse.input),
-      ...(options.previewContent ? { content: options.previewContent } : {}),
-      ...(options.extraLocations?.length
-        ? { locations: [...(facts.locations ?? []), ...options.extraLocations] }
-        : {}),
+      kind: facts.kind,
+      content: content.length === 0 && options.fallbackContent ? options.fallbackContent : content,
+      ...(facts.locations !== undefined || options.extraLocations?.length ? { locations } : {}),
       ...(options.meta ? { _meta: options.meta } : {}),
     };
   }
@@ -322,11 +266,9 @@ export class AcpToolCallRenderer {
       const output = { terminal_id: terminalId, data: command.output };
       return {
         ...fields,
-        // A client that is not AIR gets the terminal content again, like
-        // upstream: it replaces a denial text that an earlier update showed.
-        ...(this.capabilities.air.client
-          ? {}
-          : { content: [{ type: "terminal" as const, terminalId }] }),
+        // The terminal content goes out again, like upstream: it replaces a
+        // denial text that an earlier update showed.
+        content: [{ type: "terminal" as const, terminalId }],
         _meta: {
           terminal_info: { terminal_id: terminalId },
           ...(this.capabilities.terminalOutputDelta
@@ -364,17 +306,6 @@ export class AcpToolCallRenderer {
     options: { structured?: unknown; nonExecution?: Record<string, unknown> } = {},
   ): ToolCallUpdate[] {
     const { _meta: resultMeta, ...fields } = this.resultFields(toolUse, result, options.structured);
-    // AIR shows a read or a search that names a path as the list of viewed
-    // files. That view does not show the text of the result, so it stays out.
-    const viewedFiles =
-      this.capabilities.air.client && result.is_error !== true && this.namesViewedFile(toolUse);
-    if (viewedFiles) {
-      const content = fields.content?.filter(
-        (item) => !(item.type === "content" && item.content.type === "text"),
-      );
-      if (content?.length) fields.content = content;
-      else delete fields.content;
-    }
     const updates: ToolCallUpdate[] = [];
     const terminalOutput = resultMeta?.terminal_output_delta ?? resultMeta?.terminal_output;
     if (terminalOutput) {
@@ -386,24 +317,11 @@ export class AcpToolCallRenderer {
         sessionUpdate: "tool_call_update",
       });
     }
-    // AIR gets the raw tool_result only when no other field carries the
-    // result. Every other client gets it unless the terminal carried it.
-    const rawOutput = !this.capabilities.air.client
-      ? terminalOutput
-        ? undefined
-        : exitPlanModeRawOutput(toolUse.name, result.content)
-      : "rawOutput" in fields
-        ? fields.rawOutput
-        : viewedFiles || terminalOutput || fields.content !== undefined
-          ? undefined
-          : result.content;
+    // The raw tool_result goes out unless the terminal carried it.
+    const rawOutput = terminalOutput
+      ? undefined
+      : exitPlanModeRawOutput(toolUse.name, result.content);
     delete fields.rawOutput;
-    // A plan file that the result names goes out also when the input did not
-    // name it. The field tracker drops a path that the client holds.
-    const planFilePath = fields.planFilePath;
-    delete fields.planFilePath;
-    const planFileReleased = fields.planFileReleased === true;
-    delete fields.planFileReleased;
     updates.push({
       _meta: {
         claudeCode: { toolName: toolUse.name, ...(options.nonExecution ?? {}) },
@@ -413,42 +331,14 @@ export class AcpToolCallRenderer {
       sessionUpdate: "tool_call_update",
       status: result.is_error === true ? "failed" : "completed",
       ...(rawOutput !== undefined ? { rawOutput } : {}),
-      ...(planFilePath ? { rawInput: planFileInput(toolUse.input, planFilePath) } : {}),
       ...fields,
     });
-    // AIR keeps the plan file button while the last reported path names a
-    // file, and a blank path is its clear signal. The clear goes as a call of
-    // its own, so the plan card of this call keeps its file.
-    if (planFilePath && planFileReleased && result.is_error !== true) {
-      updates.push({
-        toolCallId: `${toolUse.id}${PLAN_FILE_CLEAR_SUFFIX}`,
-        sessionUpdate: "tool_call",
-        title: "Exited Plan Mode",
-        kind: "switch_mode",
-        status: "completed",
-        rawInput: { planFilePath: "" },
-        content: [],
-      });
-    }
     return updates;
   }
 
   /**
-   * Whether AIR shows [toolUse] as the list of viewed files: a read or a
-   * search with a path in its locations or in the `path` of its input.
-   */
-  private namesViewedFile(toolUse: ToolUse): boolean {
-    const facts = this.facts(toolUse);
-    if (facts.kind !== "read" && facts.kind !== "search") return false;
-    if (facts.locations?.some((location) => location.path)) return true;
-    const path = (toolUse.input as { path?: unknown } | undefined)?.path;
-    return typeof path === "string" && path.length > 0;
-  }
-
-  /**
-   * The report of a PostToolUse hook: the final change of an edit tool, and
-   * the `status` and `isAsync` markers of the `tool_response`. The rest of the
-   * `tool_response` repeats output that the content already carries.
+   * The report of a PostToolUse hook: the final change of an edit tool. The
+   * `tool_response` goes out whole, on every hook.
    */
   async hookResult(
     toolUse: Pick<ToolUse, "id" | "name">,
@@ -459,22 +349,8 @@ export class AcpToolCallRenderer {
     const change = reporter.hookResult
       ? await reporter.hookResult(toolResponse, { cwd, capabilities: this.capabilities })
       : {};
-    if (!this.capabilities.air.client) {
-      // The upstream shape: the whole tool_response, on every hook.
-      return {
-        _meta: { claudeCode: { toolResponse, toolName: toolUse.name } } satisfies ToolUpdateMeta,
-        toolCallId: toolUse.id,
-        sessionUpdate: "tool_call_update",
-        ...(change.content ? { content: change.content } : {}),
-        ...(change.locations ? { locations: change.locations } : {}),
-      };
-    }
-    const markers = toolResponseMarkers(toolResponse);
-    if (!markers && !change.content && !change.locations) return undefined;
     return {
-      _meta: {
-        claudeCode: { ...(markers ? { toolResponse: markers } : {}), toolName: toolUse.name },
-      } satisfies ToolUpdateMeta,
+      _meta: { claudeCode: { toolResponse, toolName: toolUse.name } } satisfies ToolUpdateMeta,
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
       ...(change.content ? { content: change.content } : {}),
@@ -529,15 +405,6 @@ export class AcpToolCallRenderer {
     message?: string;
   }): ToolCallUpdate {
     const reason = denial.decisionReason ?? denial.message;
-    // AIR gets the SDK message only when it differs from the reason, which
-    // the content shows. Every other client gets the upstream toolResponse.
-    const extraMessage = !this.capabilities.air.client
-      ? { decisionReason: denial.decisionReason, message: denial.message }
-      : denial.decisionReason !== undefined &&
-          denial.message !== undefined &&
-          denial.message !== denial.decisionReason
-        ? { message: denial.message }
-        : {};
     return {
       sessionUpdate: "tool_call_update",
       toolCallId: denial.toolCallId,
@@ -547,7 +414,11 @@ export class AcpToolCallRenderer {
         claudeCode: {
           toolName: denial.toolName,
           ...(denial.parentToolUseId ? { parentToolUseId: denial.parentToolUseId } : {}),
-          toolResponse: { decisionReasonType: denial.decisionReasonType, ...extraMessage },
+          toolResponse: {
+            decisionReasonType: denial.decisionReasonType,
+            decisionReason: denial.decisionReason,
+            message: denial.message,
+          },
         },
       } satisfies ToolUpdateMeta,
     };
@@ -587,79 +458,25 @@ export class AcpToolCallRenderer {
   }
 
   /**
-   * `rawInput`. For AIR, without the file text that a diff holds, and with
-   * the path of the plan file in place of the plan text.
-   */
-  rawInput(facts: ToolUseFacts, rawInput: unknown): unknown {
-    if (facts.planFilePath) return planFileInput(rawInput, facts.planFilePath);
-    if (
-      !this.capabilities.air.client ||
-      !facts.fileTextKeys ||
-      !rawInput ||
-      typeof rawInput !== "object" ||
-      Array.isArray(rawInput)
-    ) {
-      return rawInput;
-    }
-    const input = { ...(rawInput as Record<string, unknown>) };
-    for (const key of facts.fileTextKeys) delete input[key];
-    return input;
-  }
-
-  /**
    * The content of a tool use. A command shows the terminal marker. An edit
-   * shows its change. A display copy of the input goes only to a client that
-   * does not render `rawInput` itself, and never next to a terminal.
+   * shows its change. A display copy of the input goes next to it, and never
+   * next to a terminal.
    */
   toolUseContent(toolCallId: string, facts: ToolUseFacts): ToolCallContent[] {
     const terminal = facts.command === true && this.capabilities.terminalOutput;
     return [
       ...(terminal ? [{ type: "terminal" as const, terminalId: toolCallId }] : []),
       ...(facts.change ?? []),
-      ...(!terminal && !this.capabilities.air.rawInputRendering ? (facts.display ?? []) : []),
+      ...(!terminal ? (facts.display ?? []) : []),
     ];
   }
 
   /**
-   * The `_meta` of a tool use report: the tool name, and for AIR the tool
-   * flags under `_meta.jetbrains.air`. A shell description stays out of the
-   * standard `title`, which clients use as the command preview. Every other
-   * client gets only the upstream tool name.
+   * The `_meta` of a tool use report: the tool name that Claude Code used. It
+   * is also carried as the standard ACP `name` field on the initial
+   * `tool_call`.
    */
-  toolUseMeta(toolUse: { name: string; input?: unknown }, cwd?: string): ToolUpdateMeta {
-    const input =
-      toolUse.input !== null && typeof toolUse.input === "object"
-        ? (toolUse.input as Record<string, unknown>)
-        : {};
-    const description =
-      (toolUse.name === "Bash" || toolUse.name === "PowerShell") &&
-      typeof input.description === "string"
-        ? input.description
-        : undefined;
-    const skillName =
-      toolUse.name === "Skill" && typeof input.skill === "string" ? input.skill : undefined;
-    const subagent = toolUse.name === "Agent" || toolUse.name === "Task";
-    if (!this.capabilities.air.client) return { claudeCode: { toolName: toolUse.name } };
-    let meta: Record<string, unknown> = { claudeCode: { toolName: toolUse.name } };
-    if (description) meta = withAirMeta(meta, AIR_COMMAND_TITLE_KEY, description);
-    if (subagent) meta = withAirMeta(meta, AIR_SUBAGENT_KEY, true);
-    if (skillName) {
-      const skillPath = resolveSkillPath(skillName, cwd);
-      meta = withAirMeta(meta, AIR_SKILL_KEY, {
-        name: skillName,
-        ...(skillPath ? { path: skillPath } : {}),
-      });
-    }
-    return meta as ToolUpdateMeta;
+  toolUseMeta(toolUse: { name: string }): ToolUpdateMeta {
+    return { claudeCode: { toolName: toolUse.name } };
   }
-}
-
-/** The input with the path of the plan file in place of the plan text. */
-function planFileInput(rawInput: unknown, planFilePath: string): Record<string, unknown> {
-  const input =
-    rawInput && typeof rawInput === "object" && !Array.isArray(rawInput)
-      ? { ...(rawInput as Record<string, unknown>) }
-      : {};
-  delete input.plan;
-  return { ...input, planFilePath };
 }

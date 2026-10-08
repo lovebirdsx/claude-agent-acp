@@ -1,12 +1,10 @@
 /**
  * The outbound ACP traffic of every scenario in `acp-scenarios/scenarios.ts`,
- * for three client profiles: a plain ACP client, Zed, and JetBrains AIR.
+ * for two client profiles: a plain ACP client and Zed.
  *
  * - Recordings are JSON Lines: one outbound message on each line, with sorted
  *   keys. `normalize` in `harness.ts` replaces only exact run-specific values:
  *   the generated ids, the paths, and the argv and version of this process.
- * - AIR golden files: `acp-scenarios/__snapshots__/air/<scenario>.jsonl`.
- *   Run `npx vitest run src/tests/acp-scenarios.test.ts -u` to update them.
  * - Schema: every message is valid against the ACP schema of the SDK.
  * - Plain and Zed: the same information as origin/main
  *   (`acp-scenarios/origin-main/<profile>/<scenario>.jsonl`). `compare.ts`
@@ -14,7 +12,6 @@
  *   files of their own. `origin-main/zed/` holds a scenario only when its
  *   recording differs from the plain client.
  * - Zed: the Zed conventions and the upstream `_meta` keys.
- * - AIR: the AIR extensions of `docs/air-extensions.md`, each fact once.
  *
  * To record the origin/main baseline again, copy `src/tests/acp-scenarios/`
  * and this file into a checkout of origin/main, and run this file there with
@@ -27,7 +24,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  AIR_CAPABILITY_NAMES,
   assistantTurn,
   normalize,
   PROFILES,
@@ -44,13 +40,12 @@ import {
 } from "./acp-scenarios/harness.js";
 import { SCENARIOS } from "./acp-scenarios/scenarios.js";
 import {
-  AIR_ONLY_CLAUDE_CODE_KEYS,
-  AIR_ONLY_META_KEYS,
   canonical,
   compareWithBaseline,
+  UPSTREAM_AIR_CLAUDE_CODE_KEYS,
+  UPSTREAM_AIR_META_KEYS,
 } from "./acp-scenarios/compare.js";
 import { EXTENSION_SESSION_UPDATES, validateRecorded } from "./acp-scenarios/schema.js";
-import { LEGACY_AIR_CUSTOM_ANSWER_KEY } from "../air-extension.js";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
@@ -131,27 +126,6 @@ function run(profile: Profile["name"], scenario: string): ScenarioRun {
   const recorded = runs.get(key(profile, scenario));
   if (!recorded) throw new Error(`no run of ${scenario} for ${profile}`);
   return recorded;
-}
-
-/** Runs one more scenario for AIR without some AIR capabilities. */
-async function runAir(scenario: Scenario, without: string[] = []): Promise<Recorded[]> {
-  resetIds();
-  const profile: Profile = {
-    name: "air",
-    capabilities: {
-      ...PROFILES.air.capabilities,
-      _meta: {
-        ...PROFILES.air.capabilities._meta,
-        jetbrains: {
-          air: {
-            version: 1,
-            capabilities: AIR_CAPABILITY_NAMES.filter((name) => !without.includes(name)),
-          },
-        },
-      },
-    },
-  };
-  return (await runScenario(Agent, profile, scenario)).raw;
 }
 
 function updates(recorded: Recorded[]): Record<string, any>[] {
@@ -319,16 +293,9 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
     });
   });
 
-  describe("air golden files", () => {
-    it.each(SCENARIOS.map((scenario) => scenario.name))("%s", async (scenario) => {
-      await expect(toJsonLines(run("air", scenario).normalized)).toMatchFileSnapshot(
-        path.join(here, "acp-scenarios", "__snapshots__", "air", `${scenario}.jsonl`),
-      );
-    });
-  });
-
   describe.each(profiles.map((profile) => profile.name))("%s ACP schema", (profile) => {
-    const extensions = profile === "air" ? EXTENSION_SESSION_UPDATES : new Set<string>();
+    // No scenario profile negotiates a draft ACP extension session update.
+    const extensions = new Set<string>();
     it.each(SCENARIOS.map((scenario) => scenario.name))(
       "%s sends only valid messages",
       (scenario) => {
@@ -341,9 +308,10 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
   });
 
   describe.each(profiles.map((profile) => profile.name))("%s session ids", (profile) => {
-    // Only AIR negotiates native subagent sessions. There a child session
-    // gets updates after its parent announced it with `subagent_spawned`.
-    const nativeSubagents = profile === "air";
+    // A profile declares the draft subagents extension to get native subagent
+    // sessions, where a child session gets updates once `subagent_spawned`
+    // announced it. Neither profile declares it.
+    const nativeSubagents = false;
     it.each(SCENARIOS.map((scenario) => scenario.name))(
       "%s sends every session/update to the ACP session",
       (scenario) => {
@@ -376,14 +344,14 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
     );
 
     it.each(SCENARIOS.map((scenario) => scenario.name))(
-      "%s sends no key that exists only for AIR",
+      "%s sends no key that only AIR read upstream",
       (scenario) => {
         const found = metaObjects(run(profile, scenario).raw).flatMap(({ at, meta }) => [
           ...Object.keys(meta)
-            .filter((k) => AIR_ONLY_META_KEYS.has(k))
+            .filter((k) => UPSTREAM_AIR_META_KEYS.has(k))
             .map((k) => `${at}.${k}`),
           ...Object.keys((meta.claudeCode as Record<string, unknown> | undefined) ?? {})
-            .filter((k) => AIR_ONLY_CLAUDE_CODE_KEYS.has(k))
+            .filter((k) => UPSTREAM_AIR_CLAUDE_CODE_KEYS.has(k))
             .map((k) => `${at}.claudeCode.${k}`),
         ]);
         expect(found).toEqual([]);
@@ -592,327 +560,86 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
     });
   });
 
-  describe("AIR", () => {
-    const air = (scenario: string) => run("air", scenario).raw;
-    const airMeta = (meta: Record<string, any> | undefined) => meta?.jetbrains?.air;
-
-    it("gets the AIR capabilities and the goal capability under jetbrains.air", () => {
-      const initialize = air("session-setup").find((record) => record.kind === "initialize")!
-        .payload as Record<string, any>;
-      expect(initialize._meta).toEqual({
-        jetbrains: {
-          air: {
-            version: 1,
-            capabilities: expect.arrayContaining(
-              AIR_CAPABILITY_NAMES.filter((name) => name !== "rawInputRendering"),
-            ),
-            goal: expect.objectContaining({ version: 1 }),
-          },
-        },
-        steering: { supported: true },
-      });
-      const session = air("session-setup").find((record) => record.kind === "newSession")!
-        .payload as Record<string, any>;
-      for (const mode of session.modes.availableModes) {
-        expect(mode._meta).toEqual({
-          jetbrains: { air: { version: 1, kind: expect.any(String) } },
-        });
-      }
-    });
-
-    it("gets commandTitle, subagent, and skill under jetbrains.air, each once", async () => {
-      const bash = toolCallReports(air("bash-foreground"), "toolu_bash");
-      expect(bash.filter((r) => airMeta(r._meta)?.commandTitle === "List files")).toHaveLength(1);
-      // A native subagent session replaces the tool call of the subagent, so
-      // the marker shows without native subagent sessions.
-      const [nested] = toolCallReports(
-        await runAir(
-          {
-            name: "nested-agent",
-            turns: [
-              async function* () {
-                yield* assistantTurn("msg_nested", [
-                  { type: "tool_use", id: "toolu_nested", name: "Agent", input: { prompt: "Go" } },
-                ]);
-                yield result();
-              },
-            ],
-          },
-          ["nativeSubagentSessions"],
-        ),
-        "toolu_nested",
-      );
-      expect(airMeta(nested?._meta)?.subagent).toBe(true);
-      const skill = toolCallReports(air("skill"), "toolu_skill");
-      expect(skill.filter((r) => airMeta(r._meta)?.skill)).toEqual([
-        expect.objectContaining({
-          _meta: expect.objectContaining({
-            jetbrains: {
-              air: {
-                version: 1,
-                skill: { name: "commits", path: expect.stringMatching(/SKILL\.md$/) },
-              },
-            },
-          }),
-        }),
-      ]);
-    });
-
-    it("gets the permission, customAnswer, goal, and contextCompaction keys", () => {
-      const [request] = permissionRequests(air("bash-foreground"));
-      expect(request._meta).toEqual({
-        jetbrains: { air: { version: 1, permission: { version: 1, title: "ls -la" } } },
-      });
-      const elicitation = air("ask-user-question").find(
-        (record) => record.kind === "createElicitation",
-      )!.payload as Record<string, any>;
-      expect(elicitation.requestedSchema.properties.question_0_custom._meta).toEqual({
-        _askUserQuestionCustomAnswer: { questionId: "question_0", isCustomAnswer: true },
-        jetbrains: {
-          air: { version: 1, customAnswer: { questionId: "question_0", isCustomAnswer: true } },
-        },
-      });
-      const goal = updates(air("goal")).find((u) => u.sessionUpdate === "session_info_update");
-      expect(goal?._meta).toEqual({
-        jetbrains: {
-          air: {
-            version: 1,
-            goal: expect.objectContaining({ objective: "Ship the feature", status: "active" }),
-          },
-        },
-      });
-      const compaction = toolCallReports(air("compaction-legacy"));
-      expect(compaction.at(-1)?._meta).toEqual({
-        jetbrains: {
-          air: {
-            contextCompaction: expect.objectContaining({ version: 1, preTokens: 1000 }),
-          },
-        },
-      });
-      expect(compaction.at(-1)).not.toHaveProperty("rawOutput");
-    });
-
-    it("sends no upstream copy of an AIR key", () => {
-      for (const scenario of SCENARIOS) {
-        for (const { at, meta } of metaObjects(air(scenario.name))) {
-          const duplicates = [
-            // Released AIR versions read only the legacy custom answer key, so AIR gets both.
-            ...Object.keys(meta).filter(
-              (k) =>
-                AIR_ONLY_META_KEYS.has(k) &&
-                k !== "jetbrains" &&
-                k !== LEGACY_AIR_CUSTOM_ANSWER_KEY,
-            ),
-            ...Object.keys((meta.claudeCode as Record<string, unknown> | undefined) ?? {}).filter(
-              (k) => AIR_ONLY_CLAUDE_CODE_KEYS.has(k),
-            ),
-          ];
-          expect(duplicates, `${scenario.name} ${at}`).toEqual([]);
-        }
-      }
-    });
-
-    it("sends each tool fact in one field", () => {
-      for (const scenario of SCENARIOS) {
-        for (const report of toolCallReports(air(scenario.name))) {
-          const where = `${scenario.name} ${report.toolCallId}`;
-          // Output is never copied into rawOutput when content carries it.
-          if (report.rawOutput !== undefined) {
-            expect(report.content ?? [], where).toEqual([]);
-          }
-          // Terminal output goes to deltas, never to snapshots.
-          expect(report._meta ?? {}, where).not.toHaveProperty("terminal_output");
-        }
-      }
-      const write = toolCallReports(air("write-new"), "toolu_write");
-      for (const report of write) expect(report.rawInput ?? {}).not.toHaveProperty("content");
-      expect(write[0]).not.toHaveProperty("rawInput");
-    });
-
-    describe("ExitPlanMode with a plan file", () => {
-      const plan = "# Plan\n1. Do it";
-      /**
-       * The CLI streams the input that the model wrote, which has no plan.
-       * The complete message and canUseTool get the text and the path of the
-       * plan file. The structured result names the file again.
-       */
-      const planFileScenario = (options: { file: boolean; reject?: boolean }): Scenario => ({
-        name: "exit-plan-file",
-        ...(options.file ? { files: { "plans/plan.md": plan } } : {}),
-        ...(options.reject ? { permission: "reject_once" } : {}),
-        turns: [
-          async function* (ctx) {
-            const planFilePath = path.join(ctx.cwd, "plans", "plan.md");
-            const input = { plan, planFilePath };
-            yield* streamMessage("msg_toolu_plan", [
-              { type: "tool_use", id: "toolu_plan", name: "ExitPlanMode", input: {} },
-            ]);
-            yield* toolCall(
-              ctx,
-              { id: "toolu_plan", name: "ExitPlanMode", input },
-              options.reject
-                ? {
-                    ask: true,
-                    isError: true,
-                    content: "```\nThe user doesn't want to proceed with this tool use.\n```",
-                  }
-                : {
-                    ask: true,
-                    content: `User has approved your plan.\n\n## Approved Plan:\n${plan}`,
-                    structured: { plan, isAgent: false, filePath: planFilePath },
-                  },
-            );
-            yield result();
-          },
-        ],
-      });
-      it("sends the path and no plan text in every report", async () => {
-        const recorded = await runAir(planFileScenario({ file: true }));
-        const reports = toolCallReports(recorded, "toolu_plan");
-        const [request] = permissionRequests(recorded);
-        const withInput = [...reports, request.toolCall].filter((r) => "rawInput" in r);
-        expect(withInput.length).toBeGreaterThan(0);
-        for (const report of withInput) {
-          expect(report.rawInput).toEqual({ planFilePath: expect.stringMatching(/plan\.md$/) });
-          expect(path.isAbsolute(report.rawInput.planFilePath)).toBe(true);
-        }
-        expect(reports[0]).toMatchObject({ sessionUpdate: "tool_call" });
-        expect(reports[0]).not.toHaveProperty("rawInput");
-        expect(reports.at(-1)).toMatchObject({ status: "completed", title: "Exited Plan Mode" });
-        expect(JSON.stringify([reports, request])).not.toContain("Do it");
-      });
-
-      it("sends the path with a rejection", async () => {
-        const recorded = await runAir(planFileScenario({ file: true, reject: true }));
-        const reports = toolCallReports(recorded, "toolu_plan");
-        const [request] = permissionRequests(recorded);
-        expect(request.toolCall.rawInput).toEqual({ planFilePath: expect.any(String) });
-        expect(reports.at(-1)).toMatchObject({ status: "failed" });
-        expect(JSON.stringify([reports, request])).not.toContain("Do it");
-      });
-
-      it("sends the plan text when the plan file does not exist", async () => {
-        const recorded = await runAir(planFileScenario({ file: false }));
-        const [request] = permissionRequests(recorded);
-        expect(request.toolCall.rawInput).toEqual({ plan, planFilePath: expect.any(String) });
-      });
-
-      it("sends the plan text to an AIR client without planFile", async () => {
-        const recorded = await runAir(planFileScenario({ file: true }), ["planFile"]);
-        const [request] = permissionRequests(recorded);
-        expect(request.toolCall.rawInput).toEqual({ plan, planFilePath: expect.any(String) });
-      });
-
-      it("sends the whole input to a client that is not AIR", async () => {
-        for (const profile of [PROFILES.plain, PROFILES.zed]) {
-          resetIds();
-          const recorded = (await runScenario(Agent, profile, planFileScenario({ file: true })))
-            .raw;
-          const [request] = permissionRequests(recorded);
-          expect(request.toolCall.rawInput).toEqual({ plan, planFilePath: expect.any(String) });
-          expect(request.toolCall.content).toEqual([
-            { type: "content", content: { type: "text", text: plan } },
+  describe("ExitPlanMode with a plan file", () => {
+    const plan = "# Plan\n1. Do it";
+    /**
+     * The CLI streams the input that the model wrote, which has no plan. The
+     * complete message and canUseTool get the text and the path of the plan
+     * file. The structured result names the file again. A client without the
+     * retired AIR plan-file extension gets the whole input.
+     */
+    const planFileScenario = (): Scenario => ({
+      name: "exit-plan-file",
+      files: { "plans/plan.md": plan },
+      turns: [
+        async function* (ctx) {
+          const planFilePath = path.join(ctx.cwd, "plans", "plan.md");
+          const input = { plan, planFilePath };
+          yield* streamMessage("msg_toolu_plan", [
+            { type: "tool_use", id: "toolu_plan", name: "ExitPlanMode", input: {} },
           ]);
-          const reports = toolCallReports(recorded, "toolu_plan");
-          expect(reports.some((r) => r.rawInput?.plan === plan)).toBe(true);
-        }
-      });
+          yield* toolCall(
+            ctx,
+            { id: "toolu_plan", name: "ExitPlanMode", input },
+            {
+              ask: true,
+              content: `User has approved your plan.\n\n## Approved Plan:\n${plan}`,
+              structured: { plan, isAgent: false, filePath: planFilePath },
+            },
+          );
+          yield result();
+        },
+      ],
     });
 
-    it("drops every update of a tool call of a finished child session", () => {
-      const recorded = air("subagent-late-child-update");
-      const finished = recorded.findIndex(
-        (record) =>
-          record.kind === "sessionUpdate" &&
-          (record.payload as { update: Record<string, any> }).update.sessionUpdate ===
-            "subagent_state_update",
-      );
-      expect(finished).toBeGreaterThan(0);
-      const late = recorded
-        .slice(finished)
-        .filter((record) => record.kind === "sessionUpdate")
-        .map((record) => record.payload as { sessionId: string; update: Record<string, any> })
-        .filter(({ update }) => update.toolCallId === "toolu_late_read");
-      expect(late).toEqual([]);
-      for (const record of recorded.filter((r) => r.kind === "sessionUpdate")) {
-        const { sessionId, update } = record.payload as {
-          sessionId: string;
-          update: Record<string, any>;
-        };
-        if (update.toolCallId === "toolu_late_read") expect(sessionId).toBe("agent_late");
+    it("sends the whole input and the plan text", async () => {
+      for (const profile of [PROFILES.plain, PROFILES.zed]) {
+        resetIds();
+        const recorded = (await runScenario(Agent, profile, planFileScenario())).raw;
+        const [request] = permissionRequests(recorded);
+        expect(request.toolCall.rawInput).toEqual({ plan, planFilePath: expect.any(String) });
+        expect(request.toolCall.content).toEqual([
+          { type: "content", content: { type: "text", text: plan } },
+        ]);
+        const reports = toolCallReports(recorded, "toolu_plan");
+        expect(reports.some((r) => r.rawInput?.plan === plan)).toBe(true);
       }
     });
+  });
 
-    it("gets the Write patch, but no file text in the PostToolUse toolResponse", async () => {
-      const scenario = writtenFileScenario();
-      const hookReport = (recorded: Recorded[]) =>
-        toolCallReports(recorded, "toolu_write").find(
-          (report) =>
-            report._meta?.claudeCode?.toolResponse !== undefined || report.content?.[0]?._meta,
-        );
-      const airReport = hookReport(await runAir(scenario));
-      expect(airReport?.content?.[0]?._meta?.jetbrains?.air?.diffPatch?.text).toContain(
-        "-export const x = 0;\n+export const x = 1;\n",
-      );
-      expect(airReport?._meta?.claudeCode?.toolResponse).toBeUndefined();
-      expect(JSON.stringify(airReport)).not.toContain("originalFile");
-      // A client that is not AIR keeps the full toolResponse of origin/main.
-      resetIds();
-      const plain = (await runScenario(Agent, PROFILES.plain, scenario)).raw;
-      expect(hookReport(plain)?._meta?.claudeCode?.toolResponse).toMatchObject({
-        type: "update",
-        content: "export const x = 1;\n",
-        originalFile: "export const x = 0;\n",
-      });
+  it("keeps the full PostToolUse toolResponse of a Write", async () => {
+    resetIds();
+    const recorded = (await runScenario(Agent, PROFILES.plain, writtenFileScenario())).raw;
+    const hook = toolCallReports(recorded, "toolu_write").find(
+      (report) => report._meta?.claudeCode?.toolResponse !== undefined,
+    );
+    expect(hook?._meta?.claudeCode?.toolResponse).toMatchObject({
+      type: "update",
+      content: "export const x = 1;\n",
+      originalFile: "export const x = 0;\n",
     });
+  });
 
-    it("sends no creation patch over a file and no Edit patch before the preview", async () => {
-      const patches = (reports: Record<string, any>[]) =>
-        reports.flatMap((report) =>
-          (report.content ?? [])
-            .map((block: any) => block._meta?.jetbrains?.air?.diffPatch?.text)
-            .filter((text: unknown) => text !== undefined),
-        );
-      // Streamed: the Write of an existing file gets only the update patch of
-      // its hook, and the Edit gets no patch before its approval.
-      const writePatches = patches(toolCallReports(air("write-existing"), "toolu_write"));
-      expect(writePatches).toHaveLength(1);
-      expect(writePatches[0]).not.toContain("new file mode");
-      expect(writePatches[0]).toContain("-export const x = 0;\n+export const x = 1;");
-      const edit = air("edit-with-permission");
-      const approval = edit.findIndex((record) => record.kind === "requestPermission");
-      expect(approval).toBeGreaterThan(0);
-      expect(patches(toolCallReports(edit.slice(0, approval), "toolu_edit"))).toEqual([]);
-      // Replayed: session/load renders the same tool uses from the transcript.
-      const replay = await runAir(replayedEditsScenario());
-      expect(patches(toolCallReports(replay))).toEqual([]);
-      // A replay does not read old.ts: the disk shows a later state than the history.
-      expect(toolCallReports(replay, "toolu_r_write")[0].content).toEqual([
-        {
-          type: "diff",
-          path: expect.stringMatching(/old\.ts$/),
-          oldText: null,
-          newText: "export const x = 1;\n",
-        },
-      ]);
-      expect(toolCallReports(replay, "toolu_r_edit")[0].content).toEqual([
-        {
-          type: "diff",
-          path: expect.stringMatching(/app\.ts$/),
-          oldText: "const value = 1;",
-          newText: "const value = 2;",
-        },
-      ]);
-    });
-
-    it("sends the Bash output as terminal deltas", () => {
-      const reports = toolCallReports(air("bash-foreground"), "toolu_bash");
-      expect(reports).toContainEqual(
-        expect.objectContaining({
-          _meta: { terminal_output_delta: { terminal_id: "toolu_bash", data: "a.ts\nb.ts" } },
-        }),
-      );
-    });
+  it("replays a Write and an Edit from the transcript as diffs", async () => {
+    resetIds();
+    const replay = (await runScenario(Agent, PROFILES.plain, replayedEditsScenario())).raw;
+    // A replay does not read old.ts: the disk shows a later state than the history.
+    expect(toolCallReports(replay, "toolu_r_write")[0].content).toEqual([
+      {
+        type: "diff",
+        path: expect.stringMatching(/old\.ts$/),
+        oldText: null,
+        newText: "export const x = 1;\n",
+      },
+    ]);
+    expect(toolCallReports(replay, "toolu_r_edit")[0].content).toEqual([
+      {
+        type: "diff",
+        path: expect.stringMatching(/app\.ts$/),
+        oldText: "const value = 1;",
+        newText: "const value = 2;",
+      },
+    ]);
   });
 });
 

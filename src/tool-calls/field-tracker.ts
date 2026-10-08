@@ -22,8 +22,7 @@ type ReplacedField = (typeof REPLACED_FIELDS)[number];
 interface SentToolCall {
   /** The JSON of each replaced field that the client holds now. */
   fields: Map<ReplacedField, string>;
-  /** The `_meta.claudeCode` and `_meta.jetbrains.air` keys that the client
-   *  holds now, merged by key. */
+  /** The `_meta.claudeCode` keys that the client holds now, merged by key. */
   mergedMeta: Map<string, string>;
   /** True while an exact approval patch must not be replaced by a snippet. */
   contentPinned: boolean;
@@ -52,10 +51,9 @@ export class ToolCallFieldTracker {
    * `tool_call_update` and records the rest.
    *
    * Returns false when the update carries nothing new: no replaced field
-   * remains, `_meta` has no key besides `claudeCode` and `jetbrains`, and
-   * every `claudeCode` and `jetbrains.air` key repeats its value. The caller
-   * then skips the update. An update for a tool call that the tracker does
-   * not know passes through unchanged.
+   * remains, `_meta` has no key besides `claudeCode`, and every `claudeCode`
+   * key repeats its value. The caller then skips the update. An update for a
+   * tool call that the tracker does not know passes through unchanged.
    *
    * `replacePinnedContent` lets the final result of the tool replace an exact
    * approval patch (see {@link pinContent}).
@@ -151,10 +149,9 @@ export class ToolCallFieldTracker {
 }
 
 /** The `_meta` namespaces that a client merges by key. */
-const MERGED_META_NAMESPACES = new Set(["claudeCode", "jetbrains"]);
+const MERGED_META_NAMESPACES = new Set(["claudeCode"]);
 
-/** Merges the `claudeCode` and `jetbrains.air` keys of `meta`. Returns true
- *  when a key changed. */
+/** Merges the `claudeCode` keys of `meta`. Returns true when a key changed. */
 function recordMergedMeta(
   entry: SentToolCall,
   meta: Record<string, unknown> | null | undefined,
@@ -171,12 +168,5 @@ function recordMergedMeta(
     for (const [key, value] of Object.entries(values)) record(prefix + key, value);
   };
   merge("claudeCode.", meta?.claudeCode);
-  const jetbrains = meta?.jetbrains;
-  if (jetbrains && typeof jetbrains === "object" && !Array.isArray(jetbrains)) {
-    for (const [key, value] of Object.entries(jetbrains)) {
-      if (key === "air") merge("jetbrains.air.", value);
-      else record(`jetbrains.${key}`, value);
-    }
-  }
   return changed;
 }

@@ -8,7 +8,6 @@ import {
   CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_MESSAGE,
   CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_REASON,
 } from "../hide-claude-auth.js";
-import { SessionFailureController } from "../session-failure-extension.js";
 import { DEFAULT_CONTEXT_USAGE, makeMockQuery } from "./helpers.js";
 
 const mockQuery = vi.hoisted(() => vi.fn());
@@ -322,16 +321,12 @@ describe("authorization", () => {
       vi.stubGlobal("process", { ...process, argv: ["--hide-claude-auth"] });
     }
 
-    const airSessionFailureCapabilities = {
-      _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
-    };
-
-    /** An agent that records every `session/update` it sends. `capable` decides
-     *  whether the client advertises the AIR session-failure capability. */
-    function createRecordingAgent(
-      capable: boolean,
-      logger?: { log: (...args: any[]) => void; error: (...args: any[]) => void; warn?: any },
-    ): [ClaudeAcpAgent, any[], Mock] {
+    /** An agent that records every `session/update` it sends. */
+    function createRecordingAgent(logger?: {
+      log: (...args: any[]) => void;
+      error: (...args: any[]) => void;
+      warn?: any;
+    }): [ClaudeAcpAgent, any[], Mock] {
       const updates: any[] = [];
       const extNotification = vi.fn(async () => {});
       const agent = new ClaudeAcpAgent(
@@ -343,16 +338,11 @@ describe("authorization", () => {
         } as unknown as AcpClient,
         logger,
       );
-      if (capable) {
-        (agent as any).clientCapabilities = airSessionFailureCapabilities;
-      }
       return [agent, updates, extNotification];
     }
 
     function failuresIn(updates: any[]) {
-      return updates
-        .map((update) => update.update?._meta?.jetbrains?.air?.sessionFailure)
-        .filter(Boolean);
+      return updates.filter((update) => update.update?.sessionUpdate === "session_failure_update");
     }
 
     function newSessionParams() {
@@ -648,7 +638,7 @@ describe("authorization", () => {
 
       it("warns once when the CLI reports no account at all", async () => {
         const warnings: string[] = [];
-        const [agent] = createRecordingAgent(false, {
+        const [agent] = createRecordingAgent({
           log: () => {},
           error: () => {},
           warn: (message: unknown) => warnings.push(String(message)),
@@ -784,7 +774,7 @@ describe("authorization", () => {
       });
 
       it("does not publish an access failure for capable clients", async () => {
-        const [agent, updates] = createRecordingAgent(true);
+        const [agent, updates] = createRecordingAgent();
         hideClaudeAuth();
         mockAccount(SIGNED_IN_WITH_KEY, {
           accountInfo: async () => ({ subscriptionType: "pro", apiKeySource: "none" }),
@@ -795,11 +785,10 @@ describe("authorization", () => {
         await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject(refusal);
 
         expect(failuresIn(updates)).toEqual([]);
-        expect([...agent.sessions[sessionId].sessionFailureState.active.values()]).toEqual([]);
       });
 
       it("gives a client without the capability the reason on the error only", async () => {
-        const [agent, updates] = createRecordingAgent(false);
+        const [agent, updates] = createRecordingAgent();
         hideClaudeAuth();
         mockAccount(SIGNED_IN_WITH_KEY, { accountInfo: async () => ({ subscriptionType: "pro" }) });
         const { sessionId } = await agent.newSession(newSessionParams());
@@ -809,7 +798,7 @@ describe("authorization", () => {
       });
 
       it("does not publish a failure row for two concurrent prompts", async () => {
-        const [agent, updates] = createRecordingAgent(true);
+        const [agent, updates] = createRecordingAgent();
         hideClaudeAuth();
         mockAccount(SIGNED_IN_WITH_KEY, { accountInfo: async () => ({ subscriptionType: "pro" }) });
         const { sessionId } = await agent.newSession(newSessionParams());
@@ -831,7 +820,7 @@ describe("authorization", () => {
         const onUnhandled = (error: unknown) => unhandled.push(error);
         realProcess.on("unhandledRejection", onUnhandled);
         try {
-          const [agent] = createRecordingAgent(true);
+          const [agent] = createRecordingAgent();
           hideClaudeAuth();
           mockAccount(SIGNED_IN_WITH_KEY, {
             accountInfo: async () => ({ subscriptionType: "pro" }),
@@ -903,7 +892,7 @@ describe("authorization", () => {
 
       it("fails open and warns once when the SDK has no accountInfo", async () => {
         const warnings: string[] = [];
-        const [agent] = createRecordingAgent(false, {
+        const [agent] = createRecordingAgent({
           log: () => {},
           error: () => {},
           warn: (message: unknown) => warnings.push(String(message)),
@@ -1026,7 +1015,7 @@ describe("authorization", () => {
       }
 
       it("refuses the next turn when the CLI now holds a subscription", async () => {
-        const [agent, updates] = createRecordingAgent(true);
+        const [agent, updates] = createRecordingAgent();
         hideClaudeAuth();
         mockQueries(
           { account: SIGNED_IN_WITH_KEY, script: [[signOutResult()]] },
@@ -1044,7 +1033,7 @@ describe("authorization", () => {
       });
 
       it("proceeds when the CLI now holds a key, on a clean failure state", async () => {
-        const [agent] = createRecordingAgent(true);
+        const [agent, updates] = createRecordingAgent();
         hideClaudeAuth();
         mockQueries(
           { account: SIGNED_IN_WITH_KEY, script: [[signOutResult()]] },
@@ -1061,11 +1050,11 @@ describe("authorization", () => {
         expect(respawned.queryClosed).toBeUndefined();
         // The recreated session starts with no active failure: the sign-out
         // row belonged to the query that is gone.
-        expect([...respawned.sessionFailureState.active.values()]).toHaveLength(0);
+        expect(failuresIn(updates)).toEqual([]);
       });
 
       it("refuses with the plain error and no second row when still signed out", async () => {
-        const [agent, updates] = createRecordingAgent(true);
+        const [agent, updates] = createRecordingAgent();
         hideClaudeAuth();
         mockQueries(
           { account: SIGNED_IN_WITH_KEY, script: [[signOutResult()]] },
@@ -1085,7 +1074,7 @@ describe("authorization", () => {
       });
 
       it("shares one respawn between two prompts", async () => {
-        const [agent] = createRecordingAgent(true);
+        const [agent] = createRecordingAgent();
         hideClaudeAuth();
         mockQueries(
           { account: SIGNED_IN_WITH_KEY, script: [[signOutResult()]] },
@@ -1107,7 +1096,7 @@ describe("authorization", () => {
       });
 
       it("reports the identity the respawned session logged back in with", async () => {
-        const [agent, , extNotification] = createRecordingAgent(true);
+        const [agent, , extNotification] = createRecordingAgent();
         hideClaudeAuth();
         // Signed out on a key from the environment, back in on a helper key.
         mockQueries(
@@ -1129,7 +1118,7 @@ describe("authorization", () => {
       });
 
       it("answers a cancel during the dead state", async () => {
-        const [agent] = createRecordingAgent(true);
+        const [agent] = createRecordingAgent();
         hideClaudeAuth();
         mockQueries(
           { account: SIGNED_IN_WITH_KEY, script: [[signOutResult()]] },
@@ -1142,7 +1131,7 @@ describe("authorization", () => {
       });
 
       it("leaves the session alone without the flag", async () => {
-        const [agent] = createRecordingAgent(true);
+        const [agent] = createRecordingAgent();
         mockQueries({ account: SIGNED_IN_WITH_KEY, script: [[signOutResult()]] });
         const { sessionId } = await agent.newSession(newSessionParams());
 
@@ -1185,7 +1174,7 @@ describe("authorization", () => {
       const NO_CONVERSATION = () => new Error("No conversation found with session ID abc-123-def");
 
       it("starts a fresh query when the conversation was never persisted", async () => {
-        const [agent] = createRecordingAgent(true);
+        const [agent] = createRecordingAgent();
         hideClaudeAuth();
         mockQuerySpawns(
           { account: SIGNED_IN_WITH_KEY, script: [[signOutResult()]] },
@@ -1207,7 +1196,7 @@ describe("authorization", () => {
       });
 
       it("refuses the fresh query when the guard rejects the new account", async () => {
-        const [agent] = createRecordingAgent(true);
+        const [agent] = createRecordingAgent();
         hideClaudeAuth();
         mockQuerySpawns(
           { account: SIGNED_IN_WITH_KEY, script: [[signOutResult()]] },
@@ -1224,7 +1213,7 @@ describe("authorization", () => {
       });
 
       it("does not retry a resume that failed for another reason", async () => {
-        const [agent] = createRecordingAgent(true);
+        const [agent] = createRecordingAgent();
         hideClaudeAuth();
         mockQuerySpawns(
           { account: SIGNED_IN_WITH_KEY, script: [[signOutResult()]] },
@@ -1338,7 +1327,7 @@ describe("authorization", () => {
           // usually arrives while that very turn is still running. The mark is
           // a flag and nothing more: the turn keeps its query to the end, and
           // only the following prompt consumes it.
-          const [agent] = createRecordingAgent(true);
+          const [agent] = createRecordingAgent();
           hideClaudeAuth();
           probeStdout = PROBE_SUBSCRIPTION;
           const held = deferred();
@@ -1369,7 +1358,7 @@ describe("authorization", () => {
         });
 
         it("marks the session when the probe kind differs from the account", async () => {
-          const [agent] = createRecordingAgent(true);
+          const [agent] = createRecordingAgent();
           hideClaudeAuth();
           probeStdout = PROBE_SUBSCRIPTION;
           mockQueries(
@@ -1392,7 +1381,7 @@ describe("authorization", () => {
         });
 
         it("leaves the session alone when the probe finds the same kind", async () => {
-          const [agent] = createRecordingAgent(true);
+          const [agent] = createRecordingAgent();
           hideClaudeAuth();
           probeStdout = PROBE_KEY;
           mockQueries({
@@ -1414,7 +1403,7 @@ describe("authorization", () => {
         });
 
         it("never marks a session without the flag", async () => {
-          const [agent] = createRecordingAgent(true);
+          const [agent] = createRecordingAgent();
           probeStdout = PROBE_SUBSCRIPTION;
           mockQueries({
             account: SIGNED_IN_WITH_KEY,
@@ -1435,7 +1424,7 @@ describe("authorization", () => {
         });
 
         it("never marks a session whose account named no identity", async () => {
-          const [agent] = createRecordingAgent(true);
+          const [agent] = createRecordingAgent();
           hideClaudeAuth();
           probeStdout = PROBE_SUBSCRIPTION;
           mockQueries({
@@ -1460,59 +1449,6 @@ describe("authorization", () => {
       });
     });
 
-    describe("auth refusal and existing failure state", () => {
-      /** A controller on the session's own state, publishing through the same
-       *  client, so its rows land in the same `updates` array the agent uses. */
-      function controllerFor(agent: ClaudeAcpAgent, sessionId: string) {
-        return new SessionFailureController({
-          sessionId,
-          state: agent.sessions[sessionId].sessionFailureState,
-          capabilities: (agent as any).clientCapabilities,
-          isCurrent: () => true,
-          sendUpdate: (notification) => (agent as any).client.sessionUpdate(notification),
-          logger: { error: () => {} },
-        });
-      }
-
-      const promptParams = (sessionId: string) => ({
-        sessionId,
-        prompt: [{ type: "text" as const, text: "hello" }],
-      });
-
-      it("does not add a subscription row while a plain sign-out is active", async () => {
-        const [agent, updates] = createRecordingAgent(true);
-        hideClaudeAuth();
-        mockAccount(SIGNED_IN_WITH_KEY, { accountInfo: async () => ({ subscriptionType: "pro" }) });
-        const { sessionId } = await agent.newSession(newSessionParams());
-
-        await controllerFor(agent, sessionId).publish("auth_required", { sessionScoped: true });
-        await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject(refusal);
-
-        const failures = failuresIn(updates);
-        expect(failures).toHaveLength(1);
-        expect(failures[0].reason).toBeUndefined();
-      });
-
-      it("does not add a subscription row before a later sign-out", async () => {
-        const [agent, updates] = createRecordingAgent(true);
-        hideClaudeAuth();
-        mockAccount(SIGNED_IN_WITH_KEY, { accountInfo: async () => ({ subscriptionType: "pro" }) });
-        const { sessionId } = await agent.newSession(newSessionParams());
-
-        await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject(refusal);
-
-        const controller = controllerFor(agent, sessionId);
-        // The guard does not change the session failure state.
-        expect(controller.hasActiveSessionError("auth_required")).toBe(false);
-        expect(controller.hasActiveSessionError("auth_required", REASON)).toBe(false);
-        await controller.publish("auth_required", { sessionScoped: true });
-
-        const failures = failuresIn(updates);
-        expect(failures).toHaveLength(1);
-        expect(failures[0].reason).toBeUndefined();
-      });
-    });
-
     describe("on steer", () => {
       it("rejects a steer that would start a new turn", async () => {
         const [agent] = await createAgentMock();
@@ -1533,7 +1469,7 @@ describe("authorization", () => {
         const onUnhandled = (error: unknown) => unhandled.push(error);
         realProcess.on("unhandledRejection", onUnhandled);
         try {
-          const [agent, updates] = createRecordingAgent(true);
+          const [agent, updates] = createRecordingAgent();
           hideClaudeAuth();
           await agent.unstable_setProvider({
             providerId: "main",
@@ -1638,53 +1574,5 @@ describe("authorization", () => {
     expect(initializeResponse.authMethods).toContainEqual(
       expect.objectContaining({ id: "console-login" }),
     );
-  });
-});
-
-describe("session failure reason field", () => {
-  it("carries reason only when the publisher passes one", async () => {
-    const { SessionFailureController, createSessionFailureState } =
-      await import("../session-failure-extension.js");
-    const capabilities = {
-      _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
-    } as any;
-
-    const withReason: any[] = [];
-    const controllerWithReason = new SessionFailureController({
-      sessionId: "s1",
-      state: createSessionFailureState(),
-      capabilities,
-      isCurrent: () => true,
-      sendUpdate: async (notification) => {
-        withReason.push(notification);
-      },
-      logger: { error: () => {} },
-    });
-    await controllerWithReason.publish("auth_required", {
-      sessionScoped: true,
-      details: "This integration does not support using claude.ai subscriptions.",
-      reason: "claude_subscription_not_supported",
-    });
-    const subscriptionFailure = withReason[0]?.update?._meta?.jetbrains?.air?.sessionFailure;
-    expect(subscriptionFailure).toMatchObject({ reason: "claude_subscription_not_supported" });
-
-    const withoutReason: any[] = [];
-    const controllerWithoutReason = new SessionFailureController({
-      sessionId: "s2",
-      state: createSessionFailureState(),
-      capabilities,
-      isCurrent: () => true,
-      sendUpdate: async (notification) => {
-        withoutReason.push(notification);
-      },
-      logger: { error: () => {} },
-    });
-    await controllerWithoutReason.publish("auth_required", {
-      sessionScoped: true,
-      details: "Authentication required.",
-    });
-    const signedOutFailure = withoutReason[0]?.update?._meta?.jetbrains?.air?.sessionFailure;
-    expect(signedOutFailure).toBeDefined();
-    expect(signedOutFailure.reason).toBeUndefined();
   });
 });

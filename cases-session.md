@@ -20,7 +20,7 @@
 
 **实测（SDK 0.3.287）**：SDK 的行映射是固定字段表 `{type,uuid,session_id,message,parent_tool_use_id,parent_agent_id,timestamp}` —— `isCompactSummary`、`tool_use_result` 等 transcript 专属字段全部丢失（`rawEntryByUuid` sidecar 因此只能来自 raw 行）；过滤器排除 `type:"attachment"`（steering 不在链里）与 system 行（boundary 也不在链里）。真实语料核对：`compact_boundary` 行带 `logicalParentUuid`、summary 行 `isCompactSummary:true` 且 parentUuid 指向 boundary。
 
-**已知差异（未随修，AIR 专属）**：raw transcript 行**没有** `parent_tool_use_id` 字段（实测 1789/1789 行缺失），而 `activeUsageLimitMessage`（`session-failure-extension.ts`）与回放循环的两处判定用 `=== null` 严格比较 → full-chain 路径上 `replayTurnId` / 额度耗尽 restore 恒不命中。父项目编辑器不声明 AIR capability，本次只记录；日后若要修，换既有的 `parentToolUseIdOf()`。
+**已知差异（未随修，历史记录）**：raw transcript 行**没有** `parent_tool_use_id` 字段（实测 1789/1789 行缺失），而回放循环的两处判定用 `=== null` 严格比较 → full-chain 路径上 `replayTurnId` 恒不命中。（当初另一处 `activeUsageLimitMessage` 与额度耗尽 restore 属 AIR 专属路径，已随 AIR 退役删除。）日后若要修，换既有的 `parentToolUseIdOf()`。
 
 **覆盖测试**：`tests/acp-agent.test.ts` 的 `replaySessionHistory across compaction` describe 新增两条走**生产入参形态**的用例（`readResumedSession(...)` → `replaySessionHistory(id, messages)`：压缩前全史 + 卡片 + 隐藏 summary；无 boundary 时 merge 救回 steering）。教训：既有用例全部调 `replaySessionHistory(sessionId)`（不传 messages），功能自引入起被遮蔽也无人发现。
 
@@ -85,7 +85,7 @@ CLI 的 first-party 家族改写会把内置 Explore 子 agent 从网关模型�
 
 修法（`acp-agent.ts`，`unstable_forkSession` 分支 + 新 helper `forkSliceBefore` / `foldedPromptForkPoint`）：
 
-1. **磁盘为唯一真相**：live 映射未命中时读 `getSessionMessages(sid, {dir})`（与 `messageIdBefore` 同一次读取，不增 IO），用 `messageIdForGrouping` / `uuid` 双判据匹配锚点——user 轮的 uuid **就是**发给 client 的 messageId（`prompt()` 把 `_meta.messageId` 盖成 `SDKMessage.uuid`），assistant 轮按 API id 归类。对齐 AIR 路径（`fork-session.ts` 的 `loadFullSessionHistory`）与 codex 侧（`SessionFork.ts` 从持久化 thread 解析，故其无此 bug）。
+1. **磁盘为唯一真相**：live 映射未命中时读 `getSessionMessages(sid, {dir})`（与 `messageIdBefore` 同一次读取，不增 IO），用 `messageIdForGrouping` / `uuid` 双判据匹配锚点——user 轮的 uuid **就是**发给 client 的 messageId（`prompt()` 把 `_meta.messageId` 盖成 `SDKMessage.uuid`），assistant 轮按 API id 归类。（AIR 锚点路径的 `fork-session.ts` 的 `loadFullSessionHistory` 已随 AIR 退役删除，tip fork 现只剩 SDK `forkSession`。）对齐 codex 侧（`SessionFork.ts` 从持久化 thread 解析，故其无此 bug）。
 2. **解析不到即 `RequestError.invalidParams`**，绝不静默退回整份复制（对齐 fork 自己的 rewind 失败形态）。锚点是**首条消息**同样报错——`upToMessageId` inclusive 且 SDK 无法表达"空历史"，而该锚点可达（粘性条右键菜单），不能给整份副本。
 3. **折叠（steered）prompt 兜底**：turn 运行中发的 prompt 被 CLI 折叠进该 turn，落盘为 `queued_command` **attachment 行**，`getSessionMessages` 会过滤它 → 该 messageId 在有效链上无行可锚（resident 时 live 表也只是把它映射到自己）。此时用 `readTranscriptEntries`（读原始行）找 `isQueuedCommandEntry(entry) && entry.attachment.source_uuid === messageId`，取其 `parentUuid` 作切点；**该 parent 必须仍在有效链上**（`chain.some`），否则视为未知——rewind 留下的孤儿 attachment 不得复活已删轮次。没有这层兜底，修复会把"静默整份复制"变成"硬报错"，属可见回归。
 4. **空 `cwd` 退化为全项目搜索**：helper 用 `dir !== undefined && dir.length > 0 ? { dir } : {}`——SDK 省略 `dir` 时"searches all projects"，传空串则匹配不到任何项目。

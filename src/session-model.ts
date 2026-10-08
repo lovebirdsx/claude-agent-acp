@@ -1,6 +1,5 @@
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import type { ModelInfo, Query, Settings } from "@anthropic-ai/claude-agent-sdk";
-import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, withAirMeta } from "./air-extension.js";
 
 export const MODEL_CONFIG_ID = "model";
 
@@ -187,44 +186,16 @@ export function matchResumedModel(models: ModelInfo[], liveModel: string): Model
 export function buildModelConfigOption(
   models: SessionModelState,
   modelInfos: ModelInfo[],
-  useRecommendedValue: boolean,
 ): SessionConfigOption {
   const defaultInfo = modelInfos.find((model) => model.value === "default");
-  const selectableIds = new Set(models.availableModels.map((model) => model.modelId));
-  const concreteInfos = modelInfos.filter(
-    (model) => model.value !== "default" && selectableIds.has(model.value),
-  );
-  // Recommendations describe the running default, so fuzzy family matching
-  // must never substitute a different generation or context window.
-  const defaultResolved = defaultInfo?.resolvedModel;
-  const recommended = defaultResolved
-    ? (concreteInfos.find(
-        (model) =>
-          canonicalizeModelId(model.resolvedModel ?? model.value) ===
-          canonicalizeModelId(defaultResolved),
-      ) ?? null)
-    : null;
-  const concreteRecommendation = useRecommendedValue && recommended !== null;
-  const available = concreteRecommendation
-    ? models.availableModels.filter((model) => model.modelId !== "default")
-    : models.availableModels;
-
   return {
     id: MODEL_CONFIG_ID,
     name: "Model",
     description: "AI model to use",
     category: "model",
     type: "select",
-    currentValue:
-      concreteRecommendation && models.currentModelId === "default"
-        ? recommended.value
-        : models.currentModelId,
-    ...(concreteRecommendation
-      ? {
-          _meta: withAirMeta(undefined, AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, recommended.value),
-        }
-      : {}),
-    options: available.map((model) => {
+    currentValue: models.currentModelId,
+    options: models.availableModels.map((model) => {
       if (model.modelId === "default" && defaultInfo?.resolvedModel) {
         const named = modelInfos.find(
           (info) => info.value !== "default" && info.resolvedModel === defaultInfo.resolvedModel,
@@ -386,6 +357,26 @@ export function applyAvailableModelsAllowlist(
  *  falls back to the ordinary fail-loud path, no worse than before. */
 function isPreModelSwitchHookBlock(error: unknown): boolean {
   return error instanceof Error && error.message.includes("blocked by a PreModelSwitch hook");
+}
+
+/** 用户切模型被 CLI 拒绝的方式。未命中下面文本的一律留 `unrecognised`，
+ *  调用方走通用失败路径，不猜类别。 */
+export type ModelSwitchRefusal = "authentication_required" | "model_unavailable" | "unrecognised";
+
+// 只匹配锁定 CLI 上实测到的两种文本（2.1.287，隔离 CLAUDE_CONFIG_DIR，无 prompt）：
+//   - 原生 CLI 无凭据："Unable to validate model: Could not resolve authentication
+//     method. …" —— 切模型要先对着目录校验，没凭据就校验不了，是缺认证而非模型不存在；
+//   - 已认证的网关不提供该 id："Model '<id>' not found"。
+// 其余文本（传输失败、代理错误体、鉴权拒绝）不归类，避免从 CLI 源码瞎猜。
+const MODEL_SWITCH_AUTH_REQUIRED_PATTERN =
+  /unable to validate model:\s*could not resolve authentication method/i;
+const MODEL_SWITCH_MODEL_NOT_FOUND_PATTERN = /\bmodel\b[^\n]*\bnot found\b/i;
+
+export function classifyModelSwitchFailure(error: unknown): ModelSwitchRefusal {
+  if (!(error instanceof Error)) return "unrecognised";
+  if (MODEL_SWITCH_AUTH_REQUIRED_PATTERN.test(error.message)) return "authentication_required";
+  if (MODEL_SWITCH_MODEL_NOT_FOUND_PATTERN.test(error.message)) return "model_unavailable";
+  return "unrecognised";
 }
 
 /** How a resumed session's model still needs to be synced with the CLI after
