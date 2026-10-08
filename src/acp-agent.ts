@@ -9379,8 +9379,11 @@ export class ClaudeAcpAgent {
     const replayTotalCapBytes = replayCaps.totalCapBytes ?? MAIN_REPLAY_TOTAL_CAP_BYTES;
     const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
-    const rawEntries =
-      resumedMessages === undefined ? await this.readTranscriptEntries(sessionId) : undefined;
+    // Fork: always read the raw transcript. Both `session/load` entry points
+    // hand replay the SDK's effective chain, which starts at the compaction
+    // summary — a rebuilt full chain must win over it, or the pre-compaction
+    // history is lost and the summary renders as a user turn.
+    const rawEntries = await this.readTranscriptEntries(sessionId);
     const fullChain = rawEntries ? rebuildTranscriptDisplayChain(rawEntries) : undefined;
     // Sidecar lookup for the sub-agent stats restamp below: `getSessionMessages`
     // strips the transcript's `toolUseResult`, the raw rows keep it.
@@ -9397,11 +9400,15 @@ export class ClaudeAcpAgent {
     // `attachment/queued_command` rows on the parent chain, which
     // `getSessionMessages` filters out — merge them back into the effective
     // chain so a reloaded session doesn't lose them. The rebuilt full chain
-    // already carries them (see rebuildTranscriptDisplayChain's filter).
+    // already carries them (see rebuildTranscriptDisplayChain's filter); the
+    // resumed chain needs this merge just as much, since the SDK drops
+    // attachment rows from it too.
     const messages: Array<RawTranscriptEntry | SessionMessage> =
-      resumedMessages ??
       fullChain ??
-      mergeQueuedCommandAttachments(await getSessionMessages(sessionId), rawEntries ?? []);
+      mergeQueuedCommandAttachments(
+        resumedMessages ?? (await getSessionMessages(sessionId)),
+        rawEntries ?? [],
+      );
     const historyLoadedAt = performance.now();
     this.logger.log(
       `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,

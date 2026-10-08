@@ -10,6 +10,20 @@
 
 **`user` 行本身带 entry 级 `origin` 的形态：上游 a44c486 已实现，fork 不保留守卫。** 上游 replay 的 user 分支先经 `taskNotificationsOf`/`restoreTaskNotification` 恢复后台任务状态，再 `isTaskNotificationRecord`（`kind==="task-notification"` 且无 `subkind`）整行隐藏；无 `origin` 的纯 `<task-notification>` 文本行靠 `stripLocalCommandMetadata` 的标记剥离清空隐藏（effective chain 映射丢 `origin` 也照样隐藏）。带 `subkind` 的投递（如 scheduled routine）是上游语义下的**真实 prompt**，必须显示。fork 原守卫把全量 `AUTONOMOUS_RESULT_ORIGINS` 判据用在 user 行上、且在 restore 之前整行跳过——既吞掉任务状态恢复，又误杀 subkind 投递，rebase 时已删（`RawTranscriptEntry` 的 entry 级 `origin` 字段保留为形状文档——上游同样按此形状消费，只是以 `unknown` 转型读取）。保留两条 fork 测试守护上游契约：全链上带 origin 的投递行隐藏；effective chain 上无 origin 的纯文本投递行隐藏。
 
+## 恢复已压缩会话重建完整显示历史（优先级不变量：勿被 resumedMessages 遮蔽）
+
+（待提交）落点 `acp-agent.ts`（`replaySessionHistory` 两处：`readTranscriptEntries` 改为无条件读、`messages` 优先级为 `fullChain ?? resumedMessages ?? merge(...)`）
+
+**症状**：恢复一个已 compact 的会话，时间线首条变成压缩摘要（"This session is being continued from a previous conversation…"），压缩前历史整段消失、压缩卡片也不发。**根因**：上游 #1218（`190a00f`）把两个 `session/load` 入口改成传 `readResumedSession(...).messages` —— 那是 SDK `getSessionMessages` 的**有效上下文链**：`compact_boundary` 的 `parentUuid` 为 null，链**从 summary 起**、压缩前历史不可达。该参数排在 `fullChain` 之前，于是 `rebuildTranscriptDisplayChain`（本 fork 的重建）在真实 load 路径上成死代码，且回放循环里 `if (fullChain !== undefined)` 守卫的「boundary → 压缩卡片、`isCompactSummary` → 隐藏」整段失效。唯一还传 `undefined` 的调用点是 rewind，故只有 load/resume 坏。**rebase 红线：优先级必须 `fullChain ?? resumedMessages ?? merge(getSessionMessages…)`，且 `readTranscriptEntries` 无条件执行**——`rebuildTranscriptDisplayChain` 在无 boundary 时返回 undefined，未压缩会话因此仍走 resumed 快路径（上游「省一次读」的意图保留）。
+
+**同源第二处（同批修复）**：`mergeQueuedCommandAttachments` 原挂在最后一个 `??` 分支，等于只有 rewind 生效——SDK 的有效链**过滤掉 `attachment` 行**，故 `session/load` 也丢用户的 steering 插话（`tests/session-load.test.ts` 最后一条集成用例可复现）。修法：merge 同时包住 `resumedMessages ?? getSessionMessages(...)`，`rawEntries` 缺失时 `?? []` 使其退化为 no-op。
+
+**实测（SDK 0.3.287）**：SDK 的行映射是固定字段表 `{type,uuid,session_id,message,parent_tool_use_id,parent_agent_id,timestamp}` —— `isCompactSummary`、`tool_use_result` 等 transcript 专属字段全部丢失（`rawEntryByUuid` sidecar 因此只能来自 raw 行）；过滤器排除 `type:"attachment"`（steering 不在链里）与 system 行（boundary 也不在链里）。真实语料核对：`compact_boundary` 行带 `logicalParentUuid`、summary 行 `isCompactSummary:true` 且 parentUuid 指向 boundary。
+
+**已知差异（未随修，AIR 专属）**：raw transcript 行**没有** `parent_tool_use_id` 字段（实测 1789/1789 行缺失），而 `activeUsageLimitMessage`（`session-failure-extension.ts`）与回放循环的两处判定用 `=== null` 严格比较 → full-chain 路径上 `replayTurnId` / 额度耗尽 restore 恒不命中。父项目编辑器不声明 AIR capability，本次只记录；日后若要修，换既有的 `parentToolUseIdOf()`。
+
+**覆盖测试**：`tests/acp-agent.test.ts` 的 `replaySessionHistory across compaction` describe 新增两条走**生产入参形态**的用例（`readResumedSession(...)` → `replaySessionHistory(id, messages)`：压缩前全史 + 卡片 + 隐藏 summary；无 boundary 时 merge 救回 steering）。教训：既有用例全部调 `replaySessionHistory(sessionId)`（不传 messages），功能自引入起被遮蔽也无人发现。
+
 ## 识别 CLI 合成的假「用户拒绝」（`_meta.claudeCode.syntheticDenial`）
 
 （待提交）落点 `acp-agent.ts`（六处：Session 类型 + 初始化、canUseTool 的 deny 分支、`toAcpNotifications` 与 `streamEventToAcpNotifications` 的 options 类型 + 转发、tool_result 消费处、`ToolUpdateMeta`）

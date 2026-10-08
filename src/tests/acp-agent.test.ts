@@ -61,6 +61,7 @@ import {
   type SteerRequest,
   type StreamedToolInputCache,
 } from "../acp-agent.js";
+import { readResumedSession } from "../resumed-session.js";
 import { SessionTitles } from "../session-titles.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";
 import { Pushable } from "../utils.js";
@@ -25045,6 +25046,135 @@ describe("replaySessionHistory across compaction (full transcript replay)", () =
     ]);
     // The full-chain path never consults the SDK's effective chain.
     expect(getSessionMessages).not.toHaveBeenCalled();
+  });
+
+  it("replays the full chain when loadSession hands over the SDK's truncated chain", async () => {
+    await writeCompactedTranscript();
+    // What getSessionMessages returns for this transcript, i.e. what
+    // readResumedSession hands both session/load entry points: the effective
+    // chain starts at the summary (the boundary's parentUuid is null, so the
+    // pre-compaction history is unreachable on it), and the SDK's row mapping
+    // drops every transcript-only field — including isCompactSummary.
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "sum",
+        session_id: sessionId,
+        message: { role: "user", content: "SUMMARY_OF_DROPPED_HISTORY" },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
+      {
+        type: "user",
+        uuid: "u2",
+        session_id: sessionId,
+        message: { role: "user", content: "second question" },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
+      {
+        type: "assistant",
+        uuid: "a2",
+        session_id: sessionId,
+        message: {
+          id: "msg_2",
+          role: "assistant",
+          content: [{ type: "text", text: "second answer" }],
+        },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
+    ] as any);
+    const { agent, events } = createRecordingAgent();
+
+    const resumed = await readResumedSession(sessionId);
+    await (agent as any).replaySessionHistory(sessionId, resumed.messages);
+
+    expect(events).toEqual([
+      { kind: "user", text: "first question" },
+      { kind: "agent", text: "first answer" },
+      { kind: "compaction", phase: "success" },
+      { kind: "user", text: "second question" },
+      { kind: "agent", text: "second answer" },
+    ]);
+    // The summary is a marker, not history: it must never reach the client as
+    // a user turn once the pre-compaction history is restored.
+    expect(events).not.toContainEqual({ kind: "user", text: "SUMMARY_OF_DROPPED_HISTORY" });
+    // Only the entry point's own read: the boundary-aware replay reuses the raw
+    // transcript instead of asking the SDK for a second effective chain.
+    expect(getSessionMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it("merges a steering prompt back when the resumed chain drops it", async () => {
+    // No compact_boundary, so the replay falls back to the chain a resumed
+    // session carries. The SDK filters attachment rows out of that chain, and
+    // the transcript's queued_command row is the only copy of the prompt.
+    await writeFile(
+      transcript,
+      [
+        line({
+          type: "user",
+          uuid: "u1",
+          parentUuid: null,
+          message: { role: "user", content: "first question" },
+        }),
+        line({
+          type: "assistant",
+          uuid: "a1",
+          parentUuid: "u1",
+          message: {
+            id: "msg_1",
+            role: "assistant",
+            content: [{ type: "text", text: "first answer" }],
+          },
+        }),
+        line({
+          type: "attachment",
+          uuid: "q1",
+          parentUuid: "a1",
+          attachment: {
+            type: "queued_command",
+            prompt: [{ type: "text", text: "STEERING_PROMPT_SURVIVES_RELOAD" }],
+            source_uuid: "client-prompt-1",
+            commandMode: "prompt",
+            origin: { kind: "human" },
+          },
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "u1",
+        session_id: sessionId,
+        message: { role: "user", content: "first question" },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
+      {
+        type: "assistant",
+        uuid: "a1",
+        session_id: sessionId,
+        message: {
+          id: "msg_1",
+          role: "assistant",
+          content: [{ type: "text", text: "first answer" }],
+        },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
+    ] as any);
+    const { agent, events } = createRecordingAgent();
+
+    const resumed = await readResumedSession(sessionId);
+    await (agent as any).replaySessionHistory(sessionId, resumed.messages);
+
+    expect(events).toEqual([
+      { kind: "user", text: "first question" },
+      { kind: "agent", text: "first answer" },
+      { kind: "user", text: "STEERING_PROMPT_SURVIVES_RELOAD" },
+    ]);
   });
 
   it("still honors stopBeforeUuid (rewind anchor) on the full chain", async () => {
