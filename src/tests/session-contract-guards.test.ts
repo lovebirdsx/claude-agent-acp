@@ -248,6 +248,47 @@ describe("session/load 入口：压缩历史与 steering", () => {
     expect(events).not.toContainEqual({ kind: "user", text: SUMMARY });
   });
 
+  /** 真实语料里 CLI 把 boundary 的显示序链接写坏的两种形态：`logicalParentUuid`
+   *  为 `null`，或指向文件里不存在的 uuid。两者都曾让重建的回溯断在 boundary，
+   *  恢复出的历史只剩最后一次 compact 之后。 */
+  const unusableLinkTranscript = (link: string | null): Record<string, unknown>[] =>
+    rawTranscript().map((row) =>
+      row.subtype === "compact_boundary"
+        ? {
+            ...row,
+            logicalParentUuid: link,
+            compactMetadata: {
+              trigger: "auto",
+              preTokens: 100000,
+              preservedSegment: { tailUuid: "a1" },
+            },
+          }
+        : row,
+    );
+
+  it.each([null, "ghost-absent-from-file"])(
+    "boundary 的显示序链接不可用（logicalParentUuid=%s）时经 preservedSegment.tailUuid 恢复",
+    async (link) => {
+      const sessionId = randomUUID();
+      await writeTranscript(sessionId, unusableLinkTranscript(link));
+      chains[sessionId] = effectiveChain(sessionId);
+
+      const { client, events } = recordingClient();
+      const agent = new ClaudeAcpAgent(client, logger);
+      await agent.loadSession({ sessionId, cwd: process.cwd(), mcpServers: [] });
+
+      expect(events).toEqual([
+        { kind: "user", text: "first question" },
+        { kind: "agent", text: "first answer" },
+        { kind: "compaction", phase: "success" },
+        { kind: "user", text: STEERING },
+        { kind: "user", text: "second question" },
+        { kind: "agent", text: "second answer" },
+      ]);
+      expect(events).not.toContainEqual({ kind: "user", text: SUMMARY });
+    },
+  );
+
   it("原始 transcript 缺失时降级到 SDK 有效链", async () => {
     const sessionId = randomUUID();
     chains[sessionId] = effectiveChain(sessionId);

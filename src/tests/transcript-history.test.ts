@@ -37,6 +37,114 @@ describe("rebuildTranscriptDisplayChain (compaction-crossing history)", () => {
     expect(chain?.map((e) => e.uuid)).toEqual(["u1", "a1", "cb", "sum", "u2", "a2"]);
   });
 
+  // The CLI stamps `logicalParentUuid` in three shapes, and the last two used
+  // to truncate the rebuild to post-compaction history — the reloaded session
+  // then appeared to start right after the newest compaction.
+  it("bridges a boundary whose logicalParentUuid names no row via the preserved-segment tail", () => {
+    const chain = rebuildTranscriptDisplayChain([
+      entry({ uuid: "u1", parentUuid: null, type: "user" }),
+      entry({ uuid: "a1", parentUuid: "u1", type: "assistant" }),
+      entry({
+        uuid: "cb",
+        parentUuid: null,
+        logicalParentUuid: "ghost-absent-from-file",
+        type: "system",
+        subtype: "compact_boundary",
+        compactMetadata: { preservedSegment: { tailUuid: "a1" } },
+      }),
+      entry({ uuid: "sum", parentUuid: "cb", type: "user", isCompactSummary: true }),
+      entry({ uuid: "u2", parentUuid: "sum", type: "user" }),
+    ]);
+    expect(chain?.map((e) => e.uuid)).toEqual(["u1", "a1", "cb", "sum", "u2"]);
+  });
+
+  it("bridges a boundary whose logicalParentUuid is null the same way", () => {
+    const chain = rebuildTranscriptDisplayChain([
+      entry({ uuid: "u1", parentUuid: null, type: "user" }),
+      entry({ uuid: "a1", parentUuid: "u1", type: "assistant" }),
+      entry({
+        uuid: "cb",
+        parentUuid: null,
+        logicalParentUuid: null,
+        type: "system",
+        subtype: "compact_boundary",
+        compactMetadata: { preservedSegment: { tailUuid: "a1" } },
+      }),
+      entry({ uuid: "sum", parentUuid: "cb", type: "user", isCompactSummary: true }),
+      entry({ uuid: "u2", parentUuid: "sum", type: "user" }),
+    ]);
+    expect(chain?.map((e) => e.uuid)).toEqual(["u1", "a1", "cb", "sum", "u2"]);
+  });
+
+  // The tail only fills a gap — it must never reroute a boundary that has a
+  // usable stamped link, or an abandoned branch could be walked instead.
+  it("keeps a resolvable logicalParentUuid ahead of the preserved-segment tail", () => {
+    const chain = rebuildTranscriptDisplayChain([
+      entry({ uuid: "u1", parentUuid: null, type: "user" }),
+      entry({ uuid: "a1", parentUuid: "u1", type: "assistant" }),
+      entry({ uuid: "zz", parentUuid: null, type: "user" }),
+      entry({
+        uuid: "cb",
+        parentUuid: null,
+        logicalParentUuid: "a1",
+        type: "system",
+        subtype: "compact_boundary",
+        compactMetadata: { preservedSegment: { tailUuid: "zz" } },
+      }),
+      entry({ uuid: "sum", parentUuid: "cb", type: "user", isCompactSummary: true }),
+      entry({ uuid: "u2", parentUuid: "sum", type: "user" }),
+      entry({ uuid: "a2", parentUuid: "u2", type: "assistant" }),
+    ]);
+    expect(chain?.map((e) => e.uuid)).toEqual(["u1", "a1", "cb", "sum", "u2", "a2"]);
+  });
+
+  // Degradation anchor, not a red-on-revert case: with no usable link the walk
+  // stops at the boundary — never at file order, which would resurrect forks.
+  it("still ends at the boundary when neither link names a row in the file", () => {
+    const chain = rebuildTranscriptDisplayChain([
+      entry({ uuid: "u1", parentUuid: null, type: "user" }),
+      entry({ uuid: "a1", parentUuid: "u1", type: "assistant" }),
+      entry({
+        uuid: "cb",
+        parentUuid: null,
+        logicalParentUuid: "ghost-absent-from-file",
+        type: "system",
+        subtype: "compact_boundary",
+        compactMetadata: { preservedSegment: { tailUuid: "also-gone" } },
+      }),
+      entry({ uuid: "sum", parentUuid: "cb", type: "user", isCompactSummary: true }),
+      entry({ uuid: "u2", parentUuid: "sum", type: "user" }),
+    ]);
+    expect(chain?.map((e) => e.uuid)).toEqual(["cb", "sum", "u2"]);
+  });
+
+  // In one measured corpus 46 of the 143 resolvable tails were attachment rows,
+  // so a non-display tail is the common shape, not an edge: the walk continues
+  // through it and the filter decides what is shown.
+  it("walks through a preserved-segment tail that is a non-display row", () => {
+    const chain = rebuildTranscriptDisplayChain([
+      entry({ uuid: "u1", parentUuid: null, type: "user" }),
+      entry({ uuid: "a1", parentUuid: "u1", type: "assistant" }),
+      entry({
+        uuid: "q1",
+        parentUuid: "a1",
+        type: "attachment",
+        attachment: { type: "queued_command", prompt: [{ type: "text", text: "stop" }] },
+      }),
+      entry({
+        uuid: "cb",
+        parentUuid: null,
+        logicalParentUuid: null,
+        type: "system",
+        subtype: "compact_boundary",
+        compactMetadata: { preservedSegment: { tailUuid: "q1" } },
+      }),
+      entry({ uuid: "sum", parentUuid: "cb", type: "user", isCompactSummary: true }),
+      entry({ uuid: "u2", parentUuid: "sum", type: "user" }),
+    ]);
+    expect(chain?.map((e) => e.uuid)).toEqual(["u1", "a1", "q1", "cb", "sum", "u2"]);
+  });
+
   it("keeps abandoned rewind branches out — only the chain from the newest leaf is live", () => {
     // u2a/a2a is an abandoned fork (CLI-native rewind); u2b/a2b is the live branch.
     const chain = rebuildTranscriptDisplayChain([
@@ -156,6 +264,37 @@ describe("rebuildTranscriptDisplayChain (compaction-crossing history)", () => {
       }),
     ]);
     expect(chain?.map((e) => e.uuid)).toEqual(["u1", "a1", "cb", "u2", "n1"]);
+  });
+
+  // The measured shape that surfaced the bug: two compactions, the newer
+  // boundary's link dangling. The walk must cross the repaired boundary and
+  // then the healthy one, so a fix that only handles the boundary nearest the
+  // leaf cannot pass this.
+  it("crosses a repaired boundary and an older healthy one in the same chain", () => {
+    const chain = rebuildTranscriptDisplayChain([
+      entry({ uuid: "u1", parentUuid: null, type: "user" }),
+      entry({ uuid: "a1", parentUuid: "u1", type: "assistant" }),
+      entry({
+        uuid: "cb1",
+        parentUuid: null,
+        logicalParentUuid: "a1",
+        type: "system",
+        subtype: "compact_boundary",
+      }),
+      entry({ uuid: "u2", parentUuid: "cb1", type: "user" }),
+      entry({ uuid: "a2", parentUuid: "u2", type: "assistant" }),
+      entry({
+        uuid: "cb2",
+        parentUuid: null,
+        logicalParentUuid: "ghost-absent-from-file",
+        type: "system",
+        subtype: "compact_boundary",
+        compactMetadata: { preservedSegment: { tailUuid: "a2" } },
+      }),
+      entry({ uuid: "sum2", parentUuid: "cb2", type: "user", isCompactSummary: true }),
+      entry({ uuid: "u3", parentUuid: "sum2", type: "user" }),
+    ]);
+    expect(chain?.map((e) => e.uuid)).toEqual(["u1", "a1", "cb1", "u2", "a2", "cb2", "sum2", "u3"]);
   });
 
   it("crosses multiple compactions in one session", () => {

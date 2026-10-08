@@ -14,6 +14,14 @@ export interface RawTranscriptEntry {
    *  (`parentUuid: null`); this preserves the display-order link to the last
    *  pre-compaction message. */
   logicalParentUuid?: string | null;
+  /** On a `compact_boundary`: what the compaction kept. `preservedSegment.tailUuid`
+   *  is the pre-compaction entry the boundary's display link should name — the
+   *  same uuid `logicalParentUuid` carries when the CLI writes it correctly, and
+   *  still readable when that field is `null` or names a row absent from the
+   *  file. Only `tailUuid` is read; see {@link displayParentOf}. */
+  compactMetadata?: {
+    preservedSegment?: { tailUuid?: string | null };
+  };
   type?: string;
   subtype?: string;
   isSidechain?: boolean;
@@ -144,12 +152,54 @@ export function mergeQueuedCommandAttachments<T extends { uuid?: string | null }
 }
 
 /**
+ * The entry the display walk continues from, or undefined when the chain ends
+ * here.
+ *
+ * `parentUuid` is the physical link; a `compact_boundary` severs it
+ * (`parentUuid: null`) and records the display-order predecessor in
+ * `logicalParentUuid` instead. That field comes in three shapes, and the last
+ * two silently truncated the rebuild to post-compaction history — a reloaded
+ * session appeared to start right after its newest compaction: `null`, or a
+ * uuid no row in the file carries (10 dangling plus 18 null of 180 boundaries
+ * in one measured corpus).
+ *
+ * The segment tail the compaction recorded is the uuid `logicalParentUuid`
+ * means to carry — on all 115 boundaries of that corpus where both resolve they
+ * agree verbatim — and it stayed resolvable on every boundary whose stamped
+ * link did not, so it only ever fills a gap. Keeping it last is deliberate:
+ * should the two ever disagree, the CLI's own stamped link wins rather than a
+ * tail that might name a branch the compaction did not follow (no such case in
+ * that corpus, where both orders score identically).
+ *
+ * Rows other than a boundary carry neither of the extra candidates, so for them
+ * this is the plain `parentUuid` lookup it replaces.
+ */
+function displayParentOf(
+  entry: RawTranscriptEntry,
+  byUuid: Map<string, RawTranscriptEntry>,
+): RawTranscriptEntry | undefined {
+  const candidates = [
+    entry.parentUuid,
+    entry.logicalParentUuid,
+    entry.compactMetadata?.preservedSegment?.tailUuid,
+  ];
+  for (const uuid of candidates) {
+    if (typeof uuid !== "string") continue;
+    const parent = byUuid.get(uuid);
+    if (parent !== undefined) return parent;
+  }
+  return undefined;
+}
+
+/**
  * Rebuild the FULL display history of a transcript that contains compaction
  * boundaries. The SDK's `getSessionMessages` reconstructs the *effective
  * context* by walking `parentUuid` links from the newest leaf — a
  * `compact_boundary` carries `parentUuid: null`, so everything before the
  * compaction is unreachable and a reloaded session appears to start at the
- * summary. This walk bridges each boundary through its `logicalParentUuid`,
+ * summary. This walk bridges each boundary through the link the CLI recorded
+ * for it — `logicalParentUuid`, or the compaction's preserved-segment tail when
+ * that field does not name a row in the file (see {@link displayParentOf}) —
  * recovering the pre-compaction history for display.
  *
  * Walking the parent chain (rather than taking raw file order) keeps abandoned
@@ -186,10 +236,7 @@ export function rebuildTranscriptDisplayChain(
   while (cursor !== undefined && !seen.has(cursor.uuid)) {
     seen.add(cursor.uuid);
     chain.push(cursor);
-    // Bridge severed boundaries: `parentUuid ?? logicalParentUuid` falls
-    // through to the logical link exactly when the physical one is null.
-    const parent: string | null | undefined = cursor.parentUuid ?? cursor.logicalParentUuid;
-    cursor = parent != null ? byUuid.get(parent) : undefined;
+    cursor = displayParentOf(cursor, byUuid);
   }
   chain.reverse();
 

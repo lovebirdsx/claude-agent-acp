@@ -22518,7 +22518,13 @@ describe("replaySessionHistory across compaction (full transcript replay)", () =
     return JSON.stringify(obj);
   }
 
-  async function writeCompactedTranscript() {
+  async function writeCompactedTranscript(
+    boundary: Record<string, unknown> = {
+      parentUuid: null,
+      logicalParentUuid: "a1",
+      compactMetadata: { trigger: "auto", preTokens: 100000 },
+    },
+  ) {
     const content =
       [
         line({
@@ -22541,9 +22547,7 @@ describe("replaySessionHistory across compaction (full transcript replay)", () =
           type: "system",
           subtype: "compact_boundary",
           uuid: "cb",
-          parentUuid: null,
-          logicalParentUuid: "a1",
-          compactMetadata: { trigger: "auto", preTokens: 100000 },
+          ...boundary,
         }),
         line({
           type: "user",
@@ -22590,6 +22594,34 @@ describe("replaySessionHistory across compaction (full transcript replay)", () =
       { kind: "agent", text: "second answer" },
     ]);
     // The full-chain path never consults the SDK's effective chain.
+    expect(getSessionMessages).not.toHaveBeenCalled();
+  });
+
+  // Real-corpus shape: the CLI stamped a display-order link no row carries (or
+  // null) and only `compactMetadata.preservedSegment.tailUuid` still names the
+  // last pre-compaction entry. The walk used to stop at that boundary, so a
+  // reloaded session replayed post-compaction history only.
+  it("bridges a boundary whose logicalParentUuid names no row via the preserved-segment tail", async () => {
+    await writeCompactedTranscript({
+      parentUuid: null,
+      logicalParentUuid: "ghost-absent-from-file",
+      compactMetadata: {
+        trigger: "auto",
+        preTokens: 100000,
+        preservedSegment: { tailUuid: "a1" },
+      },
+    });
+    const { agent, events } = createRecordingAgent();
+
+    await (agent as any).replaySessionHistory(sessionId);
+
+    expect(events).toEqual([
+      { kind: "user", text: "first question" },
+      { kind: "agent", text: "first answer" },
+      { kind: "compaction", phase: "success" },
+      { kind: "user", text: "second question" },
+      { kind: "agent", text: "second answer" },
+    ]);
     expect(getSessionMessages).not.toHaveBeenCalled();
   });
 
