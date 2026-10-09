@@ -9,11 +9,12 @@
 
 本 fork **独立维护**：产品行为契约由本仓库定义，上游变更按需**选择性吸收**（不再以 rebase / 保 diff 最小为目标）。改动满足「分块、单一职责、可验证」即可，不追求与上游代码形状一致：
 
-- **沿用本仓库风格**（`.prettierrc.json` = `printWidth:100 + tabWidth:2` + **分号 + 双引号**；`eslint.config.js`），与父项目 universe-editor（**无分号 + 单引号**）不同；**禁止无关格式化**。
-- **当心父项目工具链的自动格式化**：父项目根 `.prettierrc` 会把本目录 `.ts` 按无分号 + 单引号重排、瞬间产生上千行无关改动。用最小化精确 `Edit`，改完**立即检查 `git -C vendor/claude-agent-acp diff`**，发现整文件被重排立刻 `git checkout` 还原。
+- **沿用本仓库风格**（`.prettierrc.json` = `printWidth:100 + tabWidth:2` + **分号 + 双引号**；`eslint.config.js`），与父项目（**无分号 + 单引号**）不同；**禁止无关格式化**。
+- **当心父项目工具链的自动格式化**：父项目根 `.prettierrc` 会把本目录 `.ts` 整文件重排（上千行无关改动）。用最小化精确 `Edit`，改完**立即检查 `git -C vendor/claude-agent-acp diff`**，发现被重排立刻 `git checkout` 还原。
+- **提交前跑 `npm run check`**（lint + format:check）：CI 第 3 步即 format:check，漏跑直接红。
 - **分块、单一职责**：一次只解决一个行为问题；纯历史解析 / SDK·CLI 边界 / 生命周期编排各自成块，不夹带依赖升级或上游同步。优先落新文件，避免把逻辑堆进 `acp-agent.ts`（对齐 `interactive.ts` / `extra-models.ts` 的拆分）。
 - **可验证**：每个行为变更配走**生产入口**（真实 `session/load`、`unstable_forkSession` 等）的测试，且测试能抓错（改动被破坏时应变红），不能只断言函数 / 字段存在。
-- **复现 fork 问题前先隔离环境**：在父项目会话里跑的 shell 会带 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` 等变量，fork 单测会被它们污染（provider 相关用例把真实网关当成 native 路由而假红）。跑单测用 `env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN npx vitest run`；实测问题优先起独立 `node` 探针（不经父项目），并给 `CLAUDE_AGENT_LOGS=<dir>` 拿 fork 的分阶段日志。
+- **复现 fork 问题前先隔离环境**：在父项目会话里跑的 shell 会带 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` 等变量，fork 单测会被它们污染（provider 用例把真实网关当成 native 路由而假红）。跑单测用 `env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN npx vitest run`；实测问题优先起独立 `node` 探针（不经父项目），并给 `CLAUDE_AGENT_LOGS=<dir>` 拿 fork 的分阶段日志。
 
 长机制、基线台账、功能契约表与上游评估记录见父项目 `docs/development/claude-agent-maintenance.md`。
 
@@ -38,13 +39,13 @@
 - **resume 回放恢复子代理用量 stats**（`tools.ts` `acp-agent.ts`）：回放结束异步从 transcript 逐轮累计重建，补发 `_meta._universe/subagentStats`。**勿用 sidecar 自带 `usage`/`totalTokens`——只覆盖最后一次 API 调用，低估几十倍**。详见 [cases-subagent.md](cases-subagent.md)
 - **子代理 usage 按 message.id 去重 + live Task 完成时 transcript restamp**（`tools.ts` `acp-agent.ts`）：每帧 usage 是**快照非增量**，同 message.id 新快照替换旧贡献。详见 [cases-subagent.md](cases-subagent.md)
 - **会话后台活跃度通知**（`acp-agent.ts`）：`BACKGROUND_ACTIVITY_METHOD = "_universe/background_activity"`，params `{sessionId, backgroundTasks, autonomousTurn}`；解决 run_in_background 任务存活期间 editor 误判会话已结束；值变化去重 + load\|resume 补发
-- _*resume 重放恢复 Task* 计划 + CLI 2.1.287 起的任务工具 opt-in_*（`tools.ts` `acp-agent.ts`）：headless 的结构化数据在消息级 `tool_use_result` sidecar；TaskCreate 优先 sidecar 否则散文正则兜底；TaskUpdate 对未见 taskId 建占位条目。CLI 2.1.287 把任务工具门控在 `CLAUDE_CODE_ENABLE_TODO_TOOLS` 后（主循环模型名非第一方规范名即不暴露，网关路由常态），fork 默认注入 `1`（host/caller/settings.json env 显式设置让位；值走 CLI bool schema：1/true/yes/on 真）；缺它则不发 plan、plan 卡片空白
+- **resume 重放恢复 Task 计划 + CLI 2.1.287 起的任务工具 opt-in**（`tools.ts` `acp-agent.ts`）：headless 的结构化数据在消息级 `tool_use_result` sidecar；TaskCreate 优先 sidecar 否则散文正则兜底；TaskUpdate 对未见 taskId 建占位条目。CLI 2.1.287 把任务工具门控在 `CLAUDE_CODE_ENABLE_TODO_TOOLS` 后（主循环模型名非第一方规范名即不暴露，网关路由常态），fork 默认注入 `1`（host/caller/settings.json env 显式设置让位；值走 CLI bool schema：1/true/yes/on 真）；缺它则不发 plan、plan 卡片空白
 - **resume reassert 编辑器记忆的会话模型**（`acp-agent.ts`）：transcript 恢复裸模型名丢 `[1m]` 后缀（窗口 1M 退化 200k）；editor 捎 `_meta.claudeCode.resumeModel`，优先级 env > resumeModel > settings.model，命中走既有 reassert-override
-- **其余小改（一行清单，条目按中文提交信息识别）**（`acp-agent.ts` 等）：恢复已压缩会话重建完整显示历史（fullChain 优先于 resumedMessages；边界父链退到 preservedSegment.tailUuid 兜底）；compact 卡改结构化通知（`_universe/compaction`）；resume 模型同步 CLI 往返移出关键路径；reapplyRuntimeConfig 判别联合修 typecheck；ExitPlanMode 拒绝透传用户反馈；修 rewind 后模型/effort 丢失；修新建 session 上下文窗口计算；**rewind / fork 支持**（本地最大单笔 +726 行；分叉点解析改走磁盘、失败即报错，详见 [cases-session.md](cases-session.md)）；修 thinking_delta 空值检查；**持久化会话标题**（backing `renameSession`）；会话列表携带 git 分支（`SessionInfo._meta.gitBranch`）；Explore 子代理结果持久化；修 electron-builder ESM 加载；工具调用错误上下文增强；listSessions 用最后真实消息时间戳；**AskUserQuestion 工具调用**（`ASK_USER_QUESTION_METHOD`，`interactive.ts`(新)）；**esbuild 单文件构建 + 二进制 env 注入**（`esbuild.config.mjs`(新)，产物 `dist/index.js` 供父项目 `ELECTRON_RUN_AS_NODE` 启动；meta 另采样本机二进制的 `cliVersion`）
+- **其余小改（按中文提交信息识别）**（`acp-agent.ts` 等）：恢复已压缩会话重建完整显示历史（fullChain 优先于 resumedMessages；边界父链退到 preservedSegment.tailUuid 兜底）；compact 卡改结构化通知（`_universe/compaction`）；resume 模型同步 CLI 往返移出关键路径；reapplyRuntimeConfig 判别联合修 typecheck；ExitPlanMode 拒绝透传用户反馈；修 rewind 后模型/effort 丢失；修新建 session 上下文窗口计算；**rewind / fork 支持**（分叉点解析改走磁盘、失败即报错，详见 [cases-session.md](cases-session.md)）；修 thinking_delta 空值检查；**持久化会话标题**（backing `renameSession`）；会话列表携带 git 分支（`SessionInfo._meta.gitBranch`）；Explore 子代理结果持久化；修 electron-builder ESM 加载；工具调用错误上下文增强；listSessions 用最后真实消息时间戳；**AskUserQuestion 工具调用**（`ASK_USER_QUESTION_METHOD`，`interactive.ts`(新)）；**esbuild 单文件构建 + 二进制 env 注入**（`esbuild.config.mjs`(新)，产物 `dist/index.js` 供父项目 `ELECTRON_RUN_AS_NODE` 启动；meta 另采样本机二进制的 `cliVersion`）
 
 另有 ext-notification `_claude/sdkMessage`（原始 SDK 消息旁路，供父项目重建连接快照）也是本地印章。
 
-**已被上游实现、fork 不再保留的本地改动**（判据与保留测试详见 [cases-session.md](cases-session.md)）：AskUserQuestion「选项+备注共存」（a44c486 起 `applyAskElicitationResponse` 已实现，勿重新加回）；回放隐藏 harness 投递的 `user` 行（上游 `taskNotificationsOf` + `isTaskNotificationRecord` 整行隐藏即可；带 `subkind` 的投递是**真实 prompt**，必须显示）；每 turn / compact_boundary 的 `getContextUsage` 刷新移除（上游已不在 result 处刷新，compact 改用 `compact_metadata.post_tokens`）。
+**已被上游实现、fork 不再保留的本地改动**（判据与保留测试详见 [cases-session.md](cases-session.md)）：AskUserQuestion「选项+备注共存」（a44c486 起 `applyAskElicitationResponse` 已实现，勿重新加回）；回放隐藏 harness 投递的 `user` 行（上游 `taskNotificationsOf` + `isTaskNotificationRecord` 整行隐藏；带 `subkind` 的投递是**真实 prompt**，必须显示）；每 turn / compact_boundary 的 `getContextUsage` 刷新移除（上游已不在 result 处刷新，compact 改用 `compact_metadata.post_tokens`）。
 
 ## 七个自定义 ext-method / notification 名（须与父项目 editor 侧 `acpExtMethods.ts` 逐字一致）
 

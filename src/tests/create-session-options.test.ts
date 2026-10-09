@@ -423,10 +423,7 @@ describe("createSession options merging", () => {
   it("respects a CLAUDE_CODE_ENABLE_TODO_TOOLS the user set in settings.json", async () => {
     vi.stubEnv("CLAUDE_CODE_ENABLE_TODO_TOOLS", "");
     const userSettings = path.join(emptyConfigDir, "settings.json");
-    fs.writeFileSync(
-      userSettings,
-      JSON.stringify({ env: { CLAUDE_CODE_ENABLE_TODO_TOOLS: "0" } }),
-    );
+    fs.writeFileSync(userSettings, JSON.stringify({ env: { CLAUDE_CODE_ENABLE_TODO_TOOLS: "0" } }));
     try {
       await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
