@@ -4155,7 +4155,10 @@ export class ClaudeAcpAgent {
     // the editor's `_universe/compaction` card is replaced in place with the
     // terminal phase (see COMPACTION_METHOD). It doubles as the in-progress
     // guard: the SDK emits a failed compaction's terminal `status` twice, and
-    // the duplicate must not re-emit the card.
+    // the CLI re-sends the opening `compacting` status every 30s while the same
+    // compaction runs — neither duplicate may re-emit the card. Any `status`
+    // frame that ends the compaction clears it, result or not; a
+    // `compact_boundary` deliberately does not (see the status case).
     let currentCompactionId: string | undefined;
     // Anthropic API message id of the assistant message currently being
     // streamed, captured from `message_start` so the streamed chunks that follow
@@ -5309,13 +5312,20 @@ export class ClaudeAcpAgent {
                   // a stable id, so the in-progress card is settled in place
                   // (see COMPACTION_METHOD). The ACP `compaction_update` /
                   // legacy tool-call presentations stay upstream's (see
-                  // ContextCompactionLifecycle).
-                  currentCompactionId = randomUUID();
-                  await this.client.extNotification(COMPACTION_METHOD, {
-                    sessionId: message.session_id,
-                    id: currentCompactionId,
-                    phase: "start",
-                  } satisfies CompactionNotification);
+                  // ContextCompactionLifecycle). The CLI re-sends this frame
+                  // every 30s while the SAME compaction runs, so only the
+                  // opening frame may mint an id: a fresh id mid-run restarts
+                  // the editor's card stopwatch and progress bar.
+                  if (currentCompactionId === undefined) {
+                    currentCompactionId = randomUUID();
+                    await this.client.extNotification(COMPACTION_METHOD, {
+                      sessionId: message.session_id,
+                      id: currentCompactionId,
+                      phase: "start",
+                    } satisfies CompactionNotification);
+                  }
+                  // The ACP lifecycle keeps its own de-dupe while its entity is
+                  // not terminal, so this call stays unconditional.
                   await compaction.start(message.uuid);
                 } else if (message.compact_result === "success") {
                   await compaction.finish(message.uuid, "completed");
@@ -5340,6 +5350,13 @@ export class ClaudeAcpAgent {
                     } satisfies CompactionNotification);
                     currentCompactionId = undefined;
                   }
+                } else if (message.status === null && message.permissionMode === undefined) {
+                  // A compaction can also end without a result (hookBlocked, a
+                  // discarded precompute) and nothing else clears the marker,
+                  // which would swallow the same turn's next start. A
+                  // permission-mode switch also reports `status: null` (plus
+                  // `permissionMode`) and is NOT a compaction end.
+                  currentCompactionId = undefined;
                 }
                 break;
               }

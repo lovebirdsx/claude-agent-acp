@@ -97,3 +97,21 @@ CLI 的 first-party 家族改写会把内置 Explore 子 agent 从网关模型�
 配套测试 `tests/acp-agent.test.ts` 的 `describe("unstable_forkSession fork point (excludes anchored user turn)")`：resident 命中（live 表）／非 resident 磁盘兜底／折叠 prompt 命中／两个 reject（锚点不存在、锚点为首条）各一例，reject 用例额外断言 `forkSession` 未被调用。
 
 **真实 SDK 行为（`tests/fork-session-sdk.test.ts`，真实 `forkSession` / `getSessionMessages` 文件操作，8/8 通过）**：`forkSession` 把保留行的 `uuid` / `parentUuid` 重映射为新 uuid（parent 链不悬挂）、丢弃 progress / sidechain 行；但 **folded attachment 行本身、以及它的 `attachment.source_uuid`（客户端 prompt id）原样保留**——回放正是靠这个 id 重新锚定。`compact_boundary` 的 `logicalParentUuid` 也重映射到新的压缩前 uuid，显示链因此穿过边界。**勿把这里写成「raw uuid / `source_uuid` 全被重映射」**——`source_uuid` 恰恰被保留。
+
+## 压缩卡片 30s 心跳去重（`_universe/compaction` 只在压缩真正开始时发一条 start）
+
+**症状**：编辑器的上下文压缩卡片（`CompactionCard`，进度条 + 秒表）在长压缩里「进度条走满（99%）→ 秒表归零、进度条从 0 重走」，而压缩实际尚未结束。
+
+**根因**：CLI 在压缩进行期间**每 30 秒**重发一次心跳帧 `{type:"sdk_status",status:"compacting"}`（二进制证据：`var Gwo=30000; function QB(e){let n=setInterval(zwo,Gwo,e);...} function zwo(e){SGo(),e?.({type:"sdk_status",status:"compacting"})}`；挂载四条路径：reactive auto-compact、手动 `/compact`、precompute、retry），SDK 把它翻成 `{type:"system",subtype:"status",status:"compacting"}`。`acp-agent.ts` 的 `case "status"` 原实现对**每一帧**都铸新 uuid 并发 `phase:"start"`——编辑器只能把新 id 当成一次新压缩（新 id 合并 running 孤儿槽并重打 `startedAt`），于是每 30s 重置一次卡片。注意 ACP 层 `ContextCompactionLifecycle.start()` 自带去重（其实体未达终态时直接 return），漏的只有 fork 私有的这条 ext 通道。
+
+**修法**：`currentCompactionId !== undefined` 时视为同一压缩的心跳——不铸 id、不发 `start`（仍调 `compaction.start(message.uuid)`：ACP 层在其实体未达终态时自行去重，实体被 boundary 收尾后重开属既有行为，非本次引入）。同时补一条兜底清标记：`message.status === null && message.permissionMode === undefined` 时置 `undefined`。
+
+**为什么需要兜底**：CLI 有不带 `compact_result` 的结束帧——reactive 的 hookBlocked，以及**作废 precompute 的收尾**（同一函数里 `emittedEarlyCompactStart` 为真时补发 `compact_end` + 裸 `status:null`；该变量来自 `{…emittedEarlyCompactStart:ht} = yield* mHt(…)` 的解构，别被别处同名的混淆局部变量误导）。既有两个分支都不会清标记，标记陈旧时会**吞掉同 turn 下一次压缩的 start**（卡片不出现）。
+
+**为什么 `permissionMode` 守卫不能省**：权限模式切换帧也带 `status:null`（二进制 `outbound.enqueue({type:"system",subtype:"status",status:null,permissionMode:n,...})`；SDK 类型 `SDKStatusMessage.permissionMode?: PermissionMode`）。用户切 plan / acceptEdits 时若压缩正在进行，误清标记会让下一条心跳重铸 id——bug 在更窄窗口内复发，测试 `does not read a permission-mode status frame as a compaction end` 钉住该判据。
+
+**为什么不在 `compact_boundary` 里清标记（勿"顺手补上"）**：流里可见的 boundary 都排在终态帧之后（清它是 no-op）；而 retry 路径上一次尝试的 boundary 可能插在 retry 的 `compacting` 与其终态之间，清了反而制造一次秒表重开。测试 `keeps the in-flight marker across a compact_boundary` 专门钉住这条约束。真出现「只有 boundary、无任何 ending status」的路径时，标记由下一次 turn 激活的 `resetTurnScratch()` 兜底清掉——代价是该 turn 少一张卡，不是卡死。
+
+**残余风险（勿写成"彻底解决"）**：① 若存在只发 `compacting`、不发任何终结帧的 CLI 路径（本 build 的站点枚举里没有），标记陈旧到下一次 turn 激活；② precompute 与 retry 心跳真并发时可能多一次秒表重开（该 build 不可达）；③ 新 turn 的 `resetTurnScratch()` 在交错时序下可能清掉刚置的标记（一次重开，不改 turn 机制）。
+
+配套测试 `tests/acp-agent.test.ts`（6 例）：心跳折叠（三个不同 uuid 只出 `[start, success]`）、同 turn 两轮压缩各发一条 start（防**过度**去重）、无 result 结束后下一次 start 不被吞、`permissionMode` 帧不当作结束、`requesting` 帧（每 turn 的 `stream_request_start`）不当作结束、`compact_boundary` 不清标记（防"顺手补上"）。**负向验证**（每条判据都有用例钉住，改坏即红）：只做去重不加兜底 → 「无 result 结束后可再 start」失败；兜底漏 `permissionMode` 守卫 → 「`permissionMode` 帧不是结束」失败；兜底漏 `status === null` 检查（写成无条件 else）→ 「`permissionMode`」「`requesting`」两例**同时**失败；在 boundary 分支补清标记 → 「`compact_boundary` 不清标记」失败。

@@ -648,7 +648,8 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     });
     // The fork also surfaces the lifecycle as structured `_universe/compaction`
     // extension notifications (start → success), not plain-text chunks, so the
-    // editor can render a dedicated status card. Both phases must share one id.
+    // editor can render a dedicated status card. Both phases must share one id,
+    // and a compaction outliving the CLI's 30s heartbeat must not add any more.
     const phases = client.compactionNotifications;
     expect(phases.map((n) => n.phase)).toEqual(["start", "success"]);
     expect(phases[0].id).toBe(phases[1].id);
@@ -12054,14 +12055,19 @@ describe("assembled assistant text fallback", () => {
 
   function createMockAgentWithCapture() {
     const updates: any[] = [];
+    // Records the fork's `_universe/compaction` extension notifications so a
+    // test can assert the card lifecycle the editor receives.
+    const extNotifications: { method: string; params: any }[] = [];
     const mockClient = {
       sessionUpdate: async (notification: any) => {
         updates.push(notification);
       },
-      extNotification: async () => {},
+      extNotification: async (method: string, params: any) => {
+        extNotifications.push({ method, params });
+      },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    return { agent, updates };
+    return { agent, updates, extNotifications };
   }
 
   function messageStart(apiId: string) {
@@ -12910,6 +12916,46 @@ describe("assembled assistant text fallback", () => {
       .filter((update) => update.sessionUpdate === "compaction_update");
   }
 
+  function compactionNotices(extNotifications: { method: string; params: any }[]) {
+    return extNotifications
+      .filter((notification) => notification.method === COMPACTION_METHOD)
+      .map((notification) => notification.params as { id: string; phase: string; reason?: string });
+  }
+
+  /** A compaction ending with no result: hookBlocked, a discarded precompute, or compact_end. */
+  function compactionEndWithoutResult(uuid: string) {
+    return {
+      type: "system",
+      subtype: "status",
+      status: null,
+      uuid,
+      session_id: "test-session",
+    };
+  }
+
+  /** A permission-mode switch also reports `status: null`, but is not a compaction end. */
+  function permissionModeStatus(uuid: string, permissionMode = "plan") {
+    return {
+      type: "system",
+      subtype: "status",
+      status: null,
+      permissionMode,
+      uuid,
+      session_id: "test-session",
+    };
+  }
+
+  /** A `requesting` status (stream_request_start) is neither a start nor an end. */
+  function requestingStatus(uuid: string) {
+    return {
+      type: "system",
+      subtype: "status",
+      status: "requesting",
+      uuid,
+      session_id: "test-session",
+    };
+  }
+
   function hasSyntheticCompactionToolCall(updates: any[]) {
     return updates
       .map((notification) => notification.update)
@@ -13496,6 +13542,135 @@ describe("assembled assistant text fallback", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "continue" }] });
 
     expect(messageChunkTexts(updates)).toEqual(["final answer"]);
+  });
+
+  it("collapses the compacting heartbeats of one compaction into a single start", async () => {
+    const { agent, extNotifications } = createMockAgentWithCapture();
+    injectSession(agent, [
+      compactingStatus("compact-start"),
+      // The CLI re-sends its `compacting` status every 30s while the same
+      // compaction runs, and each frame carries a fresh uuid.
+      compactingStatus("compact-heartbeat-1"),
+      compactingStatus("compact-heartbeat-2"),
+      compactResult("success", "compact-completed"),
+      replayedResult("conversation summarized"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "continue" }] });
+
+    const notices = compactionNotices(extNotifications);
+    expect(notices.map((notice) => notice.phase)).toEqual(["start", "success"]);
+    expect(notices[0].id).toBe(notices[1].id);
+  });
+
+  it("opens a second card for a second compaction in the same turn", async () => {
+    const { agent, extNotifications } = createMockAgentWithCapture();
+    injectSession(agent, [
+      compactingStatus("compact-start-1"),
+      compactResult("success", "compact-completed-1"),
+      compactingStatus("compact-start-2"),
+      compactResult("success", "compact-completed-2"),
+      replayedResult("conversation summarized"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "continue" }] });
+
+    const notices = compactionNotices(extNotifications);
+    expect(notices.map((notice) => notice.phase)).toEqual(["start", "success", "start", "success"]);
+    expect(notices[1].id).toBe(notices[0].id);
+    expect(notices[3].id).toBe(notices[2].id);
+    expect(notices[2].id).not.toBe(notices[0].id);
+  });
+
+  it("lets the next compaction open a card after an end frame that carries no result", async () => {
+    const { agent, extNotifications } = createMockAgentWithCapture();
+    injectSession(agent, [
+      compactingStatus("compact-blocked-start"),
+      compactionEndWithoutResult("compact-blocked-end"),
+      compactingStatus("compact-next-start"),
+      compactResult("success", "compact-next-completed"),
+      replayedResult("conversation summarized"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "continue" }] });
+
+    const notices = compactionNotices(extNotifications);
+    expect(notices.map((notice) => notice.phase)).toEqual(["start", "start", "success"]);
+    expect(notices[2].id).toBe(notices[1].id);
+    expect(notices[1].id).not.toBe(notices[0].id);
+  });
+
+  it("does not read a permission-mode status frame as a compaction end", async () => {
+    const { agent, extNotifications } = createMockAgentWithCapture();
+    injectSession(agent, [
+      compactingStatus("compact-start"),
+      permissionModeStatus("mode-switch"),
+      compactingStatus("compact-heartbeat"),
+      compactResult("success", "compact-completed"),
+      replayedResult("conversation summarized"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "continue" }] });
+
+    const notices = compactionNotices(extNotifications);
+    expect(notices.map((notice) => notice.phase)).toEqual(["start", "success"]);
+    expect(notices[0].id).toBe(notices[1].id);
+  });
+
+  it("does not read a stream-request status frame as a compaction end", async () => {
+    const { agent, extNotifications } = createMockAgentWithCapture();
+    injectSession(agent, [
+      compactingStatus("compact-start"),
+      // Every turn's `stream_request_start` reports `requesting` — clearing the
+      // marker on it would restart the card on the next heartbeat.
+      requestingStatus("stream-request"),
+      compactingStatus("compact-heartbeat"),
+      compactResult("success", "compact-completed"),
+      replayedResult("conversation summarized"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "continue" }] });
+
+    const notices = compactionNotices(extNotifications);
+    expect(notices.map((notice) => notice.phase)).toEqual(["start", "success"]);
+    expect(notices[0].id).toBe(notices[1].id);
+  });
+
+  it("keeps the in-flight marker across a compact_boundary", async () => {
+    const { agent, extNotifications } = createMockAgentWithCapture();
+    injectSession(agent, [
+      compactingStatus("compact-start"),
+      // The boundary enriches the card but must NOT clear the marker: a retried
+      // compaction's boundary can land between its `compacting` and its
+      // terminal status, and clearing here would restart the card.
+      {
+        type: "system",
+        subtype: "compact_boundary",
+        uuid: "compact-boundary",
+        session_id: "test-session",
+        compact_metadata: {
+          trigger: "auto",
+          pre_tokens: 180000,
+          post_tokens: 12345,
+          duration_ms: 2500,
+        },
+      },
+      compactingStatus("compact-heartbeat"),
+      compactResult("success", "compact-completed"),
+      replayedResult("conversation summarized"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "continue" }] });
+
+    const notices = compactionNotices(extNotifications);
+    expect(notices.map((notice) => notice.phase)).toEqual(["start", "success"]);
+    expect(notices[0].id).toBe(notices[1].id);
   });
 
   it("emits a completed compaction tool call for a terminal-only result", async () => {
