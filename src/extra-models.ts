@@ -1,4 +1,4 @@
-import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
+import type { ModelInfo, Settings } from "@anthropic-ai/claude-agent-sdk";
 
 /**
  * Fork-only extension (not upstream): let the ACP client append extra model ids
@@ -24,6 +24,21 @@ import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
  * tokenized fallback, which would otherwise match the bare entry and silently
  * shrink the effective context window.
  */
+
+/** 同步客户端声明到 CLI 目录，避免切换时额外发起限时 5 秒的模型探测。 */
+export function appendExtraModelPicker(
+  picker: Settings["modelPicker"],
+  extras: string[],
+): NonNullable<Settings["modelPicker"]> {
+  const options = [...(picker?.options ?? [])];
+  const seen = new Set(options.map((option) => option.model.trim()));
+  for (const model of extras) {
+    if (seen.has(model)) continue;
+    seen.add(model);
+    options.push({ model });
+  }
+  return { ...picker, options };
+}
 
 /** Upper bound mirroring the client's own cap; a malformed payload cannot bloat the catalogue. */
 const MAX_EXTRA_MODELS = 64;

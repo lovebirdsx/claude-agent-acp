@@ -171,6 +171,7 @@ import { SettingsManager } from "./settings.js";
 import { resolveSubagentModelEnv } from "./subagent-model.js";
 import {
   appendExtraModelInfos,
+  appendExtraModelPicker,
   readExtraModelEffortMeta,
   readExtraModelsMeta,
 } from "./extra-models.js";
@@ -8265,6 +8266,12 @@ export class ClaudeAcpAgent {
             "model is not available in this session",
           );
         }
+        if (refusal === "validation_incomplete") {
+          throw RequestError.internalError(
+            errorKindData("unknown"),
+            "Model validation could not complete. Check the provider connection and try again; the model was not changed.",
+          );
+        }
         throw RequestError.internalError(errorKindData("unknown"));
       }
     }
@@ -10968,8 +10975,25 @@ export class ClaudeAcpAgent {
     // an active ACP route in the programmatic settings tier too so user/project
     // settings cannot silently restore a different ANTHROPIC_BASE_URL.
     let settings = configuredSettings;
+    const extraModels = readExtraModelsMeta(params._meta) ?? [];
+    if (extraModels.length > 0) {
+      const userPicker =
+        userProvidedOptions?.settingSources?.includes("user") !== false
+          ? settingsManager.getUserModelPicker()
+          : undefined;
+      settings = {
+        ...configuredSettingsObject,
+        modelPicker: appendExtraModelPicker(
+          configuredSettingsObject?.modelPicker ?? userPicker,
+          extraModels,
+        ),
+      };
+      this.logger.log(
+        `[session/models] phase=configure-cli-picker extraModels=${extraModels.length}`,
+      );
+    }
     if (resolvedProvider) {
-      const baseSettings = configuredSettingsObject;
+      const baseSettings = typeof settings === "string" ? configuredSettingsObject : settings;
       settings = {
         ...baseSettings,
         apiKeyHelper: "",

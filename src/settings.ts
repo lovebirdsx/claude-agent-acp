@@ -50,6 +50,7 @@ export class SettingsManager {
   private cwd: string;
   private effective: Settings = {};
   private managedDeniedModels: string[] = [];
+  private userModelPicker: Settings["modelPicker"];
   private watchers: fs.FSWatcher[] = [];
   private onChange?: () => void;
   private logger: { log: (...args: any[]) => void; error: (...args: any[]) => void };
@@ -107,6 +108,9 @@ export class SettingsManager {
     try {
       const resolved = await resolveSettings({ cwd: this.cwd });
       this.effective = filterEscalatingDefaultMode(resolved);
+      // CLI 不信任项目层的 modelPicker，不能把合并后的目录提升到 SDK settings。
+      this.userModelPicker = resolved.sources.find((entry) => entry.source === "user")?.settings
+        .modelPicker;
       // The CLI reads `deniedModels` from managed settings only.
       this.managedDeniedModels = resolved.sources
         .filter((entry) => entry.source === "managed")
@@ -115,6 +119,7 @@ export class SettingsManager {
       this.logger.error("Failed to resolve settings:", error);
       this.effective = {};
       this.managedDeniedModels = [];
+      this.userModelPicker = undefined;
     }
   }
 
@@ -170,9 +175,11 @@ export class SettingsManager {
     }, 100);
   }
 
-  /**
-   * Returns the current merged settings
-   */
+  getUserModelPicker(): Settings["modelPicker"] {
+    return this.userModelPicker;
+  }
+
+  /** 返回当前合并后的设置。 */
   getSettings(): Settings {
     return this.effective;
   }

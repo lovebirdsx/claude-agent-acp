@@ -132,6 +132,113 @@ describe("createSession options merging", () => {
     vi.unstubAllEnvs();
   });
 
+  describe("客户端模型目录同步", () => {
+    const model = "acme-slow[1m]";
+
+    it("新建与恢复会话把 extraModels 逐字追加到 CLI modelPicker", async () => {
+      const params = {
+        cwd: emptyConfigDir,
+        mcpServers: [],
+        _meta: { extraModels: [model, "acme-other[1m]", model] },
+      };
+      const { sessionId } = await agent.newSession(params);
+      const expected = { options: [{ model }, { model: "acme-other[1m]" }] };
+      expect(capturedOptions?.settings).toEqual({ modelPicker: expected });
+      for (const method of ["loadSession", "resumeSession"] as const) {
+        const previousOptions = capturedOptions;
+        const resumedModel = `acme-${method}[1m]`;
+        await agent[method]({
+          ...params,
+          sessionId,
+          _meta: { extraModels: [model, resumedModel] },
+        });
+        expect(capturedOptions).not.toBe(previousOptions);
+        expect(capturedOptions?.resume).toBe(sessionId);
+        expect(capturedOptions?.settings).toEqual({
+          modelPicker: { options: [{ model }, { model: resumedModel }] },
+        });
+      }
+    });
+
+    it.each([false, true])("保留调用方目录与其它设置（文件形式=%s）", async (asFile) => {
+      const settings = {
+        useAutoModeDuringPlan: true,
+        availableModels: [model],
+        modelPicker: {
+          replaceBuiltInOptions: true,
+          options: [{ model, label: "自定义标签" }],
+        },
+      };
+      const file = path.join(emptyConfigDir, "caller.json");
+      if (asFile) await fs.promises.writeFile(file, JSON.stringify(settings));
+      await agent.newSession({
+        cwd: emptyConfigDir,
+        mcpServers: [],
+        _meta: {
+          extraModels: [model, "acme-other[1m]"],
+          claudeCode: { options: { settings: asFile ? file : settings } },
+        },
+      });
+      expect(capturedOptions?.settings).toEqual({
+        ...settings,
+        modelPicker: {
+          ...settings.modelPicker,
+          options: [...settings.modelPicker.options, { model: "acme-other[1m]" }],
+        },
+      });
+      if (asFile) expect(JSON.parse(await fs.promises.readFile(file, "utf8"))).toEqual(settings);
+    });
+
+    it("保留用户目录但不把项目目录提升到受信任设置层", async () => {
+      await fs.promises.writeFile(
+        path.join(emptyConfigDir, "settings.json"),
+        JSON.stringify({ modelPicker: { options: [{ model: "acme-user", label: "用户模型" }] } }),
+      );
+      const cwd = path.join(emptyConfigDir, "workspace");
+      await fs.promises.mkdir(path.join(cwd, ".claude"), { recursive: true });
+      await fs.promises.writeFile(
+        path.join(cwd, ".claude", "settings.json"),
+        JSON.stringify({ modelPicker: { options: [{ model: "acme-project" }] } }),
+      );
+      await agent.newSession({ cwd, mcpServers: [], _meta: { extraModels: [model] } });
+      expect(capturedOptions?.settings).toEqual({
+        modelPicker: { options: [{ model: "acme-user", label: "用户模型" }, { model }] },
+      });
+    });
+
+    it("provider 路由覆盖仍保留 CLI 模型目录", async () => {
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example.com",
+        headers: {},
+      });
+      await agent.newSession({
+        cwd: emptyConfigDir,
+        mcpServers: [],
+        _meta: { extraModels: [model] },
+      });
+      expect(capturedOptions?.settings).toMatchObject({
+        modelPicker: { options: [{ model }] },
+        apiKeyHelper: "",
+        env: { ANTHROPIC_BASE_URL: "https://gateway.example.com" },
+      });
+    });
+
+    it("禁用用户设置时不继承用户目录", async () => {
+      await fs.promises.writeFile(
+        path.join(emptyConfigDir, "settings.json"),
+        JSON.stringify({ modelPicker: { options: [{ model: "acme-user" }] } }),
+      );
+      await agent.newSession({
+        cwd: emptyConfigDir,
+        mcpServers: [],
+        _meta: { extraModels: [model], claudeCode: { options: { settingSources: [] } } },
+      });
+      expect(capturedOptions?.settings).toEqual({ modelPicker: { options: [{ model }] } });
+    });
+  });
+
   for (const method of ["resumeSession", "loadSession"] as const) {
     for (const limit of ["maxTurns", "maxBudgetUsd"] as const) {
       it(`${method} applies added, tightened and removed ${limit} to the SDK query`, async () => {

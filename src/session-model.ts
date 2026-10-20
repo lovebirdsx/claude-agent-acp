@@ -361,13 +361,10 @@ function isPreModelSwitchHookBlock(error: unknown): boolean {
 
 /** 用户切模型被 CLI 拒绝的方式。未命中下面文本的一律留 `unrecognised`，
  *  调用方走通用失败路径，不猜类别。 */
-export type ModelSwitchRefusal = "authentication_required" | "model_unavailable" | "unrecognised";
+export type ModelSwitchRefusal =
+  "authentication_required" | "model_unavailable" | "validation_incomplete" | "unrecognised";
 
-// 只匹配锁定 CLI 上实测到的两种文本（2.1.287，隔离 CLAUDE_CONFIG_DIR，无 prompt）：
-//   - 原生 CLI 无凭据："Unable to validate model: Could not resolve authentication
-//     method. …" —— 切模型要先对着目录校验，没凭据就校验不了，是缺认证而非模型不存在；
-//   - 已认证的网关不提供该 id："Model '<id>' not found"。
-// 其余文本（传输失败、代理错误体、鉴权拒绝）不归类，避免从 CLI 源码瞎猜。
+// 只匹配锁定 CLI 2.1.287 在隔离环境和本地网关实测到的文本，不透传网关错误体。
 const MODEL_SWITCH_AUTH_REQUIRED_PATTERN =
   /unable to validate model:\s*could not resolve authentication method/i;
 const MODEL_SWITCH_MODEL_NOT_FOUND_PATTERN = /\bmodel\b[^\n]*\bnot found\b/i;
@@ -376,6 +373,9 @@ export function classifyModelSwitchFailure(error: unknown): ModelSwitchRefusal {
   if (!(error instanceof Error)) return "unrecognised";
   if (MODEL_SWITCH_AUTH_REQUIRED_PATTERN.test(error.message)) return "authentication_required";
   if (MODEL_SWITCH_MODEL_NOT_FOUND_PATTERN.test(error.message)) return "model_unavailable";
+  if (/^Couldn't confirm model "[^\r\n]*" with the API\. Try again[,.]/.test(error.message)) {
+    return "validation_incomplete";
+  }
   return "unrecognised";
 }
 

@@ -584,6 +584,26 @@ describe("session config options", () => {
       expect(liveConfigOptions().find((o) => o.id === "effort")?.currentValue).toBe("default");
     });
 
+    it("模型校验超时返回可操作提示且不回显上游文本", async () => {
+      addExtraModel();
+      const secret = "ak-1-0123456789abcdef";
+      setModelSpy.mockRejectedValueOnce(
+        new Error(
+          `Couldn't confirm model "${secret}" with the API. Try again, or run /model to see available models.`,
+        ),
+      );
+      await expect(setExtraModel()).rejects.toMatchObject({
+        code: -32603,
+        message:
+          "Internal error: Model validation could not complete. Check the provider connection and try again; the model was not changed.",
+        data: { errorKind: "unknown" },
+      });
+      expect(liveModelOption().currentValue).toBe("claude-opus-4-5");
+      expect(
+        sessionUpdates.filter((n) => n.update.sessionUpdate === "config_option_update"),
+      ).toHaveLength(0);
+    });
+
     it("does not misclassify an unobserved validation failure", async () => {
       // 同样以 "Unable to validate model" 开头，但原因不是缺认证：认不出的既不能算
       // authentication_failed 也不能算 model_not_found。

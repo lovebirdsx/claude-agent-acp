@@ -38,6 +38,8 @@ CLI 的 `getAbortReason` 把**任何**非 interrupt/end_conversation 的 tool-qu
 
 SDK 的 `initializationResult.models` 是**硬编码 Anthropic 官方列表**，网关模型天然不在其中，而 `setSessionConfigOption` 对不在候选里的值**直接抛错**——网关用户的会话内 picker 完全不可用。不走 `settings.availableModels`：它是「取代」语义的 allowlist 且是**全局共享文件**，写它会连带限制原生 CLI 自己的 `/model` picker。改走顶层 `_meta.extraModels` **追加**通道（上限 64、坏载荷降级 undefined 不失败会话、逐字透传不剥 `[1m]` 上下文后缀），**顺序是 allowlist 过滤在前、extras 追加在后**（extras exempt 于过滤）。配套测试 `tests/extra-models.test.ts`
 
+后续修复（2026-10-20）：只追加 ACP 候选仍会触发 CLI 的 `set_model` 五秒模型探测，慢网关下固定超时。现将 extras 同步到会话级 SDK `settings.modelPicker.options`；保留调用方目录或启用的 user 目录，不提升 project/local 层，不写盘、不绕过 CLI 组织限制或 Hook。真实 CLI + 本地挂起网关证明切换不再发 `/messages` 探测；实际服务可用性仍由 prompt 检验。详见父项目 `docs/development/claude-agent-maintenance.md`「后续修复：网关模型目录同步」。
+
 ## 子 agent 模型 pin（`CLAUDE_CODE_SUBAGENT_MODEL` + `_FORCE`）
 
 （待提交）落点 **`subagent-model.ts`(新文件)** + `acp-agent.ts`（一处 env 展开）
