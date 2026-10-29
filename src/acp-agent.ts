@@ -11201,6 +11201,13 @@ export class ClaudeAcpAgent {
                 cwd: params.cwd,
                 sendUpdate: (notification) => this.client.sessionUpdate(notification),
                 logger: this.logger,
+                // Hooks run long after the session entry is assigned. The map
+                // is agent id → the ORIGINAL Agent/Task tool_use id
+                // (task_started first-wins, plus replay seeding), so a
+                // SendMessage-resumed Explore still links to the card that
+                // first spawned it.
+                resolveSpawnToolUseId: (agentId) =>
+                  this.sessions[sessionId]?.subagentSpawns.get(agentId),
               }),
             ],
           },
@@ -11487,7 +11494,11 @@ export class ClaudeAcpAgent {
         userDeniedToolCalls: new Set(),
         eagerToolCallSessions: new Map(),
         liveBackgroundTasks: new Map(),
-        subagentSpawns: new Map(),
+        // Adopt the replay's spawn map: history replay runs before this record
+        // exists and seeds it with each Task card's original tool_use id, which
+        // SendMessage resume redirection (and the Explore result back-link)
+        // must keep pointing at after a session/load.
+        subagentSpawns: creationOpts.replayState?.subagentSpawns ?? new Map(),
         subagentResumeRedirects: new Map(),
         nativeSubagentsByTaskId: new Map(),
         nativeSubagentTaskIdByToolUseId: new Map(),

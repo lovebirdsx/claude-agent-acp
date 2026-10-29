@@ -25,3 +25,17 @@ SendMessage 唤醒已完成子 Agent 时，SDK 续跑 sidechain 消息的 `paren
 （待提交）落点 `tools.ts` + `acp-agent.ts`
 
 SDK 把一条 API 消息流成多帧，每帧 `usage` 是**快照非增量**，且网关形状不一：Anthropic/deepseek 每帧带全量、Moonshot/kimi 前导帧全 0 只有末帧完整。旧逻辑逐帧累加 → deepseek 虚高 2-3x、kimi live 累计恒 0（卡片无价格，回放却正常）。修法一：`accumulateSubagentUsage` 加 `messageId`，同 id 新快照**替换**旧贡献（`perMessage` 簿记，不进 `_meta` 序列化），live 与 `subagentTallyFromTranscript`（transcript 同 id 也落 2-5 行快照）共用一处去重。修法二：live prompt 循环在 Task tool_result 到达时（同 replay 用 `replayedSubagentCardFromResult` 识别，也须在 toAcpNotifications 之前收集）`void` 调 `restampReplayedSubagentStats` 从子代理 transcript 补发权威 tally——kimi 这类流内无 usage 的网关由此在 live 收尾拿到真实价格
+
+## Explore 结果卡回链（`_universe/exploreResultOf`）
+
+落点 `tools.ts` 的 `createSubagentStopHook` + `acp-agent.ts` 注册处
+
+`SubagentStop` 写完 `.claude/explore-results/*.md` 后发出的 synthetic `tool_call` 是**顶层卡片**（不带 `claudeCode.parentToolUseId`，否则客户端会把它嵌进子 Agent）。为了让编辑器能在发起卡上放「跳转到报告」，钩子额外戳 `_meta._universe/exploreResultOf = <spawn tool_use id>`。
+
+- **id 从哪来**：options 新增 `resolveSpawnToolUseId(agentId)`，`acp-agent.ts` 注册时读 `this.sessions[sessionId]?.subagentSpawns.get(agentId)`。该 Map 是 `task_started` first-wins + replay 播种——SendMessage 续跑复用同一 agentId，回链仍指**最初**那张 Task/Agent 卡。
+- **解析失败必须吞掉**：resolver 独立 try/catch，只 `logger.error` 并**省略 meta 键**；报告落盘与结果卡发送绝不受影响。没有 spawn 记录（如 transcript 外恢复出的子代理）同样省略，客户端按钮自然不出现。
+- **非 Explore 不解析**：只有 `agent_type === "Explore"` 的已完成子代理才走这段，resolver 不会被调用。
+- **测试**：`src/tests/tools.test.ts` 的 `createSubagentStopHook` 组覆盖「有 id / 无 spawn / resolver 抛错 / 非 Explore」；父仓契约测试 `acpForkContract.integration.test.ts` 把该字面量钉进 `EXPECTED_DIST_METHODS`，防止构建压缩掉。
+- **codex 侧无此键**，不要为对齐而加。
+
+**回放状态采纳**：`session/load` 的 replay 先于 session record 运行，播种写进 `PendingReplay.state.subagentSpawns`；session record 必须用 `creationOpts.replayState?.subagentSpawns` 接管（与 `taskState` / `messageIdToUuid` 一致），不能再 `new Map()`。漏掉这一步会让 load 后 SendMessage 续跑把 agentId 首次绑定到 SendMessage 卡，回链指向一张非子 Agent 卡——两张卡都没有入口。

@@ -44,6 +44,12 @@ export type ToolUpdateMeta = {
     /* The MCP server of an `mcp__*` tool, on a permission request. */
     mcpServer?: { name: string; source: string };
   };
+  /* On the synthetic Write-shaped card carrying a saved Explore result: the
+     tool_use id of the Agent/Task call that spawned the sub-agent. The editor
+     uses it to link the spawn card to the report card. Kept outside
+     `claudeCode` because it is a fork→editor `_universe/*` key, like
+     `_universe/subagentStats`. */
+  "_universe/exploreResultOf"?: string;
   /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
   terminal_info?: {
     terminal_id: string;

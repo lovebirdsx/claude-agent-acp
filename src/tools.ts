@@ -1014,6 +1014,11 @@ export const createSubagentStopHook =
     cwd: string;
     sendUpdate: (notification: SessionNotification) => Promise<void>;
     logger?: Logger;
+    /** Resolve the tool_use id of the Agent/Task call that spawned this
+     *  sub-agent. The hook runs after the session exists, so the caller can
+     *  read its live `subagentSpawns` map here. A failure only drops the link;
+     *  the report is still written and emitted. */
+    resolveSpawnToolUseId?: (agentId: string) => string | undefined;
   }): HookCallback =>
   async (input): Promise<{ continue: boolean }> => {
     if (input.hook_event_name !== "SubagentStop") return { continue: true };
@@ -1030,6 +1035,21 @@ export const createSubagentStopHook =
       "agent_transcript_path" in input && typeof input.agent_transcript_path === "string"
         ? input.agent_transcript_path
         : "";
+
+    // Best-effort link back to the Agent/Task card that spawned this sub-agent.
+    // A resolver failure must not stop the report from being saved — the result
+    // card is still useful without the client-side jump affordance.
+    let spawnToolUseId: string | undefined;
+    if (agentId.length > 0 && options.resolveSpawnToolUseId) {
+      try {
+        const resolved = options.resolveSpawnToolUseId(agentId);
+        if (resolved !== undefined && resolved.length > 0) spawnToolUseId = resolved;
+      } catch (err) {
+        options.logger?.error(
+          `[claude-agent-acp] Failed to resolve the Explore spawn card: ${(err as Error).message}`,
+        );
+      }
+    }
 
     try {
       const outDir = path.join(options.cwd, ".claude", "explore-results");
@@ -1078,6 +1098,9 @@ export const createSubagentStopHook =
               toolName: "Write",
               toolResponse,
             },
+            ...(spawnToolUseId !== undefined
+              ? { "_universe/exploreResultOf": spawnToolUseId }
+              : {}),
           } satisfies ToolUpdateMeta,
         },
       });

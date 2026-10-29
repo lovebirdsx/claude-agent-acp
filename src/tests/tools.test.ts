@@ -4475,6 +4475,125 @@ describe("createSubagentStopHook", () => {
 
     expect(sent).toHaveLength(0);
   });
+
+  it("links the saved result to the Agent/Task card that spawned it", async () => {
+    const sent: SessionNotification[] = [];
+    const hook = createSubagentStopHook({
+      sessionId: "sess-1",
+      cwd,
+      sendUpdate: async (n) => {
+        sent.push(n);
+      },
+      resolveSpawnToolUseId: (agentId) => (agentId === "agent-9" ? "toolu_spawn" : undefined),
+    });
+
+    await hook(
+      {
+        hook_event_name: "SubagentStop",
+        agent_type: "Explore",
+        agent_id: "agent-9",
+        last_assistant_message: "Found the bug.",
+        stop_hook_active: false,
+      } as any,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+
+    expect(sent).toHaveLength(1);
+    const update = sent[0].update as any;
+    expect(update._meta["_universe/exploreResultOf"]).toBe("toolu_spawn");
+  });
+
+  it("omits the link when no spawn card is known", async () => {
+    const sent: SessionNotification[] = [];
+    const hook = createSubagentStopHook({
+      sessionId: "sess-1",
+      cwd,
+      sendUpdate: async (n) => {
+        sent.push(n);
+      },
+      resolveSpawnToolUseId: () => undefined,
+    });
+
+    await hook(
+      {
+        hook_event_name: "SubagentStop",
+        agent_type: "Explore",
+        agent_id: "agent-9",
+        last_assistant_message: "Found the bug.",
+        stop_hook_active: false,
+      } as any,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+
+    expect(sent).toHaveLength(1);
+    const update = sent[0].update as any;
+    expect(update._meta["_universe/exploreResultOf"]).toBeUndefined();
+  });
+
+  it("still saves the result when the link resolver throws", async () => {
+    const sent: SessionNotification[] = [];
+    const hook = createSubagentStopHook({
+      sessionId: "sess-1",
+      cwd,
+      sendUpdate: async (n) => {
+        sent.push(n);
+      },
+      resolveSpawnToolUseId: () => {
+        throw new Error("spawn map unavailable");
+      },
+    });
+
+    await hook(
+      {
+        hook_event_name: "SubagentStop",
+        agent_type: "Explore",
+        agent_id: "agent-9",
+        last_assistant_message: "Found the bug.",
+        stop_hook_active: false,
+      } as any,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+
+    const files = fs.readdirSync(path.join(cwd, ".claude", "explore-results"));
+    expect(files).toHaveLength(1);
+    expect(sent).toHaveLength(1);
+    const update = sent[0].update as any;
+    expect(update._meta["_universe/exploreResultOf"]).toBeUndefined();
+  });
+
+  it("does not resolve a spawn card for non-Explore subagents", async () => {
+    const sent: SessionNotification[] = [];
+    let requested = false;
+    const hook = createSubagentStopHook({
+      sessionId: "sess-1",
+      cwd,
+      sendUpdate: async (n) => {
+        sent.push(n);
+      },
+      resolveSpawnToolUseId: () => {
+        requested = true;
+        return "toolu_spawn";
+      },
+    });
+
+    await hook(
+      {
+        hook_event_name: "SubagentStop",
+        agent_type: "general-purpose",
+        agent_id: "agent-9",
+        last_assistant_message: "done",
+        stop_hook_active: false,
+      } as any,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+
+    expect(requested).toBe(false);
+    expect(sent).toHaveLength(0);
+  });
 });
 
 describe("Skill tool rendering", () => {
