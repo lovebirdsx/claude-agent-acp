@@ -2,7 +2,7 @@
 
 本仓库是 **`agentclientprotocol/claude-agent-acp` 的自维护 fork**（origin: `lovebirdsx/claude-agent-acp`），作为 git submodule 嵌入 `universe-editor` 的 `vendor/claude-agent-acp`。它是 stdio ACP agent：包装 `@anthropic-ai/claude-agent-sdk`，把 ACP 请求翻译成 SDK query，再把 SDK 事件映回 ACP 客户端。
 
-> 项目结构 / 测试约定 / 运行方式 → `README.md`。本文件只讲 fork 特有的事：**维护原则、导航、一行摘要**；标「详见」条目的完整 bug 叙事、设计约束与实测数据拆在 `cases-session.md` / `cases-subagent.md`。
+> 项目结构 / 测试约定 / 运行方式 → `README.md`。本文件只讲 fork 特有的事：**维护原则、导航、一行摘要**；标「详见」条目的细节拆在 `cases-session.md` / `cases-subagent.md`。
 > 姊妹 fork `vendor/codex-acp` 有同规格 `CLAUDE.md` 可对照；注意策略不同——本 fork **行为优先、独立维护**，codex 仍以最小 diff 为目标，勿互套规则。
 
 ## 维护原则：行为优先、分块重构、可验证
@@ -38,7 +38,7 @@
 - **落盘 entrypoint 默认 `universe-editor`**（`acp-agent.ts` `src/tests/create-session-options.test.ts`）：条件注入 `CLAUDE_CODE_ENTRYPOINT`（显式设置优先）；**不能用 `cli`**——CLI 强制改写为 `sdk-cli` 再被 /resume 过滤
 - **resume 回放恢复子代理用量 stats**（`tools.ts` `acp-agent.ts`）：回放结束异步从 transcript 逐轮累计重建，补发 `_meta._universe/subagentStats`。**勿用 sidecar 自带 `usage`/`totalTokens`——只覆盖最后一次 API 调用，低估几十倍**。详见 [cases-subagent.md](cases-subagent.md)
 - **子代理 usage 按 message.id 去重 + live Task 完成时 transcript restamp**（`tools.ts` `acp-agent.ts`）：每帧 usage 是**快照非增量**，同 message.id 新快照替换旧贡献。详见 [cases-subagent.md](cases-subagent.md)
-- **会话后台活跃度通知**（`acp-agent.ts`）：`BACKGROUND_ACTIVITY_METHOD = "_universe/background_activity"`，params `{sessionId, backgroundTasks, autonomousTurn}`；解决 run_in_background 任务存活期间 editor 误判会话已结束；值变化去重 + load\|resume 补发
+- **会话后台活跃度通知**（`acp-agent.ts`）：`_universe/background_activity`（`{sessionId, backgroundTasks, autonomousTurn}`）覆盖后台任务与无 prompt 的自主 followup；ambient 不计、成功后才去重、load\|resume 补发；`idle` 不清标志（计时器兜底，详见 [cases-session.md](cases-session.md)）
 - **resume 重放恢复 Task 计划 + CLI 2.1.287 起的任务工具 opt-in**（`tools.ts` `acp-agent.ts`）：headless 的结构化数据在消息级 `tool_use_result` sidecar；TaskCreate 优先 sidecar 否则散文正则兜底；TaskUpdate 对未见 taskId 建占位条目。CLI 2.1.287 把任务工具门控在 `CLAUDE_CODE_ENABLE_TODO_TOOLS` 后（主循环模型名非第一方规范名即不暴露，网关路由常态），fork 默认注入 `1`（host/caller/settings.json env 显式设置让位；值走 CLI bool schema：1/true/yes/on 真）；缺它则不发 plan、plan 卡片空白
 - **resume reassert 编辑器记忆的会话模型**（`acp-agent.ts`）：transcript 恢复裸模型名丢 `[1m]` 后缀（窗口 1M 退化 200k）；editor 捎 `_meta.claudeCode.resumeModel`，优先级 env > resumeModel > settings.model，命中走既有 reassert-override
 - **其余小改（按中文提交信息识别）**（`acp-agent.ts` 等）：恢复已压缩会话重建完整显示历史（fullChain 优先于 resumedMessages；边界父链退到 preservedSegment.tailUuid 兜底）；compact 卡改结构化通知（`_universe/compaction`；30s 心跳去重）；resume 模型同步 CLI 往返移出关键路径；reapplyRuntimeConfig 判别联合修 typecheck；ExitPlanMode 拒绝透传用户反馈；修 rewind 后模型/effort 丢失；修新建 session 上下文窗口计算；**rewind / fork 支持**（分叉点解析改走磁盘、失败即报错，详见 [cases-session.md](cases-session.md)）；修 thinking_delta 空值检查；**持久化会话标题**（backing `renameSession`）；会话列表携带 git 分支（`SessionInfo._meta.gitBranch`）；Explore 子代理结果持久化；修 electron-builder ESM 加载；工具调用错误上下文增强；listSessions 用最后真实消息时间戳；**AskUserQuestion 工具调用**（`ASK_USER_QUESTION_METHOD`，`interactive.ts`(新)）；**esbuild 单文件构建 + 二进制 env 注入**（`esbuild.config.mjs`(新)，产物 `dist/index.js` 供父项目 `ELECTRON_RUN_AS_NODE` 启动；meta 另采样本机二进制的 `cliVersion`）

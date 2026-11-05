@@ -117,3 +117,28 @@ CLI 的 first-party 家族改写会把内置 Explore 子 agent 从网关模型�
 **残余风险（勿写成"彻底解决"）**：① 若存在只发 `compacting`、不发任何终结帧的 CLI 路径（本 build 的站点枚举里没有），标记陈旧到下一次 turn 激活；② precompute 与 retry 心跳真并发时可能多一次秒表重开（该 build 不可达）；③ 新 turn 的 `resetTurnScratch()` 在交错时序下可能清掉刚置的标记（一次重开，不改 turn 机制）。
 
 配套测试 `tests/acp-agent.test.ts`（6 例）：心跳折叠（三个不同 uuid 只出 `[start, success]`）、同 turn 两轮压缩各发一条 start（防**过度**去重）、无 result 结束后下一次 start 不被吞、`permissionMode` 帧不当作结束、`requesting` 帧（每 turn 的 `stream_request_start`）不当作结束、`compact_boundary` 不清标记（防"顺手补上"）。**负向验证**（每条判据都有用例钉住，改坏即红）：只做去重不加兜底 → 「无 result 结束后可再 start」失败；兜底漏 `permissionMode` 守卫 → 「`permissionMode` 帧不是结束」失败；兜底漏 `status === null` 检查（写成无条件 else）→ 「`permissionMode`」「`requesting`」两例**同时**失败；在 boundary 分支补清标记 → 「`compact_boundary` 不清标记」失败。
+
+## 后台活跃度与自主轮次标志（`_universe/background_activity`）
+
+**契约**：`{sessionId, backgroundTasks, autonomousTurn}`。`backgroundTasks` 是**非 ambient** 且未被 level 标记结束的存活后台任务数；`autonomousTurn` 表示模型正在跑一个没有 ACP prompt 归属的周期（task-notification followup、peer/coordinator/observer 唤醒）。编辑器把两者折进会话状态：只有 prompt RPC 在途或该标志为真时才是 `running`，后台任务 > 0 时显示 `background`。
+
+**事故与根因（勿把 idle 当清除信号）**：真实日志里 `task_notification` 置位后，上一条周期迟到的 `idle` 紧跟到达，旧实现无条件清标志 → 后续整个 followup（模型调用、工具执行、followup result）期间编辑器全程 idle，看起来「已停止」但进程仍在跑。`session_state_changed: idle` 不带周期身份，SDK 也不保证它相对下一次 wake 的顺序，因此 **idle 不参与清除**；flag 的边界改由下面的状态机与计时器表达。
+
+**状态机（`Session.autonomousTurn*`）**：
+
+| 事件                                                                                                                                                        | 行为                                                                                                                                                                               |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| wake（非 ambient `task_notification`；带 `AUTONOMOUS_RESULT_ORIGINS` 的 user 消息）                                                                         | `active=true`、`pending=true`；若此前已不是 pending（已出过证据）则重置 `firstPendingAt=now`，arm **wake grace**（60s）                                                            |
+| 顶层证据帧（`assistant`/`stream_event`/`tool_progress`，`parent_tool_use_id === null`；`assistant` 还须非 replay、非 `<synthetic>`；且无活跃/未结算用户轮） | `pending=false`、`lastEvidenceAt=now`，arm **silence lease**（30min）；只在 grace→silence 的换租时 arm，逐 token 的 `stream_event` 不反复清建计时器                                |
+| 真实自主 result（`num_turns > 0` 或 `is_error`）                                                                                                            | 清全部状态 + arm 无 → emit false                                                                                                                                                   |
+| 占位自主 result（`num_turns === 0 && !is_error`）                                                                                                           | 不清；按 wake 处理（CLI 2.1.274+ 批量投递时它排在共享 followup 之前）                                                                                                              |
+| 自主 origin 但 `answersPendingPrompt`（followup 被折进用户轮）                                                                                              | 清全部状态 + emit false                                                                                                                                                            |
+| 用户取消（`cancel` / `cancelTurns`）                                                                                                                        | `cancelled=true` 后立即 fire-and-forget 清标志 + emit false；此后到达的旧周期帧不再算证据                                                                                          |
+| 流结束（consumer done / stream error）                                                                                                                      | 清标志；query 已死，没有后续快照能送达                                                                                                                                             |
+| 计时器到期                                                                                                                                                  | query 已关 → 静默清；用户轮在途 / CLI 自称 `running`/`requires_action` → 未超 `maxWait`（10min）则重 arm grace；已有证据 → 按 `lastEvidenceAt + silence` 续租；否则清 + emit false |
+
+**其它必须保持的点**：`task_started`/`task_notification`/level 的 `ambient === true` 都不置位、不计入快照（level 是 ambient 翻转的权威来源，要更新记录）；`task_updated running/pending` 经 `resumeLiveTask` 把已结算子 agent 放回 live 集后**必须补发快照**（此前漏发，0→1 不可见）；快照**发送成功后**才写 `lastBackgroundActivity`，失败置 `backgroundActivityNeedsResync` 让同值快照继续重试（否则失败后去重基线已成，同值永不重发）；同一会话的发送经 `backgroundActivitySend` 串行化（计时器与 consumer 会并发），首次全零快照直接跳过（客户端初始状态即是它）；query 释放时清 `autonomousTurnTimer`（`query-resources.ts`）。
+
+**为什么要 `isHeldOpen` 例外**：held turn（result 已到、等子 agent 收尾）的 `activeTurn` 仍未 `settled`，但它的用户回答已经产出，之后所有顶层帧都属于 followup——证据判定必须放行，否则 wake grace 会在长 followup 中误清标志。replay / 子 agent / `<synthetic>` 帧不是主循环在工作，同样排除。
+
+配套测试 `tests/acp-agent.test.ts` 的 `background activity notification` describe（14 例）：迟到 idle、占位 result、周期 idle、ambient 过滤与双向翻转、resume 补发、失败重试、宽限兜底、取消清理、replay/子 agent/synthetic 证据排除、活跃用户轮帧不算证据。

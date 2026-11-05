@@ -468,16 +468,23 @@ interface CompactionNotification {
  * actually still working from one that is truly done. Shared verbatim with
  * the editor's `acpSessionModel.ts` — keep both in sync.
  *
- * `backgroundTasks` counts the session's live background tasks (registry
- * entries the level signal hasn't ended — see Session.liveBackgroundTasks).
+ * `backgroundTasks` counts the session's live, non-ambient background tasks
+ * (registry entries the level signal hasn't ended — see
+ * Session.liveBackgroundTasks; `ambient` tasks are "not activity" per the SDK
+ * contract and never count).
  * `autonomousTurn` is true while the agent is processing a model cycle with
  * no in-flight ACP prompt — set at the wake signal (a `task_notification`,
  * or a user message stamped with an autonomous origin) and cleared at the
- * cycle's autonomous result (see AUTONOMOUS_RESULT_ORIGINS), with the
- * session's next idle as the backstop for a wake whose followup never comes.
- * Emitted whenever either value changes (deduplicated against the last push),
- * plus one forced push after session/load|resume so a reconnected client
- * re-syncs. Best-effort: a delivery failure never breaks the sender.
+ * cycle's REAL autonomous result (see AUTONOMOUS_RESULT_ORIGINS; a batched
+ * notification's placeholder result does not end the stretch), when an
+ * autonomous-origin result answers a folded-in user prompt, on cancel, and
+ * when the query stream dies. `session_state_changed: idle` deliberately does
+ * NOT clear it: it carries no cycle identity and can trail the next wake, so
+ * the wake grace / evidence silence lease below bound a lost wake instead.
+ * Emitted whenever either value changes (deduplicated against the last
+ * SUCCESSFUL push) and serialized per session; one forced push follows
+ * session/load|resume so a reconnected client re-syncs. Best-effort: a
+ * delivery failure never breaks the sender.
  */
 export const BACKGROUND_ACTIVITY_METHOD = "_universe/background_activity";
 
@@ -570,7 +577,7 @@ function settleLiveBackgroundTask(session: Session, taskId: string): void {
   if (!record.isSubagent) return;
   const resumable = (session.resumableSubagents ??= new Map());
   resumable.delete(taskId);
-  resumable.set(taskId, { parentToolUseId: record.parentToolUseId });
+  resumable.set(taskId, { parentToolUseId: record.parentToolUseId, ambient: record.ambient });
   if (resumable.size > MAX_RESUMABLE_SUBAGENTS) {
     const oldest = resumable.keys().next().value;
     if (oldest !== undefined) resumable.delete(oldest);
@@ -684,6 +691,26 @@ function waitUnlessAborted(milliseconds: number, signal: AbortSignal): Promise<b
  *  means the SDK already finished, so a genuine echo would follow within a tick;
  *  the window only absorbs that ordering race. */
 const DEFAULT_ORPHAN_QUEUED_TURN_GRACE_MS = 1_500;
+
+/** How long a wake may stay unconfirmed before the autonomous flag is cleared:
+ *  the `task_notification` (or autonomous-origin user message) arrived, but the
+ *  model produced no top-level frame since. `idle` cannot serve as the backstop
+ *  — it carries no cycle identity, so a late trailer from the PREVIOUS cycle
+ *  would clear a wake that is still about to run (observed live). While the CLI
+ *  reports `running`/`requires_action`, or a user turn is in flight, the grace
+ *  is re-armed until {@link DEFAULT_AUTONOMOUS_WAKE_MAX_WAIT_MS}. */
+const DEFAULT_AUTONOMOUS_WAKE_GRACE_MS = 60_000;
+
+/** Upper bound on repeatedly re-arming {@link DEFAULT_AUTONOMOUS_WAKE_GRACE_MS}
+ *  for a wake whose followup never produces evidence. Bounds a stale flag even
+ *  when the CLI's session state never returns to `idle`. */
+const DEFAULT_AUTONOMOUS_WAKE_MAX_WAIT_MS = 600_000;
+
+/** How long an autonomous stretch that HAS produced top-level evidence may go
+ *  silent before its result is presumed lost. Much looser than the wake grace:
+ *  a model turn can legitimately think or run a long tool without emitting a
+ *  top-level frame, and clearing early strands the whole stretch as idle. */
+const DEFAULT_AUTONOMOUS_TURN_SILENCE_MS = 1_800_000;
 
 /** Error surfaced when the SDK declares a turn over (`session_state_changed:
  *  idle`, its authoritative turn-over signal) without ever emitting the turn's
@@ -1276,6 +1303,12 @@ export type Session = {
     {
       parentToolUseId?: string;
       isSubagent: boolean;
+      /** The SDK's "not activity" marker (skip_transcript housekeeping tasks
+       *  and live-update watchers — see SDKTaskStartedMessage.ambient). Such
+       *  tasks never count toward the activity snapshot: their whole point is
+       *  to be excluded from activity indicators. The level signal carries the
+       *  authoritative flag and may flip it, so keep it on the record. */
+      ambient?: boolean;
       /** Absent-from-level lifecycle, one field so the illegal
        *  armed-but-not-ended state is unrepresentable: undefined = live per
        *  the level signal; "ended" = a level omitted the task (holds stop
@@ -1299,7 +1332,7 @@ export type Session = {
    *  into `liveBackgroundTasks` from this record, so the resuming turn holds
    *  and its permission requests keep their attribution. Bounded by
    *  `MAX_RESUMABLE_SUBAGENTS`, oldest first. */
-  resumableSubagents?: Map<string, { parentToolUseId?: string }>;
+  resumableSubagents?: Map<string, { parentToolUseId?: string; ambient?: boolean }>;
   /** Native ACP subagent sessions negotiated through PR #1992. Records are
    *  retained for the parent session lifetime so late child output cannot be
    *  rebound to another task after the SDK prunes its live-task registry. */
@@ -1335,14 +1368,44 @@ export type Session = {
    *  e.g. a task-notification wake's followup or a peer/coordinator/observer
    *  handling — is currently processing. Set at the wake signal (the
    *  `task_notification` system message, or a user message stamped with an
-   *  autonomous origin), cleared at the cycle's autonomous result, with the
-   *  session's next idle as the backstop for a wake whose followup never
-   *  comes. Read only for the BACKGROUND_ACTIVITY_METHOD snapshot. */
+   *  autonomous origin) and cleared at the cycle's REAL result (a batched
+   *  notification's placeholder result is not the end — see the result case),
+   *  or by the timer below when the wake/followup never materializes.
+   *
+   *  `session_state_changed: idle` deliberately does NOT clear it: idle carries
+   *  no cycle identity, the SDK does not order it against the wake that starts
+   *  the next cycle, and a late idle from the previous cycle would strand the
+   *  whole followup as "not running" (observed live). Read only for the
+   *  BACKGROUND_ACTIVITY_METHOD snapshot. */
   autonomousTurnActive?: boolean;
+  /** A wake was seen but no top-level followup frame has arrived yet. Armed
+   *  with the wake grace timer; cleared by the first evidence frame. */
+  autonomousTurnPending?: boolean;
+  /** When an evidence frame (top-level assistant / stream_event / tool_progress)
+   *  last arrived in the current autonomous stretch. Drives the silence lease
+   *  that catches a lost result without cutting off a slow-but-live turn. */
+  autonomousLastEvidenceAt?: number;
+  /** When the current autonomous stretch was first woken. Caps the repeated
+   *  grace re-arms while the CLI claims to be running. */
+  autonomousFirstPendingAt?: number;
+  /** Single timer backing the wake grace and the evidence silence lease. A new
+   *  arm replaces the previous one. Released with the query resources. */
+  autonomousTurnTimer?: ReturnType<typeof setTimeout>;
   /** The last background-activity snapshot pushed via
    *  BACKGROUND_ACTIVITY_METHOD, so repeat pushes only go out when a value
-   *  actually changed. */
+   *  actually changed. Written only AFTER a successful send, so a failed
+   *  delivery is retried by the next same-valued snapshot. */
   lastBackgroundActivity?: { backgroundTasks: number; autonomousTurn: boolean };
+  /** Serializes activity pushes. The consumer awaits each of its own sends,
+   *  but the autonomous-turn timer pushes out of band; without a chain a
+   *  slow send could land after a newer one and leave the client (and
+   *  `lastBackgroundActivity`) on a stale snapshot. */
+  backgroundActivitySend?: Promise<void>;
+  /** A background-activity send failed, so the client's state is unknown: the
+   *  next snapshot must bypass the value dedup even if it equals the last
+   *  SUCCESSFUL push. Cleared by a successful send. Matters most for the
+   *  forced load/resume re-sync, where the client just reset its own state. */
+  backgroundActivityNeedsResync?: boolean;
   /** Whether any top-level assistant text reached the client since the last
    *  stretch boundary. Set as a side effect of sending in the consumer's
    *  `sendUpdate`, never at an emission site; read at the terminal `result`
@@ -1441,6 +1504,24 @@ export type Session = {
  *  lanes and cancel(). */
 function isHeldOpen(turn: Turn | null | undefined): turn is Turn & { deferredSettle: TurnOutcome } {
   return turn != null && turn.deferredSettle !== undefined && !turn.settled;
+}
+
+/** Whether this message is the main loop producing output — the evidence that
+ *  an autonomous wake's followup is actually running. Subagent frames
+ *  (non-null `parent_tool_use_id`), replayed frames, and synthetic CLI banners
+ *  are excluded: none of them means the main loop moved. */
+function isMainLoopCycleFrame(message: SDKMessage): boolean {
+  if ("isReplay" in message && message.isReplay) return false;
+  switch (message.type) {
+    case "assistant":
+      return message.parent_tool_use_id === null && message.message.model !== "<synthetic>";
+    case "stream_event":
+      return message.parent_tool_use_id === null;
+    case "tool_progress":
+      return message.parent_tool_use_id === null;
+    default:
+      return false;
+  }
 }
 
 /** Whether a steer moved this turn's settlement off the next result and onto the
@@ -2773,6 +2854,18 @@ export class ClaudeAcpAgent {
    *  the running generation and settled `end_turn`. See
    *  {@link DEFAULT_ORPHAN_QUEUED_TURN_GRACE_MS}. Mutable so tests can shrink it. */
   orphanQueuedTurnGraceMs: number = DEFAULT_ORPHAN_QUEUED_TURN_GRACE_MS;
+
+  /** Wake-without-followup grace. See {@link DEFAULT_AUTONOMOUS_WAKE_GRACE_MS}.
+   *  Mutable so tests can shrink it. */
+  autonomousWakeGraceMs: number = DEFAULT_AUTONOMOUS_WAKE_GRACE_MS;
+
+  /** Cap on repeated wake-grace re-arms. See
+   *  {@link DEFAULT_AUTONOMOUS_WAKE_MAX_WAIT_MS}. Mutable so tests can shrink it. */
+  autonomousWakeMaxWaitMs: number = DEFAULT_AUTONOMOUS_WAKE_MAX_WAIT_MS;
+
+  /** Silence lease after the last evidence frame. See
+   *  {@link DEFAULT_AUTONOMOUS_TURN_SILENCE_MS}. Mutable so tests can shrink it. */
+  autonomousTurnSilenceMs: number = DEFAULT_AUTONOMOUS_TURN_SILENCE_MS;
 
   /** Memoized per-agentId sub-agent tallies rebuilt from their transcripts on
    *  replay — a completed run's totals are immutable, so rewind/fork re-replays
@@ -4692,8 +4785,13 @@ export class ClaudeAcpAgent {
       taskId: string,
       parentToolUseId: string | undefined,
       isSubagent: boolean,
+      ambient?: boolean,
     ) => {
-      session.liveBackgroundTasks.set(taskId, { parentToolUseId, isSubagent });
+      session.liveBackgroundTasks.set(taskId, {
+        parentToolUseId,
+        isSubagent,
+        ...(ambient === true ? { ambient: true } : {}),
+      });
       if (parentToolUseId) forgetForegroundToolCall(session, parentToolUseId);
       session.resumableSubagents?.delete(taskId);
       if (isSubagent && session.activeTurn && !session.activeTurn.settled) {
@@ -4710,7 +4808,7 @@ export class ClaudeAcpAgent {
     const resumeLiveTask = (taskId: string) => {
       if (session.liveBackgroundTasks.has(taskId)) return;
       const settled = session.resumableSubagents?.get(taskId);
-      if (settled) registerLiveTask(taskId, settled.parentToolUseId, true);
+      if (settled) registerLiveTask(taskId, settled.parentToolUseId, true, settled.ambient);
     };
 
     /** Whether any background subagent this turn spawned is still live —
@@ -5115,6 +5213,9 @@ export class ClaudeAcpAgent {
           // (marks queryClosed, drops the consumer handle, releases the dead
           // subprocess/settings resources) — a later prompt() then rejects up
           // front rather than restarting a consumer on the exhausted stream.
+          // The autonomous cycle died with the stream; clear it first so the
+          // ACP client (still connected) is not left on a stale `true`.
+          await this.clearAutonomousTurn(params.sessionId, session);
           this.closeQueryStream(session);
           return;
         }
@@ -5252,6 +5353,12 @@ export class ClaudeAcpAgent {
         if ((message as { type: string }).type === "active_goal") {
           continue;
         }
+
+        // A top-level model frame is proof that an autonomous wake's followup
+        // is actually producing output. Record it before dispatch so the wake
+        // timer never unlatches a cycle that is visibly running — `idle`
+        // cannot prove the opposite (it carries no cycle identity).
+        this.noteAutonomousFollowupActivity(params.sessionId, session, message);
 
         switch (message.type) {
           case "system":
@@ -5586,15 +5693,15 @@ export class ClaudeAcpAgent {
                     session.owedTrailingIdles,
                   );
 
-                  // Backstop clear of the autonomous-activity flag: a wake
-                  // whose followup never comes (its notification lost or
-                  // skipped) would otherwise latch the flag until the next
-                  // wake. Every processing cycle ends with an idle, so this
-                  // bounds a stale flag to one cycle.
-                  if (session.autonomousTurnActive) {
-                    session.autonomousTurnActive = false;
-                    await this.emitBackgroundActivity(params.sessionId, session);
-                  }
+                  // `idle` is deliberately NOT a clear signal for the
+                  // autonomous-activity flag: it carries no cycle identity, so
+                  // a trailer from the cycle that just ended can arrive AFTER
+                  // the wake for the next one — clearing here left a live
+                  // followup (its model call, tool runs and followup result)
+                  // invisible end to end (observed live). The wake grace and
+                  // silence lease owned by noteAutonomousWake /
+                  // noteAutonomousFollowupActivity bound a lost wake without
+                  // touching a live followup.
                 }
                 break;
               }
@@ -5770,7 +5877,12 @@ export class ClaudeAcpAgent {
                 // turn: a turn only ever waits on its own subagents, and a
                 // spawn during a held-open drain window (an agent chain)
                 // extends that turn's hold.
-                registerLiveTask(message.task_id, message.tool_use_id, !!message.subagent_type);
+                registerLiveTask(
+                  message.task_id,
+                  message.tool_use_id,
+                  !!message.subagent_type,
+                  message.ambient === true,
+                );
                 await subagents.taskStarted(
                   {
                     taskId: message.task_id,
@@ -5811,9 +5923,15 @@ export class ClaudeAcpAgent {
                 // The wake this notification triggers starts an autonomous
                 // followup cycle (its terminal result carries an
                 // AUTONOMOUS_RESULT_ORIGINS origin) — flag it for the
-                // activity snapshot. The flag's clear sites are the
-                // autonomous result and, as backstop, the next idle.
-                session.autonomousTurnActive = true;
+                // activity snapshot. Ambient tasks are housekeeping, not
+                // activity, and wake nothing: settling one must not latch the
+                // flag. The flag is cleared by the cycle's real result, or by
+                // the bundled wake-grace/silence lease if the followup never
+                // materializes; `idle` deliberately does not clear it (a late
+                // trailer from the previous cycle would strand this one).
+                if (message.ambient !== true) {
+                  this.noteAutonomousWake(params.sessionId, session);
+                }
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
                 // fork: the resume run (if any) is done — drop its redirect so
@@ -5902,6 +6020,10 @@ export class ClaudeAcpAgent {
                     sendUpdate,
                     sendMessageResumePrompt(session.toolUseCache, message.task_id),
                   );
+                  // The resume puts a settled subagent back into the live set;
+                  // the activity snapshot must see the count rise even though
+                  // no task_started bookend arrives for it.
+                  await this.emitBackgroundActivity(params.sessionId, session);
                 }
                 break;
               case "worker_shutting_down":
@@ -6040,9 +6162,15 @@ export class ClaudeAcpAgent {
                 // bookends is safe: a level that precedes its task_started
                 // simply no-ops here.
                 if (session.liveBackgroundTasks.size > 0) {
-                  const live = new Set(message.tasks.map((t) => t.task_id));
+                  // The level is authoritative for the ambient flag too: it is
+                  // re-emitted when an entry's flag flips, and the count must
+                  // follow it. Absent entries keep their recorded flag.
+                  const live = new Map(
+                    message.tasks.map((t) => [t.task_id, t.ambient === true] as const),
+                  );
                   for (const [taskId, record] of session.liveBackgroundTasks) {
                     if (live.has(taskId)) {
+                      record.ambient = live.get(taskId) === true ? true : undefined;
                       // The level proves the task live in the background
                       // universe (e.g. a foreground agent was backgrounded
                       // after an earlier absent-marking, or that marking was
@@ -6087,6 +6215,12 @@ export class ClaudeAcpAgent {
             const startedByClaudeCode =
               message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
             const isAutonomousResult = startedByClaudeCode && !answersPendingPrompt(message);
+            // An autonomous-origin result that ANSWERS a pending prompt means
+            // the CLI folded the wake's cycle into the user turn; this result
+            // ends both, so no separate followup remains to keep flagged.
+            if (startedByClaudeCode && !isAutonomousResult) {
+              await this.clearAutonomousTurn(params.sessionId, session);
+            }
             const pendingExitPlanModeInterruption = session.pendingExitPlanModeInterruption;
             const pendingExitPlanContextReset = session.pendingExitPlanContextReset;
             try {
@@ -6359,11 +6493,20 @@ export class ClaudeAcpAgent {
               // failActive a live turn (the held one, or the user's next
               // prompt) whose own result recorded a different outcome.
               if (isAutonomousResult) {
-                // The autonomous cycle this result terminates is over — clear
-                // the activity flag its wake set (see task_notification).
-                if (session.autonomousTurnActive) {
-                  session.autonomousTurnActive = false;
-                  await this.emitBackgroundActivity(params.sessionId, session);
+                // CLI 2.1.274+ answers a batch of queued notifications with
+                // ONE model call: every queued notification still gets its own
+                // result, but all except the last are placeholders —
+                // `num_turns: 0`, empty text, emitted BEFORE the shared
+                // followup runs. A placeholder is not the cycle's end: the
+                // real result (num_turns > 0, matching the hold guard below)
+                // clears the flag; the placeholder re-arms the wake grace in
+                // case the followup it announces is lost.
+                const placeholder = message.num_turns === 0 && !message.is_error;
+                if (placeholder) {
+                  const wasActive = this.noteAutonomousWake(params.sessionId, session);
+                  if (!wasActive) await this.emitBackgroundActivity(params.sessionId, session);
+                } else {
+                  await this.clearAutonomousTurn(params.sessionId, session);
                 }
                 // A held turn's followup can itself plan: the subagent
                 // finishes, the model writes the plan and calls ExitPlanMode
@@ -7041,13 +7184,9 @@ export class ClaudeAcpAgent {
               // the user message itself) starts an autonomous cycle the
               // `task_notification` arm never saw — its result's origin will
               // match (AUTONOMOUS_RESULT_ORIGINS) and clear the flag.
-              if (
-                message.origin != null &&
-                AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind) &&
-                !session.autonomousTurnActive
-              ) {
-                session.autonomousTurnActive = true;
-                await this.emitBackgroundActivity(params.sessionId, session);
+              if (message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind)) {
+                const wasActive = this.noteAutonomousWake(params.sessionId, session);
+                if (!wasActive) await this.emitBackgroundActivity(params.sessionId, session);
               }
             }
 
@@ -7431,6 +7570,10 @@ export class ClaudeAcpAgent {
           message.includes("process terminated by signal") ||
           message.includes("Failed to write to process stdin"));
       await finishLifecycle(session.cancelled ? "cancelled" : "failed", "after stream error");
+      // The autonomous cycle died with the query. Clear it while the ACP
+      // client connection is still alive (a process death evicts the session
+      // but does not close the connection).
+      await this.clearAutonomousTurn(params.sessionId, session);
       // The query iterator is finished and the consumer is exiting, so release
       // its resources via closeQueryStream (idempotent). A process death is
       // unrecoverable, so additionally evict the session so the client starts
@@ -7540,6 +7683,12 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    // The interrupt also ends any autonomous cycle in flight. Its own result
+    // (if one arrives) is dropped by the cancelled guard in the result case,
+    // so nothing else would clear the flag; leaving it set keeps the editor
+    // "running" and disarms its stall watchdog. Fire-and-forget: cancelling
+    // must not wait on a client round-trip.
+    void this.clearAutonomousTurn(params.sessionId, session);
     for (const turn of session.turnQueue ?? []) turn.localCommandAbort?.abort();
     session.pendingExitPlanModeInterruption = undefined;
     session.pendingExitPlanContextReset = undefined;
@@ -8030,46 +8179,177 @@ export class ClaudeAcpAgent {
     await this.notifyResurrection({ sessionId, id: notificationId, phase: "success" });
   }
 
+  /** Records a wake (task_notification or autonomous-origin user message):
+   *  the model is about to process something no ACP prompt accounts for.
+   *  Returns whether the flag was already set, so the caller can decide about
+   *  the activity push at its usual site. */
+  private noteAutonomousWake(sessionId: string, session: Session): boolean {
+    const wasActive = session.autonomousTurnActive === true;
+    // A wake that follows evidence starts a NEW pending window and gets a
+    // fresh max-wait budget; only repeated wakes before any evidence keep the
+    // original anchor. Otherwise a stretch's earlier long tool would exhaust
+    // the budget of a later followup that has not even begun.
+    if (session.autonomousTurnPending !== true) {
+      session.autonomousFirstPendingAt = Date.now();
+    }
+    session.autonomousTurnActive = true;
+    session.autonomousTurnPending = true;
+    this.armAutonomousTurnTimer(sessionId, session, this.autonomousWakeGraceMs);
+    return wasActive;
+  }
+
+  /** A top-level main-loop frame proves the wake's followup is actually
+   *  producing output: swap the wake grace for the (much longer) silence
+   *  lease. Frames a live user turn owns are ignored — only a held turn (its
+   *  own answer already arrived) releases the top level to the followup. */
+  private noteAutonomousFollowupActivity(
+    sessionId: string,
+    session: Session,
+    message: SDKMessage,
+  ): void {
+    if (!session.autonomousTurnActive) return;
+    // A cancelled cycle is ending; frames still draining from it must not keep
+    // extending the lease (cancelTurns clears the flag).
+    if (session.cancelled) return;
+    if (!isMainLoopCycleFrame(message)) return;
+    const active = session.activeTurn;
+    if (active != null && !active.settled && !isHeldOpen(active)) return;
+    if ((session.turnQueue ?? []).some((turn) => turn !== active && !turn.settled)) return;
+    // Re-arm only when swapping the wake grace for a silence lease. Deliberately
+    // not every frame: `stream_event` fires per token, and the timeout handler
+    // already re-arms for `lastEvidenceAt + silence` when it fires.
+    const alreadyLeased =
+      session.autonomousTurnPending === false && session.autonomousTurnTimer !== undefined;
+    session.autonomousTurnPending = false;
+    session.autonomousLastEvidenceAt = Date.now();
+    if (!alreadyLeased) {
+      this.armAutonomousTurnTimer(sessionId, session, this.autonomousTurnSilenceMs);
+    }
+  }
+
+  /** Ends the autonomous stretch and pushes the cleared snapshot. */
+  private async clearAutonomousTurn(sessionId: string, session: Session): Promise<void> {
+    this.clearAutonomousTurnTimer(session);
+    const wasActive = session.autonomousTurnActive === true;
+    session.autonomousTurnActive = false;
+    session.autonomousTurnPending = undefined;
+    session.autonomousLastEvidenceAt = undefined;
+    session.autonomousFirstPendingAt = undefined;
+    if (wasActive) await this.emitBackgroundActivity(sessionId, session);
+  }
+
+  private armAutonomousTurnTimer(sessionId: string, session: Session, delayMs: number): void {
+    this.clearAutonomousTurnTimer(session);
+    session.autonomousTurnTimer = setTimeout(() => {
+      session.autonomousTurnTimer = undefined;
+      void this.handleAutonomousTurnTimeout(sessionId, session);
+    }, delayMs);
+  }
+
+  private clearAutonomousTurnTimer(session: Session): void {
+    if (session.autonomousTurnTimer) {
+      clearTimeout(session.autonomousTurnTimer);
+      session.autonomousTurnTimer = undefined;
+    }
+  }
+
+  /** Wake grace or silence lease expired. Re-validate before unlatching: the
+   *  CLI may claim to be running the followup without having emitted a
+   *  top-level frame yet, or a user turn may own the cycle. */
+  private async handleAutonomousTurnTimeout(sessionId: string, session: Session): Promise<void> {
+    if (!session.autonomousTurnActive) return;
+    if (session.queryClosed) {
+      // The stream died with the cycle; no further snapshot can reach a live
+      // consumer, and a resurrection builds a fresh Session.
+      this.clearAutonomousTurnTimer(session);
+      session.autonomousTurnActive = false;
+      session.autonomousTurnPending = undefined;
+      session.autonomousLastEvidenceAt = undefined;
+      session.autonomousFirstPendingAt = undefined;
+      return;
+    }
+    const now = Date.now();
+    const active = session.activeTurn;
+    const userTurnInFlight =
+      (active != null && !active.settled && !isHeldOpen(active)) ||
+      (session.turnQueue ?? []).some((turn) => turn !== active && !turn.settled);
+    const cliBusy =
+      session.lastSessionState === "running" || session.lastSessionState === "requires_action";
+    if (userTurnInFlight || cliBusy) {
+      if (now - (session.autonomousFirstPendingAt ?? now) < this.autonomousWakeMaxWaitMs) {
+        this.armAutonomousTurnTimer(sessionId, session, this.autonomousWakeGraceMs);
+        return;
+      }
+    }
+    if (session.autonomousTurnPending === false) {
+      // Evidence already arrived: only an exceeded silence lease may clear.
+      const lastEvidenceAt = session.autonomousLastEvidenceAt ?? now;
+      const remaining = this.autonomousTurnSilenceMs - (now - lastEvidenceAt);
+      if (remaining > 0) {
+        this.armAutonomousTurnTimer(sessionId, session, remaining);
+        return;
+      }
+    }
+    await this.clearAutonomousTurn(sessionId, session);
+  }
+
   /** Push the session's background-activity snapshot (live background task
    *  count + autonomous-cycle flag) to the client via
    *  BACKGROUND_ACTIVITY_METHOD. Deduplicated: a push only goes out when a
    *  value changed since the last one — unless `force` (the
-   *  session/load|resume re-sync, where the client's state is unknown).
+   *  session/load|resume re-sync, where the client's state is unknown) — and
+   *  the initial all-zero snapshot is skipped (that is every client's starting
+   *  state). Sends are serialized per session; the snapshot is computed when
+   *  the send runs, so the last queued push always reflects the newest state.
    *  Best-effort: a delivery failure must never break the caller (same
-   *  contract as notifyResurrection). */
+   *  contract as notifyResurrection), and it leaves the dedup baseline
+   *  untouched so the next same-valued snapshot retries. */
   private async emitBackgroundActivity(
     sessionId: string,
     session: Session,
     opts?: { force?: boolean },
   ): Promise<void> {
-    let backgroundTasks = 0;
-    for (const record of session.liveBackgroundTasks.values()) {
-      // endedPerLevel entries are attribution-only residue — the level signal
-      // says the task is gone — so they don't count as live.
-      if (!record.endedPerLevel) {
-        backgroundTasks++;
-      }
-    }
-    const autonomousTurn = session.autonomousTurnActive ?? false;
-    const last = session.lastBackgroundActivity;
-    if (
-      !opts?.force &&
-      last != null &&
-      last.backgroundTasks === backgroundTasks &&
-      last.autonomousTurn === autonomousTurn
-    ) {
-      return;
-    }
-    session.lastBackgroundActivity = { backgroundTasks, autonomousTurn };
-    try {
-      await this.client.extNotification(BACKGROUND_ACTIVITY_METHOD, {
-        sessionId,
-        backgroundTasks,
-        autonomousTurn,
+    const previous = session.backgroundActivitySend ?? Promise.resolve();
+    const send = previous
+      .catch(() => {
+        // A previous failure is already logged; it must not poison the chain.
+      })
+      .then(async () => {
+        let backgroundTasks = 0;
+        for (const record of session.liveBackgroundTasks.values()) {
+          // endedPerLevel entries are attribution-only residue — the level
+          // signal says the task is gone — and ambient tasks are "not activity"
+          // by the SDK's own contract, so neither counts as live.
+          if (!record.endedPerLevel && record.ambient !== true) {
+            backgroundTasks++;
+          }
+        }
+        const autonomousTurn = session.autonomousTurnActive ?? false;
+        const snapshot = { backgroundTasks, autonomousTurn };
+        const last = session.lastBackgroundActivity;
+        // `last == null` is the client's starting state: it begins at all-zero,
+        // so a first event that leaves the values there has nothing to say.
+        const unchanged =
+          last == null
+            ? backgroundTasks === 0 && !autonomousTurn
+            : last.backgroundTasks === backgroundTasks && last.autonomousTurn === autonomousTurn;
+        if (!opts?.force && !session.backgroundActivityNeedsResync && unchanged) {
+          return;
+        }
+        try {
+          await this.client.extNotification(BACKGROUND_ACTIVITY_METHOD, {
+            sessionId,
+            ...snapshot,
+          });
+          session.lastBackgroundActivity = snapshot;
+          session.backgroundActivityNeedsResync = false;
+        } catch (error) {
+          session.backgroundActivityNeedsResync = true;
+          this.logger.error(`Failed to send background activity notification: ${String(error)}`);
+        }
       });
-    } catch (error) {
-      this.logger.error(`Failed to send background activity notification: ${String(error)}`);
-    }
+    session.backgroundActivitySend = send;
+    await send;
   }
 
   /** Best-effort resurrection lifecycle card for the editor's timeline: a

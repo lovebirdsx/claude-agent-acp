@@ -24,6 +24,9 @@ export interface QueryResourceHolder {
   contextCompaction?: unknown;
   /** 孤儿 queued-turn 的宽限计时器。 */
   orphanQueuedTurnTimer?: ReturnType<typeof setTimeout> | undefined;
+  /** 自主轮次唤醒宽限 / 证据沉默租约计时器（见 acp-agent 的
+   *  autonomousTurnTimer）。与 query 同生命周期：流没了，轮次也死了。 */
+  autonomousTurnTimer?: ReturnType<typeof setTimeout> | undefined;
   /** 设置监听器，先 dispose。 */
   settingsManager: { dispose(): void };
   /** SDK 输入流，随后 end。 */
@@ -43,6 +46,10 @@ export function releaseQueryResources(session: QueryResourceHolder): void {
   if (session.orphanQueuedTurnTimer) {
     clearTimeout(session.orphanQueuedTurnTimer);
     session.orphanQueuedTurnTimer = undefined;
+  }
+  if (session.autonomousTurnTimer) {
+    clearTimeout(session.autonomousTurnTimer);
+    session.autonomousTurnTimer = undefined;
   }
   session.settingsManager.dispose();
   session.input.end();

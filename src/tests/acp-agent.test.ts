@@ -18382,7 +18382,16 @@ describe("background activity notification (_universe/background_activity)", () 
   // prompt attached) is processing.
 
   function createAgent() {
-    const extNotification = vi.fn(async (_method: string, _params: unknown) => {});
+    // One ordered log shared by the wire (below) and the scripted generator.
+    // A generator line after `yield` runs only once the consumer processed that
+    // frame, so the relative position of an activity push is observable — the
+    // payload array alone cannot tell an early clear from a late one.
+    const trace: string[] = [];
+    const extNotification = vi.fn(async (method: string, params: any) => {
+      if (method === BACKGROUND_ACTIVITY_METHOD) {
+        trace.push(`activity:${params.backgroundTasks}/${params.autonomousTurn}`);
+      }
+    });
     const mockClient = {
       sessionUpdate: async () => {},
       extNotification,
@@ -18392,7 +18401,7 @@ describe("background activity notification (_universe/background_activity)", () 
       extNotification.mock.calls
         .filter(([method]) => method === BACKGROUND_ACTIVITY_METHOD)
         .map(([, params]) => params);
-    return { agent, activityPayloads };
+    return { agent, activityPayloads, trace };
   }
 
   function resultMessage(overrides: Record<string, any> = {}) {
@@ -18432,17 +18441,22 @@ describe("background activity notification (_universe/background_activity)", () 
   const idle = () => stateChanged("idle");
 
   /** A non-subagent background task starting (e.g. run_in_background Bash). */
-  const backgroundTaskStarted = (taskId: string) => ({
+  const backgroundTaskStarted = (
+    taskId: string,
+    opts: { ambient?: boolean; subagentType?: string } = {},
+  ) => ({
     type: "system",
     subtype: "task_started",
     task_id: taskId,
     tool_use_id: `toolu_${taskId}`,
     description: "copy files",
+    ...(opts.ambient === true ? { ambient: true } : {}),
+    ...(opts.subagentType !== undefined ? { subagent_type: opts.subagentType } : {}),
     uuid: randomUUID(),
     session_id: "test-session",
   });
 
-  const taskNotification = (taskId: string) => ({
+  const taskNotification = (taskId: string, opts: { ambient?: boolean } = {}) => ({
     type: "system",
     subtype: "task_notification",
     task_id: taskId,
@@ -18450,18 +18464,35 @@ describe("background activity notification (_universe/background_activity)", () 
     status: "completed",
     output_file: "",
     summary: "done",
+    ...(opts.ambient === true ? { ambient: true } : {}),
     uuid: randomUUID(),
     session_id: "test-session",
   });
 
-  const backgroundTasksChanged = (taskIds: string[]) => ({
+  const backgroundTasksChanged = (
+    tasks: Array<string | { task_id: string; ambient?: boolean }>,
+  ) => ({
     type: "system",
     subtype: "background_tasks_changed",
-    tasks: taskIds.map((task_id) => ({
-      task_id,
-      task_type: "local_bash",
-      description: "copy files",
-    })),
+    tasks: tasks.map((task) => {
+      const { task_id, ambient } =
+        typeof task === "string" ? { task_id: task, ambient: undefined } : task;
+      return {
+        task_id,
+        task_type: "local_bash",
+        description: "copy files",
+        ...(ambient === true ? { ambient: true } : {}),
+      };
+    }),
+    uuid: randomUUID(),
+    session_id: "test-session",
+  });
+
+  const taskUpdated = (taskId: string, status: string) => ({
+    type: "system",
+    subtype: "task_updated",
+    task_id: taskId,
+    patch: { status },
     uuid: randomUUID(),
     session_id: "test-session",
   });
@@ -18550,6 +18581,392 @@ describe("background activity notification (_universe/background_activity)", () 
     ]);
   });
 
+  it("keeps an autonomous wake alive when a late idle from the previous cycle lands first", async () => {
+    const { agent, activityPayloads, trace } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        const session = () => agent.sessions["test-session"]!;
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("task-1");
+        yield resultMessage();
+        yield idle();
+        yield taskNotification("task-1");
+        trace.push("after-wake");
+        // An idle carries no cycle identity: this one is the trailer of the
+        // cycle that just ended, and it may arrive after the wake. Clearing
+        // here leaves the whole followup unannounced (the observed incident).
+        yield idle();
+        trace.push(`after-late-idle:${session().autonomousTurnActive}`);
+        yield assistantText("copy finished");
+        trace.push("after-followup-frame");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        trace.push(`after-result:${session().autonomousTurnActive}`);
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(trace).toEqual([
+      "activity:1/false",
+      "activity:0/true",
+      "after-wake",
+      "after-late-idle:true",
+      "after-followup-frame",
+      "activity:0/false",
+      "after-result:false",
+    ]);
+    expect(activityPayloads()).toEqual([
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: true },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: false },
+    ]);
+  });
+
+  it("keeps the wake alive across a placeholder autonomous result", async () => {
+    const { agent, trace } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        const session = () => agent.sessions["test-session"]!;
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("task-1");
+        yield resultMessage();
+        yield idle();
+        yield taskNotification("task-1");
+        // CLI 2.1.274+ batch delivery: every queued notification gets a result,
+        // but all except the last are placeholders (`num_turns: 0`) emitted
+        // BEFORE the shared followup. A placeholder is not the cycle's end.
+        yield resultMessage({ origin: { kind: "task-notification" }, num_turns: 0, result: "" });
+        trace.push(`after-placeholder:${session().autonomousTurnActive}`);
+        yield assistantText("copy finished");
+        trace.push("after-followup-frame");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(trace).toEqual([
+      "activity:1/false",
+      "activity:0/true",
+      "after-placeholder:true",
+      "after-followup-frame",
+      "activity:0/false",
+    ]);
+  });
+
+  it("keeps the wake alive across an interim idle between followup cycles", async () => {
+    const { agent, trace } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        const session = () => agent.sessions["test-session"]!;
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("task-1");
+        yield resultMessage();
+        yield idle();
+        yield taskNotification("task-1");
+        // A followup spans several processing cycles on older CLIs, each with
+        // its own idle. Only the autonomous result ends the stretch.
+        yield assistantText("copy finished");
+        trace.push("after-first-frame");
+        yield idle();
+        trace.push(`after-interim-idle:${session().autonomousTurnActive}`);
+        yield assistantText("summary");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(trace).toEqual([
+      "activity:1/false",
+      "activity:0/true",
+      "after-first-frame",
+      "after-interim-idle:true",
+      "activity:0/false",
+    ]);
+  });
+
+  it("excludes ambient tasks from the activity snapshot", async () => {
+    const { agent, activityPayloads } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        // Ambient tasks are explicitly "not activity" per the SDK contract;
+        // counting one would latch a spinner until the next count change.
+        yield backgroundTaskStarted("task-ambient", { ambient: true });
+        yield backgroundTaskStarted("task-live");
+        yield backgroundTasksChanged([
+          { task_id: "task-ambient", ambient: true },
+          { task_id: "task-live" },
+        ]);
+        yield taskNotification("task-ambient", { ambient: true });
+        yield taskNotification("task-live");
+        yield assistantText("copy finished");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(activityPayloads()).toEqual([
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: true },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: false },
+    ]);
+  });
+
+  it("follows an ambient reclassification from the level signal in both directions", async () => {
+    const { agent, activityPayloads } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("task-1");
+        // `background_tasks_changed` is the authoritative ambient source: the
+        // same task can be reclassified either way, and the count must follow
+        // both directions rather than only the one seen at task_started.
+        yield backgroundTasksChanged([{ task_id: "task-1", ambient: true }]);
+        yield backgroundTasksChanged([{ task_id: "task-1" }]);
+        yield resultMessage();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(activityPayloads()).toEqual([
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: false },
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+    ]);
+  });
+
+  it("ignores replay, subagent and synthetic frames as followup evidence", async () => {
+    const { agent, trace } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        const session = () => agent.sessions["test-session"]!;
+        const synthetic = assistantText("");
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("task-1");
+        yield resultMessage();
+        yield idle();
+        yield taskNotification("task-1");
+        // Replayed frames describe earlier cycles, subagent frames belong to a
+        // child transcript, and synthetic frames are CLI banners — none of them
+        // proves the followup is actually running.
+        yield { ...assistantText("old"), isReplay: true };
+        trace.push(`after-replay:${session().autonomousTurnPending}`);
+        yield { ...assistantText("child"), parent_tool_use_id: "toolu_parent" };
+        trace.push(`after-subagent:${session().autonomousTurnPending}`);
+        yield { ...synthetic, message: { ...synthetic.message, model: "<synthetic>" } };
+        trace.push(`after-synthetic:${session().autonomousTurnPending}`);
+        yield assistantText("copy finished");
+        trace.push(`after-real:${session().autonomousTurnPending}`);
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(trace).toEqual([
+      "activity:1/false",
+      "activity:0/true",
+      "after-replay:true",
+      "after-subagent:true",
+      "after-synthetic:true",
+      "after-real:false",
+      "activity:0/false",
+    ]);
+  });
+
+  it("does not treat a live user turn's frames as followup evidence", async () => {
+    const { agent, trace } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        const session = () => agent.sessions["test-session"]!;
+        yield userEcho(first);
+        yield running();
+        yield backgroundTaskStarted("task-1");
+        yield resultMessage();
+        yield idle();
+        yield taskNotification("task-1");
+        // The user types while the wake is still pending: the echo activates a
+        // new turn, and its frames belong to that turn — counting them as
+        // followup evidence would lease the wake to the silence timer while the
+        // user turn owns the cycle.
+        const { value: second } = await iter.next();
+        yield userEcho(second);
+        yield assistantText("user turn reply");
+        trace.push(`after-user-frame:${session().autonomousTurnPending}`);
+        yield resultMessage();
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await vi.waitFor(() => expect(agent.sessions["test-session"]?.autonomousTurnActive).toBe(true));
+    const second = prompt(agent, "hello again");
+    await second;
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(trace).toEqual([
+      "activity:1/false",
+      "activity:0/true",
+      "after-user-frame:true",
+      "activity:0/false",
+    ]);
+  });
+
+  it("clears an autonomous cycle when the user cancels", async () => {
+    const { agent, trace } = createAgent();
+    let release!: () => void;
+    const cancelled = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        const session = () => agent.sessions["test-session"]!;
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("task-1");
+        yield resultMessage();
+        yield idle();
+        yield taskNotification("task-1");
+        await cancelled;
+        trace.push(`after-cancel:${session().autonomousTurnActive}`);
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await vi.waitFor(() => expect(agent.sessions["test-session"]?.autonomousTurnActive).toBe(true));
+    await agent.cancel({ sessionId: "test-session" });
+    release();
+    await agent.sessions["test-session"]?.consumer;
+
+    // The interrupt ends the cycle: leaving the flag set would keep the editor
+    // "running" until the silence lease expires, with the stall watchdog
+    // disarmed for that whole stretch.
+    expect(trace).toContain("after-cancel:false");
+    expect(trace.filter((line) => line.startsWith("activity:"))).toEqual([
+      "activity:1/false",
+      "activity:0/true",
+      "activity:0/false",
+    ]);
+  });
+
+  it("emits the count when a settled subagent is resumed without a new task_started", async () => {
+    const { agent, activityPayloads } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("agent-1", { subagentType: "Explore" });
+        yield taskUpdated("agent-1", "completed");
+        // The SDK can resume a finished subagent under the same agent id; the
+        // live count goes 0 → 1 again and the client must see it.
+        yield taskUpdated("agent-1", "running");
+        yield taskUpdated("agent-1", "completed");
+        yield resultMessage();
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(activityPayloads()).toEqual([
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: false },
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: false },
+    ]);
+  });
+
+  it("retries an activity snapshot whose notification failed", async () => {
+    const extNotification = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("transport down"))
+      .mockResolvedValue(undefined);
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: async () => {}, extNotification } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("task-1");
+        // Same snapshot values: only a retry can deliver it after the failure.
+        yield backgroundTasksChanged(["task-1"]);
+        yield resultMessage();
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(
+      extNotification.mock.calls.filter(([method]) => method === BACKGROUND_ACTIVITY_METHOD),
+    ).toHaveLength(2);
+  });
+
   it("does not re-send when neither value changed", async () => {
     const { agent, activityPayloads } = createAgent();
 
@@ -18578,13 +18995,15 @@ describe("background activity notification (_universe/background_activity)", () 
     ]);
   });
 
-  it("clears a wake's autonomousTurn flag at the next idle when no followup comes", async () => {
-    const { agent, activityPayloads } = createAgent();
+  it("unlatches a wake whose followup never comes after the grace window", async () => {
+    const { agent, activityPayloads, trace } = createAgent();
+    agent.autonomousWakeGraceMs = 20;
 
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
         const iter = input[Symbol.asyncIterator]();
         const { value: userMessage } = await iter.next();
+        const session = () => agent.sessions["test-session"]!;
         yield userEcho(userMessage);
         yield running();
         yield backgroundTaskStarted("task-1");
@@ -18592,9 +19011,12 @@ describe("background activity notification (_universe/background_activity)", () 
         yield idle();
         yield taskNotification("task-1");
         // The wake's followup never arrives (notification lost/skipped
-        // model-side): the idle backstop must unlatch the flag rather than
-        // leaving the session looking busy forever.
+        // model-side). A late idle cannot prove that, so the bounded grace
+        // timer is the backstop that unlatches the flag.
         yield idle();
+        trace.push(`after-idle:${session().autonomousTurnActive}`);
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        trace.push(`after-grace:${session().autonomousTurnActive}`);
       }
       return messageGenerator();
     });
@@ -18602,6 +19024,13 @@ describe("background activity notification (_universe/background_activity)", () 
     await prompt(agent);
     await agent.sessions["test-session"]?.consumer;
 
+    expect(trace).toEqual([
+      "activity:1/false",
+      "activity:0/true",
+      "after-idle:true",
+      "activity:0/false",
+      "after-grace:false",
+    ]);
     expect(activityPayloads()).toEqual([
       { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
       { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: true },
