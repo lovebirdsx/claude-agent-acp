@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { messageIdForGrouping } from "../acp-agent.js";
-import { resolveForkAnchor, type AnchorChainMessage } from "../session-anchor.js";
+import {
+  resolveForkAnchor,
+  resolveRewindAnchor,
+  type AnchorChainMessage,
+} from "../session-anchor.js";
 import type { RawTranscriptEntry } from "../transcript-history.js";
 
 /** 有效链的一条行；assistant 行可选带 API message id（分组锚点）。 */
@@ -116,5 +120,93 @@ describe("resolveForkAnchor", () => {
     const { anchor, readChain } = resolve({});
     await anchor("uuid-user-3", { dir: "" });
     expect(readChain).toHaveBeenCalledWith(undefined);
+  });
+});
+
+function resolveRewind(options: {
+  chain?: AnchorChainMessage[];
+  raw?: RawTranscriptEntry[] | undefined;
+}) {
+  const readChain = vi.fn(async (_dir?: string) => options.chain ?? DEFAULT_CHAIN);
+  const readRawEntries = vi.fn(async () => options.raw);
+  const anchor = (
+    messageId: string,
+    extra: { dir?: string } = {},
+  ): ReturnType<typeof resolveRewindAnchor> =>
+    resolveRewindAnchor({
+      messageId,
+      dir: extra.dir,
+      readChain,
+      readRawEntries,
+      messageIdForGrouping,
+    });
+  return { anchor, readChain, readRawEntries };
+}
+
+describe("resolveRewindAnchor", () => {
+  it("把中间 user 轮解析成锚点自身 uuid + 前驱", async () => {
+    const { anchor, readRawEntries } = resolveRewind({});
+    await expect(anchor("uuid-user-3")).resolves.toEqual({
+      anchorUuid: "uuid-user-3",
+      previousUuid: "uuid-asst-2",
+      resolution: "active",
+    });
+    // 链命中时不必回读原始 transcript。
+    expect(readRawEntries).not.toHaveBeenCalled();
+  });
+
+  it("assistant 轮次按 API message id 分组匹配", async () => {
+    const { anchor } = resolveRewind({});
+    await expect(anchor("api-2")).resolves.toEqual({
+      anchorUuid: "uuid-asst-2",
+      previousUuid: "uuid-user-2",
+      resolution: "active",
+    });
+  });
+
+  it("首条消息合法：没有前驱，但锚点本身可回退（与 fork 有意不同）", async () => {
+    const { anchor } = resolveRewind({});
+    await expect(anchor("uuid-user-1")).resolves.toEqual({
+      anchorUuid: "uuid-user-1",
+      previousUuid: undefined,
+      resolution: "active",
+    });
+  });
+
+  it("folded（steering）prompt 解析成 attachment 行 uuid + 链上父消息", async () => {
+    const { anchor } = resolveRewind({
+      raw: [queuedCommand("uuid-att-1", "uuid-asst-2", "acp-steered-1")],
+    });
+    await expect(anchor("acp-steered-1")).resolves.toEqual({
+      anchorUuid: "uuid-att-1",
+      previousUuid: "uuid-asst-2",
+      resolution: "folded",
+    });
+  });
+
+  it("folded parent 已不在链上（rewind 丢弃的分支）视为未找到", async () => {
+    const { anchor } = resolveRewind({
+      raw: [queuedCommand("uuid-att-1", "uuid-rewound-away", "acp-steered-1")],
+    });
+    await expect(anchor("acp-steered-1")).resolves.toBeUndefined();
+  });
+
+  it("未知锚点返回 undefined，由调用方维持既有 invalidParams", async () => {
+    const { anchor, readRawEntries } = resolveRewind({});
+    await expect(anchor("does-not-exist")).resolves.toBeUndefined();
+    expect(readRawEntries).toHaveBeenCalledTimes(1);
+  });
+
+  it("原始 transcript 读取失败（undefined）时按未找到处理", async () => {
+    const { anchor } = resolveRewind({ raw: undefined });
+    await expect(anchor("does-not-exist")).resolves.toBeUndefined();
+  });
+
+  it("非空 cwd 透传给链读取器，空 cwd 省略", async () => {
+    const { anchor, readChain } = resolveRewind({});
+    await anchor("uuid-user-3", { dir: "/proj" });
+    expect(readChain).toHaveBeenCalledWith("/proj");
+    await anchor("uuid-user-3", { dir: "" });
+    expect(readChain).toHaveBeenLastCalledWith(undefined);
   });
 });

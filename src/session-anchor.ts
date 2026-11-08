@@ -1,5 +1,9 @@
 import { RequestError } from "@agentclientprotocol/sdk";
-import { findFoldedPromptParent, type RawTranscriptEntry } from "./transcript-history.js";
+import {
+  findFoldedPromptAnchor,
+  findFoldedPromptParent,
+  type RawTranscriptEntry,
+} from "./transcript-history.js";
 
 /** 有效链（`getSessionMessages` 结果）里本模块需要的最小字段；ACP 锚点靠
  *  {@link ForkAnchorDependencies.messageIdForGrouping} 在该链上匹配。 */
@@ -91,4 +95,69 @@ export async function resolveForkAnchor(
     }
   }
   return { upToMessageId, resolution };
+}
+
+/** {@link resolveRewindAnchor} 的依赖：与 fork 解析相同的读取器，但不需要 live UUID——
+ *  live 命中由调用方先处理，这里只服务冷进程的磁盘兜底。 */
+export type RewindAnchorDependencies = {
+  /** 客户端持有的 ACP messageId（user 轮即其 uuid；折叠 prompt 存在 source_uuid）。 */
+  messageId: string;
+  /** 会话 cwd；空串与 undefined 都表示「不限目录」（见实现里的空 dir 处理）。 */
+  dir?: string;
+  /** 读取 SDK 有效链；rewind 解析只调用一次。 */
+  readChain: (dir?: string) => Promise<readonly AnchorChainMessage[]>;
+  /** 读取原始磁盘 transcript；仅在 folded fallback 时调用。 */
+  readRawEntries: () => Promise<RawTranscriptEntry[] | undefined>;
+  /** ACP messageId 分类器，与 live/replay 的 chunk 分组共用。 */
+  messageIdForGrouping: (message: AnchorChainMessage) => string | undefined;
+};
+
+export type RewindAnchorResolution = {
+  /** 截断/重放/rewindFiles 用的锚点行 uuid；折叠 prompt 为 attachment 行 uuid。 */
+  anchorUuid: string;
+  /** `resumeSessionAt` 的前驱（inclusive 语义）；首条消息为 undefined。 */
+  previousUuid: string | undefined;
+  resolution: "active" | "folded";
+};
+
+/**
+ * Resolve a rewind target (回退锚点) against the on-disk transcript when the
+ * live `messageIdToUuid` table missed. A rewind is normally served by that
+ * table, but it only exists on the process that has the session resident: after
+ * `session/resume` (idle-reaper wake, crash recovery, fingerprint rebuild) the
+ * recreated Session starts with an empty table while the editor still shows
+ * messageIds from before the reconnect.
+ *
+ * Unlike {@link resolveForkAnchor} this returns the anchor row ITSELF (rewind
+ * needs it for `rewindFiles` / transcript truncation / replay boundary) and the
+ * first message is valid: `previousUuid` is undefined and the caller truncates
+ * to an empty history. Returning undefined means "not found"; the caller keeps
+ * its existing `invalidParams` failure shape.
+ *
+ * A folded (steered) prompt has no effective-chain row; its `queued_command`
+ * attachment carries the client id and hangs off a chain message. The
+ * attachment's own uuid is the truncation point, and its parent must still be
+ * on the chain so a rewind-discarded branch is never resurrected.
+ */
+export async function resolveRewindAnchor(
+  dependencies: RewindAnchorDependencies,
+): Promise<RewindAnchorResolution | undefined> {
+  const { messageId, dir } = dependencies;
+  // 空 dir 必须丢弃而不是透传（与 fork 相同：SDK 把缺失的 dir 读作「搜遍所有 project」）。
+  const chain = await dependencies.readChain(dir !== undefined && dir.length > 0 ? dir : undefined);
+  const index = chain.findIndex(
+    (message) => dependencies.messageIdForGrouping(message) === messageId,
+  );
+  if (index >= 0) {
+    const anchor = chain[index];
+    if (anchor === undefined) return undefined;
+    return {
+      anchorUuid: anchor.uuid,
+      previousUuid: index > 0 ? chain[index - 1]?.uuid : undefined,
+      resolution: "active",
+    };
+  }
+  const folded = findFoldedPromptAnchor(await dependencies.readRawEntries(), messageId, chain);
+  if (folded === undefined) return undefined;
+  return { anchorUuid: folded.uuid, previousUuid: folded.parentUuid, resolution: "folded" };
 }

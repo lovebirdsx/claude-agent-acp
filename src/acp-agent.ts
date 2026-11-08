@@ -98,7 +98,7 @@ import {
   rebuildTranscriptDisplayChain,
   type RawTranscriptEntry,
 } from "./transcript-history.js";
-import { resolveForkAnchor } from "./session-anchor.js";
+import { resolveForkAnchor, resolveRewindAnchor } from "./session-anchor.js";
 import { releaseQueryResources } from "./query-resources.js";
 import {
   AcpSessionNotification,
@@ -8603,9 +8603,11 @@ export class ClaudeAcpAgent {
    * Translate the ACP messageId the client stamped on a user turn into the SDK
    * message uuid the Agent SDK's rewind/resume APIs key on, using the live
    * session's `messageIdToUuid` table (populated during the message loop and on
-   * `replaySessionHistory`). Returns undefined when the session isn't resident or
-   * the id is unknown — callers decide whether that is fatal (rewind) or a
-   * fall-through to whole-session behavior (fork).
+   * `replaySessionHistory`). This table is process-local, so a miss is not
+   * necessarily an unknown id: after `session/resume` it is empty while the
+   * editor still holds pre-reconnect messageIds. Callers fall back to the
+   * on-disk transcript (`resolveRewindAnchor` for rewind, `resolveForkAnchor`
+   * for fork) before deciding the id is fatal.
    */
   private resolveMessageUuid(sessionId: string, messageId: string): string | undefined {
     return this.sessions[sessionId]?.messageIdToUuid.get(messageId);
@@ -8744,18 +8746,46 @@ export class ClaudeAcpAgent {
    *      turn and everything after it.
    * A `dryRun` performs only step 1 in preview mode and reports the file stats
    * without mutating disk or the conversation. Backs the editor's
-   * `universe-editor/rewind_session` ext-method.
+   * `universe-editor/rewind_session` ext-method. The target messageId is
+   * translated through the live `messageIdToUuid` table; a miss (e.g. the
+   * session was resumed in a fresh process) falls back to the on-disk
+   * transcript, so anchors from before the reconnect stay rewindable.
    */
   async rewindSession(params: RewindSessionRequest): Promise<Record<string, unknown>> {
     const session = this.sessions[params.sessionId];
     if (!session) {
       throw RequestError.resourceNotFound(params.sessionId);
     }
-    const uuid = this.resolveMessageUuid(params.sessionId, params.messageId);
-    if (uuid === undefined) {
-      throw RequestError.invalidParams(
-        { messageId: params.messageId },
-        `Unknown messageId for session ${params.sessionId}; cannot resolve a rewind target`,
+    // The live table is a fast path, not the source of truth: a `session/resume`
+    // (idle-reaper wake / crash recovery) recreates the Session without
+    // replaying history, so it starts empty while the editor still shows
+    // messageIds from before the reconnect. Read the on-disk transcript before
+    // declaring the anchor unknown.
+    const liveUuid = this.resolveMessageUuid(params.sessionId, params.messageId);
+    let uuid: string;
+    let diskPreviousUuid: string | undefined;
+    if (liveUuid !== undefined) {
+      uuid = liveUuid;
+    } else {
+      const resolved = await resolveRewindAnchor({
+        messageId: params.messageId,
+        dir: session.cwd,
+        readChain: (dir) =>
+          getSessionMessages(params.sessionId, dir !== undefined ? { dir } : {}),
+        readRawEntries: () => this.readTranscriptEntries(params.sessionId),
+        messageIdForGrouping,
+      });
+      if (resolved === undefined) {
+        throw RequestError.invalidParams(
+          { messageId: params.messageId },
+          `Unknown messageId for session ${params.sessionId}; cannot resolve a rewind target`,
+        );
+      }
+      uuid = resolved.anchorUuid;
+      diskPreviousUuid = resolved.previousUuid;
+      this.logger.log(
+        `rewind-point: resolution=${resolved.resolution} anchor=${params.messageId} ` +
+          `uuid=${uuid} before=${diskPreviousUuid ?? "<none>"}`,
       );
     }
 
@@ -8782,8 +8812,12 @@ export class ClaudeAcpAgent {
     // uuid preceding the user turn; `replaySessionHistory` reads the still-whole
     // disk transcript, so it must also stop before the anchor. When the anchor is
     // the first message there is no predecessor — resume the session whole (empty
-    // truncation point) and replay nothing.
-    const beforeUuid = await this.messageUuidBefore(params.sessionId, uuid, session.cwd);
+    // truncation point) and replay nothing. A disk-resolved anchor already
+    // carries its predecessor (one chain read); a live hit still derives it.
+    const beforeUuid =
+      liveUuid !== undefined
+        ? await this.messageUuidBefore(params.sessionId, uuid, session.cwd)
+        : diskPreviousUuid;
     // Persist the truncation to disk BEFORE tearing the session down (we still
     // have its cwd here). `resumeSessionAt` only rebuilds the in-memory Query, so
     // without this the rewound turns reappear on the next reload.

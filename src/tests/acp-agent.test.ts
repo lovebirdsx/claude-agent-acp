@@ -9029,9 +9029,17 @@ describe("universe-editor/rewind_session (rewindSession)", () => {
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
 
+  beforeEach(() => {
+    // Every cold-map rewind reads the effective chain; keep that deterministic
+    // (and off the real filesystem) unless a test overrides it.
+    vi.mocked(getSessionMessages).mockReset();
+    vi.mocked(getSessionMessages).mockResolvedValue([] as any);
+  });
+
   it("rejects an unknown messageId with invalidParams", async () => {
     const agent = createMockAgent();
     injectGeneratorSession(agent, async function* () {});
+    vi.spyOn(agent as any, "readTranscriptEntries").mockResolvedValue(undefined);
     await expect(
       agent.rewindSession({ sessionId: "test-session", messageId: "nope" }),
     ).rejects.toMatchObject({ code: -32602 });
@@ -9042,6 +9050,199 @@ describe("universe-editor/rewind_session (rewindSession)", () => {
     await expect(
       agent.rewindSession({ sessionId: "ghost", messageId: "m1" }),
     ).rejects.toMatchObject({ code: -32002 });
+  });
+
+  it("resolves a rewind target from disk when the live map is cold (session/resume)", async () => {
+    // `session/resume` recreates the agent-side Session without replaying
+    // history, so `messageIdToUuid` is empty even though the editor still holds
+    // messageIds from before the reconnect. The transcript is the durable truth;
+    // a rewind must not depend on process-local state.
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, async function* () {});
+    const session = agent.sessions["test-session"]!;
+    expect(session.messageIdToUuid.size).toBe(0);
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      { type: "user", uuid: "uuid-user-1", session_id: "s", message: {}, parent_tool_use_id: null },
+      {
+        type: "assistant",
+        uuid: "uuid-asst-1",
+        session_id: "s",
+        message: {},
+        parent_tool_use_id: null,
+      },
+      { type: "user", uuid: "uuid-user-2", session_id: "s", message: {}, parent_tool_use_id: null },
+    ] as any);
+    vi.spyOn(agent as any, "readTranscriptEntries").mockResolvedValue(undefined);
+    session.query.rewindFiles = vi.fn(async () => ({
+      canRewind: true,
+      filesChanged: [],
+      insertions: 0,
+      deletions: 0,
+    }));
+    const teardown = vi.spyOn(agent as any, "teardownSession").mockResolvedValue(undefined);
+    const create = vi.spyOn(agent as any, "createSession").mockResolvedValue({} as any);
+    const replay = vi.spyOn(agent as any, "replaySessionHistory").mockResolvedValue(undefined);
+    const truncate = vi
+      .spyOn(agent as any, "truncateTranscriptBefore")
+      .mockResolvedValue(undefined);
+
+    await agent.rewindSession({ sessionId: "test-session", messageId: "uuid-user-2" });
+
+    expect(session.query.rewindFiles).toHaveBeenCalledWith("uuid-user-2", { dryRun: false });
+    expect(truncate).toHaveBeenCalledWith("test-session", "uuid-user-2");
+    expect(teardown).toHaveBeenCalledWith("test-session");
+    expect(create).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ resume: "test-session", resumeSessionAt: "uuid-asst-1" }),
+    );
+    expect(replay).toHaveBeenCalledWith("test-session", undefined, undefined, "uuid-user-2");
+    expect(getSessionMessages).toHaveBeenCalledWith("test-session", { dir: "/test" });
+  });
+
+  it("previews a disk-resolved anchor without tearing the session down", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, async function* () {});
+    const session = agent.sessions["test-session"]!;
+    // No live mapping (fresh process after session/resume): resolve from disk.
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      { type: "user", uuid: "uuid-user-1", session_id: "s", message: {}, parent_tool_use_id: null },
+      { type: "user", uuid: "uuid-user-2", session_id: "s", message: {}, parent_tool_use_id: null },
+    ] as any);
+    vi.spyOn(agent as any, "readTranscriptEntries").mockResolvedValue(undefined);
+    session.query.rewindFiles = vi.fn(async () => ({
+      canRewind: true,
+      filesChanged: ["a.ts"],
+      insertions: 1,
+      deletions: 0,
+    }));
+    const teardown = vi.spyOn(agent as any, "teardownSession").mockResolvedValue(undefined);
+    const truncate = vi
+      .spyOn(agent as any, "truncateTranscriptBefore")
+      .mockResolvedValue(undefined);
+
+    const result = await agent.rewindSession({
+      sessionId: "test-session",
+      messageId: "uuid-user-2",
+      dryRun: true,
+    });
+
+    expect(session.query.rewindFiles).toHaveBeenCalledWith("uuid-user-2", { dryRun: true });
+    expect(teardown).not.toHaveBeenCalled();
+    expect(truncate).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ canRewind: true, filesChanged: ["a.ts"] });
+  });
+
+  it("keeps the live mapping as the fast path instead of consulting disk", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, async function* () {});
+    const session = agent.sessions["test-session"]!;
+    session.messageIdToUuid.set("acp-msg", "sdk-live-uuid");
+    session.query.rewindFiles = vi.fn(async () => ({
+      canRewind: true,
+      filesChanged: [],
+      insertions: 0,
+      deletions: 0,
+    }));
+    const before = vi
+      .spyOn(agent as any, "messageUuidBefore")
+      .mockResolvedValue("sdk-before");
+    const create = vi.spyOn(agent as any, "createSession").mockResolvedValue({} as any);
+    vi.spyOn(agent as any, "teardownSession").mockResolvedValue(undefined);
+    vi.spyOn(agent as any, "truncateTranscriptBefore").mockResolvedValue(undefined);
+    vi.spyOn(agent as any, "replaySessionHistory").mockResolvedValue(undefined);
+    const readRaw = vi.spyOn(agent as any, "readTranscriptEntries").mockResolvedValue(undefined);
+
+    await agent.rewindSession({ sessionId: "test-session", messageId: "acp-msg" });
+
+    expect(session.query.rewindFiles).toHaveBeenCalledWith("sdk-live-uuid", { dryRun: false });
+    expect(before).toHaveBeenCalledWith("test-session", "sdk-live-uuid", "/test");
+    expect(create).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ resume: "test-session", resumeSessionAt: "sdk-before" }),
+    );
+    expect(readRaw).not.toHaveBeenCalled();
+    expect(getSessionMessages).not.toHaveBeenCalled();
+  });
+
+  it("resolves a folded (steered) prompt to its attachment row and chain parent", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, async function* () {});
+    const session = agent.sessions["test-session"]!;
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      { type: "user", uuid: "uuid-user-1", session_id: "s", message: {}, parent_tool_use_id: null },
+      {
+        type: "assistant",
+        uuid: "uuid-asst-1",
+        session_id: "s",
+        message: {},
+        parent_tool_use_id: null,
+      },
+    ] as any);
+    vi.spyOn(agent as any, "readTranscriptEntries").mockResolvedValue([
+      {
+        type: "attachment",
+        uuid: "uuid-att-1",
+        parentUuid: "uuid-asst-1",
+        attachment: { type: "queued_command", source_uuid: "acp-steered-1" },
+      },
+    ] as any);
+    session.query.rewindFiles = vi.fn(async () => ({
+      canRewind: true,
+      filesChanged: [],
+      insertions: 0,
+      deletions: 0,
+    }));
+    const create = vi.spyOn(agent as any, "createSession").mockResolvedValue({} as any);
+    vi.spyOn(agent as any, "teardownSession").mockResolvedValue(undefined);
+    const truncate = vi
+      .spyOn(agent as any, "truncateTranscriptBefore")
+      .mockResolvedValue(undefined);
+    vi.spyOn(agent as any, "replaySessionHistory").mockResolvedValue(undefined);
+
+    await agent.rewindSession({ sessionId: "test-session", messageId: "acp-steered-1" });
+
+    expect(session.query.rewindFiles).toHaveBeenCalledWith("uuid-att-1", { dryRun: false });
+    expect(truncate).toHaveBeenCalledWith("test-session", "uuid-att-1");
+    expect(create).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ resume: "test-session", resumeSessionAt: "uuid-asst-1" }),
+    );
+  });
+
+  it("rewinds a disk-resolved first message without resumeSessionAt", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, async function* () {});
+    const session = agent.sessions["test-session"]!;
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      { type: "user", uuid: "uuid-user-1", session_id: "s", message: {}, parent_tool_use_id: null },
+      {
+        type: "assistant",
+        uuid: "uuid-asst-1",
+        session_id: "s",
+        message: {},
+        parent_tool_use_id: null,
+      },
+    ] as any);
+    vi.spyOn(agent as any, "readTranscriptEntries").mockResolvedValue(undefined);
+    session.query.rewindFiles = vi.fn(async () => ({
+      canRewind: true,
+      filesChanged: [],
+      insertions: 0,
+      deletions: 0,
+    }));
+    const create = vi.spyOn(agent as any, "createSession").mockResolvedValue({} as any);
+    vi.spyOn(agent as any, "teardownSession").mockResolvedValue(undefined);
+    const truncate = vi
+      .spyOn(agent as any, "truncateTranscriptBefore")
+      .mockResolvedValue(undefined);
+    vi.spyOn(agent as any, "replaySessionHistory").mockResolvedValue(undefined);
+
+    await agent.rewindSession({ sessionId: "test-session", messageId: "uuid-user-1" });
+
+    expect(truncate).toHaveBeenCalledWith("test-session", "uuid-user-1");
+    const options = (create as any).mock.calls[0]![1];
+    expect(options).toMatchObject({ resume: "test-session" });
+    expect(options).not.toHaveProperty("resumeSessionAt");
   });
 
   it("dry run previews files via rewindFiles(dryRun) without tearing down the session", async () => {

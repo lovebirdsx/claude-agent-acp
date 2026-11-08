@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  findFoldedPromptAnchor,
   findFoldedPromptParent,
   isQueuedCommandEntry,
   mergeQueuedCommandAttachments,
@@ -546,7 +547,7 @@ describe("mergeQueuedCommandAttachments", () => {
   });
 });
 
-describe("findFoldedPromptParent (folded steering anchor)", () => {
+describe("findFoldedPromptAnchor / findFoldedPromptParent (folded steering anchor)", () => {
   const entry = (e: Partial<RawTranscriptEntry> & { uuid: string }): RawTranscriptEntry =>
     e as RawTranscriptEntry;
   const queued = (
@@ -593,5 +594,28 @@ describe("findFoldedPromptParent (folded steering anchor)", () => {
 
   it("returns undefined when the raw transcript is unavailable", () => {
     expect(findFoldedPromptParent(undefined, "client-1", [{ uuid: "a1" }])).toBeUndefined();
+  });
+
+  it("returns both the attachment row uuid and its parent for a rewind anchor", () => {
+    expect(
+      findFoldedPromptAnchor([queued("q1", "client-1", "a1")], "client-1", [
+        { uuid: "u1" },
+        { uuid: "a1" },
+      ]),
+    ).toEqual({ uuid: "q1", parentUuid: "a1" });
+  });
+
+  it("rejects the anchor when its parent left the effective chain", () => {
+    expect(
+      findFoldedPromptAnchor([queued("q1", "client-1", "gone")], "client-1", [{ uuid: "a1" }]),
+    ).toBeUndefined();
+  });
+
+  it("keeps findFoldedPromptParent as the parent-only view of the same anchor", () => {
+    const entries = [queued("q1", "client-1", "a1")];
+    const chain = [{ uuid: "a1" }];
+    expect(findFoldedPromptParent(entries, "client-1", chain)).toBe(
+      findFoldedPromptAnchor(entries, "client-1", chain)?.parentUuid,
+    );
   });
 });

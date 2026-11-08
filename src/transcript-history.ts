@@ -276,17 +276,32 @@ export const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = 
   "observer-activity",
 ]);
 
+/** 折叠 prompt 的完整锚点：attachment 行自身 uuid（截断点）+ 它挂靠的链上父消息。 */
+export type FoldedPromptAnchor = {
+  uuid: string;
+  parentUuid: string;
+};
+
 // SDK 有效链不含 steering attachment；用 source_uuid 找父锚点，且不得复活已被 rewind 丢弃的分支。
+export function findFoldedPromptAnchor(
+  entries: RawTranscriptEntry[] | undefined,
+  messageId: string,
+  chain: readonly { uuid: string }[],
+): FoldedPromptAnchor | undefined {
+  const folded = entries?.find(
+    (entry) => isQueuedCommandEntry(entry) && entry.attachment?.source_uuid === messageId,
+  );
+  if (folded === undefined) return undefined;
+  const parent = typeof folded.parentUuid === "string" ? folded.parentUuid : undefined;
+  if (parent === undefined || !chain.some((message) => message.uuid === parent)) return undefined;
+  return { uuid: folded.uuid, parentUuid: parent };
+}
+
+/** fork 只需要切点（parent）；保留原导出与行为。 */
 export function findFoldedPromptParent(
   entries: RawTranscriptEntry[] | undefined,
   messageId: string,
   chain: readonly { uuid: string }[],
 ): string | undefined {
-  const folded = entries?.find(
-    (entry) => isQueuedCommandEntry(entry) && entry.attachment?.source_uuid === messageId,
-  );
-  const parent = typeof folded?.parentUuid === "string" ? folded.parentUuid : undefined;
-  return parent !== undefined && chain.some((message) => message.uuid === parent)
-    ? parent
-    : undefined;
+  return findFoldedPromptAnchor(entries, messageId, chain)?.parentUuid;
 }

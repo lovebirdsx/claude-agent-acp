@@ -100,6 +100,24 @@ CLI 的 first-party 家族改写会把内置 Explore 子 agent 从网关模型�
 
 **真实 SDK 行为（`tests/fork-session-sdk.test.ts`，真实 `forkSession` / `getSessionMessages` 文件操作，8/8 通过）**：`forkSession` 把保留行的 `uuid` / `parentUuid` 重映射为新 uuid（parent 链不悬挂）、丢弃 progress / sidechain 行；但 **folded attachment 行本身、以及它的 `attachment.source_uuid`（客户端 prompt id）原样保留**——回放正是靠这个 id 重新锚定。`compact_boundary` 的 `logicalParentUuid` 也重映射到新的压缩前 uuid，显示链因此穿过边界。**勿把这里写成「raw uuid / `source_uuid` 全被重映射」**——`source_uuid` 恰恰被保留。
 
+## rewind 锚点解析走磁盘兜底（休眠会话 resume 后报 Unknown messageId）
+
+**症状**：会话空闲被 idle reaper 停掉进程后，重新打开 / 点 Rewind 触发 `session/resume`；对 resume 之前的任意 user 消息点 Rewind，预览报 `Invalid params: Unknown messageId for session <sid>; cannot resolve a rewind target`（`-32602`），而 resume 之后新发的消息 Rewind 正常。编辑器日志顺序：`session/resume`（新进程）→ `universe-editor/rewind_session` 失败。用户会话 `72af8cb5-...` 的实锚点 `723fae15-...` / `d73b5fe6-...` 都能在磁盘有效链上找到，只是 live 表为空。
+
+**根因**：`rewindSession` 只查 `Session.messageIdToUuid`（进程内存表）。`session/resume` 的 `getOrCreateSession` 新建 `Session` 时 `messageIdToUuid: new Map()`，不 replay、不回填；编辑器 timeline 却保留重连前的 messageId。fork 侧早已用磁盘兜底（上节），rewind 漏了这一层。
+
+**修法**：新增 `session-anchor.ts` 的 `resolveRewindAnchor(deps)`（与 `resolveForkAnchor` 并列、依赖注入）：live 表 miss 时读 `getSessionMessages(sid, {dir})`，按 `messageIdForGrouping` 匹配有效链；链上没有则读原始 transcript，找 `queued_command` 的 `source_uuid`（attachment 行 uuid = 截断点，parentUuid = `resumeSessionAt` 前驱）。`rewindSession` 先走 live 快路径，miss 才回读磁盘；`rewindFiles` / `truncateTranscriptBefore` / `replaySessionHistory(stopBeforeUuid)` 全用解析出的 anchorUuid，`resumeSessionAt` 用 previousUuid（磁盘分支不再二次读链）。未找到仍抛原 `invalidParams`；IO 异常照常冒泡。
+
+**三条红线**：
+
+- **首条消息合法**：rewind 与 fork 不同——`previousUuid=undefined` 表示截断成空历史，不传 `resumeSessionAt` 继续执行；fork 才因 inclusive 无法表达空历史而拒绝。
+- **不要写回 `messageIdToUuid`**：写回不省 IO（live 快路径仍要 `messageUuidBefore` 读链），且会混淆「该表只由 live/replay 写入」的不变量。
+- **折叠 prompt 没有文件 checkpoint**：`rewindFiles` 对 attachment uuid 通常返回 `canRewind:false`，对话截断仍可用；不要把 `rewindFiles` 改到父轮（会多回滚父轮的文件修改）。
+
+**残差**：① 压缩前锚点在冷 resume 后仍解析不到（有效链从 summary 起；用原始行顺序解析会复活 CLI 已丢弃的分支，另立话题）；② live 命中但尚未落盘的 prompt 维持 `messageUuidBefore` 的 `idx<=0` 合流语义。
+
+配套测试：`tests/session-anchor.test.ts`（`resolveRewindAnchor` 8 例）、`tests/transcript-history.test.ts`（`findFoldedPromptAnchor` 与包装一致性）、`tests/acp-agent.test.ts` rewind describe（冷表磁盘解析 / dryRun / live 快路径 / 折叠 / 首条 / 未知）。**先红后绿**：冷表用例在修复前精确复现 `-32602`。
+
 ## 压缩卡片 30s 心跳去重（`_universe/compaction` 只在压缩真正开始时发一条 start）
 
 **症状**：编辑器的上下文压缩卡片（`CompactionCard`，进度条 + 秒表）在长压缩里「进度条走满（99%）→ 秒表归零、进度条从 0 重走」，而压缩实际尚未结束。
