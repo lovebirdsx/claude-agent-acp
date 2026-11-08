@@ -1004,6 +1004,10 @@ type PendingReplay = {
 export type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
+  /** A cancel is pending for the session: its active and queued turns settle
+   *  `cancelled`, and work no user prompt owns (background-task wakes,
+   *  autonomous output) stays suppressed until the next prompt's echo clears
+   *  this in `activateTurn()`. */
   cancelled: boolean;
   /** FIFO of in-flight prompts. The head is the turn the SDK is currently
    *  processing; later entries are queued and will be echoed in order. */
@@ -4718,6 +4722,17 @@ export class ClaudeAcpAgent {
      *  the autonomous stretch-close guard. */
     const firstUnsettledQueuedTurn = () => (session.turnQueue ?? []).find((t) => !t.settled);
 
+    /** Streamed output belongs to no user turn: the session was cancelled and
+     *  neither a live turn nor a queued prompt owns what arrives next. That is
+     *  the autonomous followup a cancelled background task must not run (or,
+     *  if the CLI had already started it, must not show). A cancelled live
+     *  turn keeps `activeTurn` until its trailing idle — its flushed tail must
+     *  still reach the client — and a prompt sent after the cancel is already
+     *  in `turnQueue` before any output can exist, because `startTurn` pushes
+     *  the turn and its input in one synchronous step. Neither is suppressed. */
+    const isCancelledOutOfTurnOutput = () =>
+      session.cancelled && session.activeTurn == null && firstUnsettledQueuedTurn() == null;
+
     /** 该结果是否在作答一个仍在等待的 prompt。
      *
      *  Claude Code 会自行起一轮（如后台任务完成）。若该轮运行中用户发了
@@ -5925,11 +5940,16 @@ export class ClaudeAcpAgent {
                 // AUTONOMOUS_RESULT_ORIGINS origin) — flag it for the
                 // activity snapshot. Ambient tasks are housekeeping, not
                 // activity, and wake nothing: settling one must not latch the
-                // flag. The flag is cleared by the cycle's real result, or by
-                // the bundled wake-grace/silence lease if the followup never
-                // materializes; `idle` deliberately does not clear it (a late
-                // trailer from the previous cycle would strand this one).
-                if (message.ambient !== true) {
+                // flag. A cancelled session must not be woken either: the task
+                // settled after the user's Stop (or was stopped by cancel
+                // itself), so latching here would pull the editor back to
+                // running for work the user already dismissed. The flag is
+                // cleared by the cycle's real result, or by the bundled
+                // wake-grace/silence lease if the followup never materializes;
+                // `idle` deliberately does not clear it (a late trailer from
+                // the previous cycle would strand this one). The settle below
+                // still runs in either case: the live count must drop.
+                if (message.ambient !== true && !session.cancelled) {
                   this.noteAutonomousWake(params.sessionId, session);
                 }
                 // The task settled — no further tool calls can originate
@@ -6884,6 +6904,9 @@ export class ClaudeAcpAgent {
             break;
           }
           case "stream_event": {
+            // A cancelled session's unowned stream is the followup of the work
+            // the user stopped; do not render it (see the guard's doc).
+            if (isCancelledOutOfTurnOutput()) break;
             // The API's compaction block streams the retained summary text;
             // `content` is null on the opening block and on a failed compaction.
             // Only the root conversation's compaction is the session's: a
@@ -7183,8 +7206,16 @@ export class ClaudeAcpAgent {
               // wake, or a task-notification delivery in CLI versions that stamp
               // the user message itself) starts an autonomous cycle the
               // `task_notification` arm never saw — its result's origin will
-              // match (AUTONOMOUS_RESULT_ORIGINS) and clear the flag.
-              if (message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind)) {
+              // match (AUTONOMOUS_RESULT_ORIGINS) and clear the flag. After a
+              // cancel the delivery belongs to work the user stopped: it must
+              // not re-latch the cycle (the cancelled guard below drops its
+              // body, but only after this wake would have lifted the editor
+              // back to running).
+              if (
+                !session.cancelled &&
+                message.origin != null &&
+                AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind)
+              ) {
                 const wasActive = this.noteAutonomousWake(params.sessionId, session);
                 if (!wasActive) await this.emitBackgroundActivity(params.sessionId, session);
               }
@@ -7472,6 +7503,9 @@ export class ClaudeAcpAgent {
             break;
           }
           case "tool_progress": {
+            // Same rule as stream_event: progress from a cycle no user turn
+            // owns after a cancel belongs to the stopped work.
+            if (isCancelledOutOfTurnOutput()) break;
             // Not every beat reports under the id of a tool call the client has
             // seen: heartbeats derive `<tool_use_id>-heartbeat-<n>`, and the
             // `agent_api_retry` beats behind `subagentRetry` report under
@@ -7942,10 +7976,42 @@ export class ClaudeAcpAgent {
       }, this.forceCancelGraceMs);
     }
 
+    // Stop means stop everything: end the session's live background tasks
+    // too. The interrupt alone is not enough — a shell that settles around
+    // this moment still delivers a wake, and a task the CLI's hold-back sweep
+    // does not cover would keep running. Control requests are written in call
+    // order (see dropQueuedMessages), so the stops reach Claude Code before
+    // the interrupt below; awaiting them here could park the cancel behind a
+    // wedged control round-trip.
+    const stopTask = (session.query as Partial<Query>).stopTask;
+    if (typeof stopTask === "function") {
+      for (const [taskId, record] of [...session.liveBackgroundTasks]) {
+        if (record.ambient === true || record.endedPerLevel !== undefined) continue;
+        const logFailure = (error: unknown) =>
+          this.logger.error(
+            `Session ${params.sessionId}: could not stop the background task ${taskId} during cancel:`,
+            error,
+          );
+        try {
+          Promise.resolve(stopTask.call(session.query, taskId)).catch(logFailure);
+        } catch (error) {
+          logFailure(error);
+        }
+      }
+    }
+
     // Before the interrupt: once it stops the running turn, Claude Code starts
     // the next queued message right away.
     this.dropQueuedMessages(params.sessionId, session.query, abandoned);
-    const interrupt = session.query.interrupt();
+    // `cancel_queued` also dequeues the uuid-less task notifications waiting
+    // at the interrupt instant — the ones `dropQueuedMessages` cannot name.
+    // The SDK runtime maps it to `cancel_queued` even though its .d.ts does
+    // not declare the argument; older CLIs ignore the field.
+    const interrupt = (
+      session.query.interrupt as (options?: {
+        cancelQueued?: boolean;
+      }) => ReturnType<Query["interrupt"]>
+    ).call(session.query, { cancelQueued: true });
     if (!options.awaitInterrupt) {
       // The caller closes the query next, which rejects the pending reply.
       // The receipt only adjusts orphan accounting of a live session.
@@ -8770,8 +8836,7 @@ export class ClaudeAcpAgent {
       const resolved = await resolveRewindAnchor({
         messageId: params.messageId,
         dir: session.cwd,
-        readChain: (dir) =>
-          getSessionMessages(params.sessionId, dir !== undefined ? { dir } : {}),
+        readChain: (dir) => getSessionMessages(params.sessionId, dir !== undefined ? { dir } : {}),
         readRawEntries: () => this.readTranscriptEntries(params.sessionId),
         messageIdForGrouping,
       });

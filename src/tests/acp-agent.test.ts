@@ -9143,9 +9143,7 @@ describe("universe-editor/rewind_session (rewindSession)", () => {
       insertions: 0,
       deletions: 0,
     }));
-    const before = vi
-      .spyOn(agent as any, "messageUuidBefore")
-      .mockResolvedValue("sdk-before");
+    const before = vi.spyOn(agent as any, "messageUuidBefore").mockResolvedValue("sdk-before");
     const create = vi.spyOn(agent as any, "createSession").mockResolvedValue({} as any);
     vi.spyOn(agent as any, "teardownSession").mockResolvedValue(undefined);
     vi.spyOn(agent as any, "truncateTranscriptBefore").mockResolvedValue(undefined);
@@ -18588,13 +18586,16 @@ describe("background activity notification (_universe/background_activity)", () 
     // frame, so the relative position of an activity push is observable — the
     // payload array alone cannot tell an early clear from a late one.
     const trace: string[] = [];
+    const updates: SessionNotification[] = [];
     const extNotification = vi.fn(async (method: string, params: any) => {
       if (method === BACKGROUND_ACTIVITY_METHOD) {
         trace.push(`activity:${params.backgroundTasks}/${params.autonomousTurn}`);
       }
     });
     const mockClient = {
-      sessionUpdate: async () => {},
+      sessionUpdate: async (notification: SessionNotification) => {
+        updates.push(notification);
+      },
       extNotification,
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
@@ -18602,7 +18603,7 @@ describe("background activity notification (_universe/background_activity)", () 
       extNotification.mock.calls
         .filter(([method]) => method === BACKGROUND_ACTIVITY_METHOD)
         .map(([, params]) => params);
-    return { agent, activityPayloads, trace };
+    return { agent, activityPayloads, trace, updates };
   }
 
   function resultMessage(overrides: Record<string, any> = {}) {
@@ -18697,6 +18698,29 @@ describe("background activity notification (_universe/background_activity)", () 
     uuid: randomUUID(),
     session_id: "test-session",
   });
+
+  /** A minimal top-level streamed text delta. Enough for
+   *  `streamEventToAcpNotifications` to emit an `agent_message_chunk`, so the
+   *  tests can tell whether the consumer forwarded model output. */
+  const streamText = (text: string) => ({
+    type: "stream_event",
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: "test-session",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text },
+    },
+  });
+
+  const messageChunkTexts = (notifications: SessionNotification[]) =>
+    notifications
+      .filter((notification) => notification.update.sessionUpdate === "agent_message_chunk")
+      .map(
+        (notification) =>
+          (notification.update as { content: { text?: string } }).content.text ?? "",
+      );
 
   const assistantText = (text: string) => ({
     type: "assistant",
@@ -19237,6 +19261,217 @@ describe("background activity notification (_universe/background_activity)", () 
       { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: true },
       { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: false },
     ]);
+  });
+
+  it("keeps the cancelled session idle when a task_notification arrives after cancel", async () => {
+    const { agent, activityPayloads, trace } = createAgent();
+    let release!: () => void;
+    const afterCancel = new Promise<void>((resolve) => (release = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        const session = () => agent.sessions["test-session"]!;
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("task-1");
+        // The turn is over while the background task still runs — the exact
+        // state the editor shows as `background`, with Stop still visible.
+        yield resultMessage();
+        yield idle();
+        await afterCancel;
+        // The task settles only after the user pressed Stop. Its notification
+        // must not latch an autonomous cycle: that is what pulled the editor
+        // back to running and let the followup execute in the reported bug.
+        yield taskNotification("task-1");
+        trace.push(`after-notification:${session().autonomousTurnActive}`);
+        yield assistantText("late followup");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await prompt(agent);
+    expect(response.stopReason).toBe("end_turn");
+    await vi.waitFor(() =>
+      expect(agent.sessions["test-session"]?.liveBackgroundTasks.size).toBe(1),
+    );
+
+    await agent.cancel({ sessionId: "test-session" });
+    release();
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(trace).toContain("after-notification:false");
+    expect(activityPayloads()).toEqual([
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: false },
+    ]);
+  });
+
+  it("stops live non-ambient background tasks before the interrupt", async () => {
+    const { agent } = createAgent();
+    let release!: () => void;
+    const afterCancel = new Promise<void>((resolve) => (release = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("task-live");
+        yield backgroundTaskStarted("task-ambient", { ambient: true });
+        yield backgroundTaskStarted("agent-ended", { subagentType: "Explore" });
+        // The level signal ends the subagent and keeps the two shells live.
+        yield backgroundTasksChanged([
+          { task_id: "task-live" },
+          { task_id: "task-ambient", ambient: true },
+        ]);
+        yield resultMessage();
+        yield idle();
+        await afterCancel;
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await prompt(agent);
+    expect(response.stopReason).toBe("end_turn");
+    const session = agent.sessions["test-session"]!;
+    await vi.waitFor(() =>
+      expect(session.liveBackgroundTasks.get("agent-ended")?.endedPerLevel).toBe("ended"),
+    );
+
+    await agent.cancel({ sessionId: "test-session" });
+    release();
+    await session.consumer;
+
+    const query = session.query as any;
+    // Stop means stop everything: the live shell is stopped explicitly, while
+    // ambient housekeeping and tasks the level already ended are left alone.
+    expect(query.stopTask.mock.calls.map(([taskId]: [string]) => taskId)).toEqual(["task-live"]);
+    // The SDK writes control requests in call order, so the stop reaches
+    // Claude Code before the interrupt that follows it.
+    expect(query.stopTask.mock.invocationCallOrder[0]).toBeLessThan(
+      query.interrupt.mock.invocationCallOrder[0],
+    );
+    // A repeated Stop must not reject when a task is already gone.
+    await expect(agent.cancel({ sessionId: "test-session" })).resolves.toBeUndefined();
+  });
+
+  it("passes cancel_queued to the interrupt", async () => {
+    const { agent } = createAgent();
+    let release!: () => void;
+    const afterCancel = new Promise<void>((resolve) => (release = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield resultMessage();
+        yield idle();
+        await afterCancel;
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    const session = agent.sessions["test-session"]!;
+    await agent.cancel({ sessionId: "test-session" });
+    release();
+    await session.consumer;
+
+    // Queued uuid-less task notifications are dequeued by this flag; without
+    // it a task that settles around Stop time still wakes a whole followup.
+    expect((session.query as any).interrupt).toHaveBeenCalledWith({ cancelQueued: true });
+  });
+
+  it("drops out-of-turn stream output after cancel but forwards a queued next prompt", async () => {
+    const { agent, updates, trace } = createAgent();
+    let release!: () => void;
+    const afterCancel = new Promise<void>((resolve) => (release = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: firstUser } = await iter.next();
+        yield userEcho(firstUser);
+        yield running();
+        yield backgroundTaskStarted("task-1");
+        yield resultMessage();
+        yield idle();
+        await afterCancel;
+        // No user turn owns this output: the cancelled session must not show
+        // it even if the CLI already started a followup.
+        yield streamText("late autonomous output");
+        trace.push("after-late-stream");
+        yield assistantText("late consolidated");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+        const { value: secondUser } = await iter.next();
+        // The new prompt's delta may arrive before its echo; it must pass.
+        yield streamText("new answer before echo");
+        yield userEcho(secondUser);
+        yield assistantText("new answer after echo");
+        yield resultMessage();
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await vi.waitFor(() =>
+      expect(agent.sessions["test-session"]?.liveBackgroundTasks.size).toBe(1),
+    );
+    await agent.cancel({ sessionId: "test-session" });
+    release();
+    await vi.waitFor(() => expect(trace).toContain("after-late-stream"));
+
+    const second = await prompt(agent, "again");
+    expect(second.stopReason).toBe("end_turn");
+    await agent.sessions["test-session"]?.consumer;
+
+    const texts = messageChunkTexts(updates).join("");
+    expect(texts).not.toContain("late autonomous output");
+    expect(texts).toContain("new answer before echo");
+    expect(texts).toContain("new answer after echo");
+  });
+
+  it("keeps forwarding the cancelled turn's tail output", async () => {
+    const { agent, updates } = createAgent();
+    let release!: () => void;
+    const afterCancel = new Promise<void>((resolve) => (release = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        await afterCancel;
+        // The interrupt flushes the live turn's tail; it must still reach the
+        // client before the turn settles cancelled.
+        yield streamText("tail of cancelled turn");
+        yield resultMessage();
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const pending = prompt(agent);
+    await vi.waitFor(() => expect(agent.sessions["test-session"]?.activeTurn).toBeTruthy());
+    await agent.cancel({ sessionId: "test-session" });
+    release();
+    const response = await pending;
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(response.stopReason).toBe("cancelled");
+    expect(messageChunkTexts(updates).join("")).toContain("tail of cancelled turn");
   });
 });
 
