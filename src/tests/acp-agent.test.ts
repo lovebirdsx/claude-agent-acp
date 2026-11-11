@@ -4004,6 +4004,7 @@ describe("permission request cancellation", () => {
       emittedToolCalls: new Set(),
       userDeniedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      foregroundTaskIds: new Set(),
       subagentSpawns: new Map(),
       subagentResumeRedirects: new Map(),
       emittedAssistantText: false,
@@ -8721,6 +8722,7 @@ describe("session/close", () => {
       emittedToolCalls: new Set(),
       userDeniedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      foregroundTaskIds: new Set(),
       subagentSpawns: new Map(),
       subagentResumeRedirects: new Map(),
       emittedAssistantText: false,
@@ -8819,6 +8821,7 @@ describe("session/delete", () => {
       emittedToolCalls: new Set(),
       userDeniedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      foregroundTaskIds: new Set(),
       subagentSpawns: new Map(),
       subagentResumeRedirects: new Map(),
       emittedAssistantText: false,
@@ -10033,6 +10036,7 @@ describe("getOrCreateSession param change detection", () => {
       emittedToolCalls: new Set(),
       userDeniedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      foregroundTaskIds: new Set(),
       subagentSpawns: new Map(),
       subagentResumeRedirects: new Map(),
       emittedAssistantText: false,
@@ -14960,6 +14964,7 @@ describe("post-error recovery", () => {
       emittedToolCalls: new Set(),
       userDeniedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      foregroundTaskIds: new Set(),
       subagentSpawns: new Map(),
       subagentResumeRedirects: new Map(),
       emittedAssistantText: false,
@@ -18645,7 +18650,7 @@ describe("background activity notification (_universe/background_activity)", () 
   /** A non-subagent background task starting (e.g. run_in_background Bash). */
   const backgroundTaskStarted = (
     taskId: string,
-    opts: { ambient?: boolean; subagentType?: string } = {},
+    opts: { ambient?: boolean; subagentType?: string; backgrounded?: boolean } = {},
   ) => ({
     type: "system",
     subtype: "task_started",
@@ -18654,6 +18659,7 @@ describe("background activity notification (_universe/background_activity)", () 
     description: "copy files",
     ...(opts.ambient === true ? { ambient: true } : {}),
     ...(opts.subagentType !== undefined ? { subagent_type: opts.subagentType } : {}),
+    ...(opts.backgrounded !== undefined ? { is_backgrounded: opts.backgrounded } : {}),
     uuid: randomUUID(),
     session_id: "test-session",
   });
@@ -18690,11 +18696,13 @@ describe("background activity notification (_universe/background_activity)", () 
     session_id: "test-session",
   });
 
-  const taskUpdated = (taskId: string, status: string) => ({
+  /** `status` is optional: the SDK sends incremental patches, and a
+   *  move-to-background frame may carry only `is_backgrounded` (via `extra`). */
+  const taskUpdated = (taskId: string, status?: string, extra: Record<string, any> = {}) => ({
     type: "system",
     subtype: "task_updated",
     task_id: taskId,
-    patch: { status },
+    patch: { ...(status !== undefined ? { status } : {}), ...extra },
     uuid: randomUUID(),
     session_id: "test-session",
   });
@@ -18800,6 +18808,178 @@ describe("background activity notification (_universe/background_activity)", () 
     await agent.sessions["test-session"]?.consumer;
 
     expect(activityPayloads()).toEqual([
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: true },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: false },
+    ]);
+  });
+
+  it("does not latch a wake for a foreground task's completion", async () => {
+    const { agent, activityPayloads, trace } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        const session = () => agent.sessions["test-session"]!;
+        yield userEcho(userMessage);
+        yield running();
+        // `is_backgrounded: false` marks a FOREGROUND task: the spawning tool
+        // call blocks on it, so its notification is this turn's own tool
+        // result. Latching an autonomous wake here stranded the flag past the
+        // turn's result until the 60s wake grace expired — the editor kept
+        // showing "running" for tens of seconds after the answer finished.
+        yield backgroundTaskStarted("task-fg", { backgrounded: false });
+        yield taskNotification("task-fg");
+        trace.push(`after-notification:${session().autonomousTurnActive === true}`);
+        yield resultMessage();
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await prompt(agent);
+    expect(response.stopReason).toBe("end_turn");
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(trace).toEqual(["activity:1/false", "activity:0/false", "after-notification:false"]);
+    expect(activityPayloads()).toEqual([
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: false },
+    ]);
+    expect(agent.sessions["test-session"]?.autonomousTurnActive ?? false).toBe(false);
+  });
+
+  it("keeps the wake for a background task that settles while its spawning turn runs", async () => {
+    const { agent, activityPayloads, trace } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        const session = () => agent.sessions["test-session"]!;
+        yield userEcho(userMessage);
+        yield running();
+        // A genuinely background task (`is_backgrounded: true`) settles while
+        // its spawning user turn still runs: the followup wake must latch.
+        // Guards against a coarse "any notification during a user turn is the
+        // turn's own" fix.
+        yield backgroundTaskStarted("task-bg", { backgrounded: true });
+        yield taskNotification("task-bg");
+        trace.push(`after-notification:${session().autonomousTurnActive}`);
+        yield resultMessage();
+        yield idle();
+        yield assistantText("copy finished");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(trace).toEqual([
+      "activity:1/false",
+      "activity:0/true",
+      "after-notification:true",
+      "activity:0/false",
+    ]);
+    expect(activityPayloads()).toEqual([
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: true },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: false },
+    ]);
+  });
+
+  it("follows a patch-only move to the background", async () => {
+    const { agent, activityPayloads, trace } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        const session = () => agent.sessions["test-session"]!;
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("task-fg", { backgrounded: false });
+        // Incremental patch with no status: a foreground tool got backgrounded
+        // mid-turn. Its later completion is a real wake, so the marker must be
+        // dropped even though this frame takes neither the terminal nor the
+        // running branch below.
+        yield taskUpdated("task-fg", undefined, { is_backgrounded: true });
+        trace.push(`after-backgrounded:${session().foregroundTaskIds.has("task-fg")}`);
+        yield resultMessage();
+        yield idle();
+        yield taskNotification("task-fg");
+        trace.push(`after-notification:${session().autonomousTurnActive}`);
+        yield assistantText("copy finished");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(trace).toEqual([
+      "activity:1/false",
+      "after-backgrounded:false",
+      "activity:0/true",
+      "after-notification:true",
+      "activity:0/false",
+    ]);
+    expect(activityPayloads()).toEqual([
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: true },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: false },
+    ]);
+  });
+
+  it("wakes for a resumed subagent whose original spawn was foreground", async () => {
+    const { agent, activityPayloads, trace } = createAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        const session = () => agent.sessions["test-session"]!;
+        yield userEcho(userMessage);
+        yield running();
+        yield backgroundTaskStarted("agent-fg", { subagentType: "Explore", backgrounded: false });
+        yield taskUpdated("agent-fg", "completed");
+        // The SDK resumes the subagent under the same id without a new
+        // task_started, and a resumed subagent is always registered in the
+        // background per the SDK contract.
+        yield taskUpdated("agent-fg", "running");
+        trace.push(`after-resume:${session().foregroundTaskIds.has("agent-fg")}`);
+        yield resultMessage();
+        yield idle();
+        yield taskNotification("agent-fg");
+        trace.push(`after-notification:${session().autonomousTurnActive}`);
+        yield assistantText("copy finished");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await prompt(agent);
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(trace).toEqual([
+      "activity:1/false",
+      "activity:0/false",
+      "activity:1/false",
+      "after-resume:false",
+      "activity:0/true",
+      "after-notification:true",
+      "activity:0/false",
+    ]);
+    expect(activityPayloads()).toEqual([
+      { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
+      { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: false },
       { sessionId: "test-session", backgroundTasks: 1, autonomousTurn: false },
       { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: true },
       { sessionId: "test-session", backgroundTasks: 0, autonomousTurn: false },
@@ -21119,6 +21299,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       emittedToolCalls: new Set(),
       userDeniedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      foregroundTaskIds: new Set(),
       subagentSpawns: new Map(),
       subagentResumeRedirects: new Map(),
       emittedAssistantText: false,

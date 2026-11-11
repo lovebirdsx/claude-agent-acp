@@ -92,6 +92,7 @@ export function mockSessionState(
     emittedToolCalls: new Set(),
     userDeniedToolCalls: new Set(),
     liveBackgroundTasks: new Map(),
+    foregroundTaskIds: new Set(),
     subagentSpawns: new Map(),
     subagentResumeRedirects: new Map(),
     emittedAssistantText: false,

@@ -1329,6 +1329,14 @@ export type Session = {
       endedPerLevel?: "ended" | "sweep-armed";
     }
   >;
+  /** Tasks the SDK registered in the FOREGROUND (`task_started.is_backgrounded
+   *  === false`): the spawning tool call blocks on them, so their
+   *  `task_notification` is the current turn's own tool result and wakes no
+   *  autonomous followup. Kept separately from `liveBackgroundTasks`: a
+   *  terminal `task_updated` may delete that record before the (unordered)
+   *  notification arrives, which would lose the marker. Absent id = unknown
+   *  (older CLI / task types without the field) — keep the historic wake. */
+  foregroundTaskIds: Set<string>;
   /** The parent tool call of each subagent that a settle bookend removed from
    *  `liveBackgroundTasks`. The SDK can resume such a subagent under the same
    *  agent id without a new `task_started` (a running `task_updated` patch or
@@ -4541,6 +4549,12 @@ export class ClaudeAcpAgent {
             record.endedPerLevel = "sweep-armed";
           }
         }
+        // A foreground task blocks its turn's result, so none can outlive a
+        // real turn boundary: this is the lost-notification fallback and the
+        // growth bound. Guarded like the sweep because a local-only command
+        // can activate while the current turn's foreground tool is still
+        // blocking — clearing then would re-latch its notification.
+        session.foregroundTaskIds.clear();
       }
       resetTurnScratch();
       // Without a command_lifecycle "started" frame before it (see that
@@ -4819,11 +4833,16 @@ export class ClaudeAcpAgent {
     /** Registers a settled subagent again when the SDK resumes it without a
      *  new `task_started`. The active turn is the one that resumed it, so it
      *  holds until the subagent settles again. A repeated resume signal finds
-     *  the subagent live and changes nothing. */
-    const resumeLiveTask = (taskId: string) => {
-      if (session.liveBackgroundTasks.has(taskId)) return;
+     *  the subagent live and changes nothing. Returns whether this call
+     *  actually re-registered it — a resumed subagent is always registered in
+     *  the background per the SDK contract, so its completion wakes even when
+     *  its original spawn was foreground. */
+    const resumeLiveTask = (taskId: string): boolean => {
+      if (session.liveBackgroundTasks.has(taskId)) return false;
       const settled = session.resumableSubagents?.get(taskId);
-      if (settled) registerLiveTask(taskId, settled.parentToolUseId, true, settled.ambient);
+      if (!settled) return false;
+      registerLiveTask(taskId, settled.parentToolUseId, true, settled.ambient);
+      return true;
     };
 
     /** Whether any background subagent this turn spawned is still live —
@@ -5898,6 +5917,13 @@ export class ClaudeAcpAgent {
                   !!message.subagent_type,
                   message.ambient === true,
                 );
+                if (message.is_backgrounded === false) {
+                  session.foregroundTaskIds.add(message.task_id);
+                } else if (message.is_backgrounded === true) {
+                  session.foregroundTaskIds.delete(message.task_id);
+                }
+                // undefined (older CLI / task types without the field): keep
+                // the historic wake-on-notification behavior.
                 await subagents.taskStarted(
                   {
                     taskId: message.task_id,
@@ -5943,13 +5969,20 @@ export class ClaudeAcpAgent {
                 // flag. A cancelled session must not be woken either: the task
                 // settled after the user's Stop (or was stopped by cancel
                 // itself), so latching here would pull the editor back to
-                // running for work the user already dismissed. The flag is
+                // running for work the user already dismissed. A FOREGROUND
+                // task is the current turn's own blocking tool call settling:
+                // its result rides this turn, not an autonomous followup, and
+                // latching here would strand the flag past the turn's result
+                // until the wake-grace timer expires (the editor stays
+                // "running" for tens of seconds). Consume the marker either
+                // way — a duplicate notification must not latch. The flag is
                 // cleared by the cycle's real result, or by the bundled
                 // wake-grace/silence lease if the followup never materializes;
                 // `idle` deliberately does not clear it (a late trailer from
                 // the previous cycle would strand this one). The settle below
                 // still runs in either case: the live count must drop.
-                if (message.ambient !== true && !session.cancelled) {
+                const wasForeground = session.foregroundTaskIds.delete(message.task_id);
+                if (message.ambient !== true && !session.cancelled && !wasForeground) {
                   this.noteAutonomousWake(params.sessionId, session);
                 }
                 // The task settled — no further tool calls can originate
@@ -6009,6 +6042,14 @@ export class ClaudeAcpAgent {
                 // guaranteed per transition — prune on it too so the registry
                 // can't grow for the session's lifetime if a notification is
                 // skipped.
+                //
+                // The move-to-background patch is INCREMENTAL and may carry
+                // only `is_backgrounded` (no status), so it is handled here
+                // rather than in the running/pending branch below: once
+                // backgrounded, the task's completion is a genuine wake.
+                if (message.patch.is_backgrounded === true) {
+                  session.foregroundTaskIds.delete(message.task_id);
+                }
                 if (
                   message.patch.status === "completed" ||
                   message.patch.status === "failed" ||
@@ -6034,7 +6075,12 @@ export class ClaudeAcpAgent {
                 ) {
                   // The SDK can resume a finished subagent under the same
                   // agent id without a new task_started.
-                  resumeLiveTask(message.task_id);
+                  if (resumeLiveTask(message.task_id)) {
+                    // A resumed subagent is always registered in the
+                    // background (SDK contract), so a foreground marker left
+                    // by its original spawn must not swallow the wake.
+                    session.foregroundTaskIds.delete(message.task_id);
+                  }
                   await subagents.taskResumed(
                     message.task_id,
                     sendUpdate,
@@ -6181,6 +6227,13 @@ export class ClaudeAcpAgent {
                 // subagent marker), so the unspecified ordering vs. the edge
                 // bookends is safe: a level that precedes its task_started
                 // simply no-ops here.
+                // A task present in the level is background — the payload's
+                // universe is background tasks only — so drop any stale
+                // foreground marker even if the move-to-background patch was
+                // lost.
+                for (const task of message.tasks) {
+                  session.foregroundTaskIds.delete(task.task_id);
+                }
                 if (session.liveBackgroundTasks.size > 0) {
                   // The level is authoritative for the ambient flag too: it is
                   // re-emitted when an entry's flag flips, and the count must
@@ -11873,6 +11926,7 @@ export class ClaudeAcpAgent {
         userDeniedToolCalls: new Set(),
         eagerToolCallSessions: new Map(),
         liveBackgroundTasks: new Map(),
+        foregroundTaskIds: new Set(),
         // Adopt the replay's spawn map: history replay runs before this record
         // exists and seeds it with each Task card's original tool_use id, which
         // SendMessage resume redirection (and the Explore result back-link)

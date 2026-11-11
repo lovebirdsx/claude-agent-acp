@@ -334,6 +334,7 @@ describe("reconcileResumedSessionModel", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      foregroundTaskIds: new Set(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
     };
